@@ -201,9 +201,28 @@ final class TunnelManager: ObservableObject {
                     .filter { !$0.isEmpty && $0.range(of: "^[a-z0-9][a-z0-9.-]*$", options: .regularExpression, range: $0.startIndex..<$0.endIndex, locale: nil) != nil }
                 guard domains.count >= 3 else { continue } // слишком мало = битый файл
                 let unique = Array(Set(domains))
-                frontBases = unique
+                // Android-порт: DNS-резолв каждого домена ДО сохранения —
+                // мёртвые не попадают в список, файл с <3 живых = протухший
+                // целиком (NXDOMAIN-волны апстрима). Резолв параллельно.
+                let alive = await withTaskGroup(of: String?.self) { group in
+                    for d in unique {
+                        group.addTask {
+                            var hints = addrinfo()
+                            hints.ai_family = AF_INET
+                            var res: UnsafeMutablePointer<addrinfo>?
+                            let rc = getaddrinfo(d, nil, &hints, &res)
+                            defer { freeaddrinfo(res) }
+                            return rc == 0 ? d : nil
+                        }
+                    }
+                    var out: [String] = []
+                    for await r in group { if let d = r { out.append(d) } }
+                    return out
+                }
+                guard alive.count >= 3 else { continue } // протухший список
+                frontBases = alive
                 frontsUpdatedAt = Date()
-                frontsUpdateMessage = "Обновлено: \(unique.count) доменов"
+                frontsUpdateMessage = "Обновлено: \(alive.count) живых (из \(unique.count))"
                 return true
             } catch {
                 continue // следующий URL

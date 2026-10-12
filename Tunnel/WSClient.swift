@@ -90,11 +90,13 @@ final class WSClient {
     static func markDead(_ host: String) {
         healthLock.lock(); defer { healthLock.unlock() }
         deadUntil[host] = Date().addingTimeInterval(600)
+        FrontHealthRegistry.recordFailure(host)
     }
 
     static func markAlive(_ host: String) {
         healthLock.lock(); defer { healthLock.unlock() }
         deadUntil.removeValue(forKey: host)
+        FrontHealthRegistry.recordSuccess(host)
     }
 
     private static func aliveOnly(_ eps: [(host: String, hostHeader: String?)]) -> [(host: String, hostHeader: String?)] {
@@ -117,10 +119,21 @@ final class WSClient {
 
         // Round-robin старт: Telegram держит ~12 параллельных соединений —
         // каждое начнёт со своего фронта и живые найдутся быстрее.
+        // Персистентный реестр здоровья (Android-порт): переупорядочиваем
+        // фронтами по lastSuccess (свежие успехи первыми), известные мёртвые
+        // (<3 фейлов подряд, без успеха 24ч) отбрасываем.
         let fronts = CFDomains.domains(dc: dc)
-        Self.rrStart = (Self.rrStart + 1) % fronts.count
+        Self.rrStart = (Self.rrStart + 1) % max(fronts.count, 1)
         let start = Self.rrStart
-        let rotated = Array(fronts[start...] + fronts[..<start])
+        var rotated = Array(fronts[start...] + fronts[..<start])
+        let (ordered, excluded) = FrontHealthRegistry.orderAndFilter(rotated)
+        if excluded > 0 {
+            post("health_excl:\(excluded)")
+            NSLog("[WSBridge] health registry: excluded \(excluded) endpoints")
+            rotated = ordered.isEmpty ? rotated : ordered
+        } else {
+            rotated = ordered
+        }
 
         var endpoints: [(host: String, hostHeader: String?)] =
             rotated.prefix(6).map { ($0, nil as String?) }

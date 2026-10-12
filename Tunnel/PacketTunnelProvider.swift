@@ -72,6 +72,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let fronts = proto?.providerConfiguration?["fronts"] as? [String]
             CFDomains.update(fronts ?? [])
             EventLog.append("cfg:fronts=\(CFDomains.bases.count)")
+            // Android-порт: эвикция протухших из реестра (мёртвые >7 дней,
+            // пропавшие из апстрима) + запись состояния реестра в журнал.
+            FrontHealthRegistry.evict(absentFrom: Set(CFDomains.bases))
+            EventLog.append("fronts_health:\(FrontHealthRegistry.summary())")
             let ver = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
             EventLog.append("tunnel_start v\(ver)")
             self?.journalServer.start()
@@ -153,6 +157,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func readLoop() {
         packetFlow.readPackets { [weak self] packets, protocols in
             guard let self else { return }
+            // Android-порт: TUN fd может умирать молча — колбэк приходит
+            // с пустым результатом и всё. Диагностируем, не висим «включено».
+            if packets.isEmpty {
+                EventLog.append("tun_dead:read:packets=0")
+                EventLog.flush()
+            }
             self.lwipQueue.async {
                 for (packet, family) in zip(packets, protocols) {
                     if family.intValue != AF_INET {
@@ -212,6 +222,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 5=providerDisabled 6=badConfiguration 7=systemPolicy 8=evalFailed
         // 9=configurationDisabled 10=configurationInvalid ...
         EventLog.append("tunnel_stop:reason=\(reason.rawValue):pkts=\(packetCount)")
+        // Android-порт: реестр здоровья на диск — процесс могут убить сразу
+        // после completionHandler.
+        FrontHealthRegistry.flush(immediate: true)
+        EventLog.append("fronts_health:\(FrontHealthRegistry.summary())")
         EventLog.flush()
         journalServer.stop()
         pollTimer?.cancel(); pollTimer = nil
