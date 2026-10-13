@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import NetworkExtension
+import UserNotifications
 
 /// Читает журнал расширения loopback TCP (127.0.0.1:51001, JournalServer).
 /// Nonisolated: колбэки NWConnection приходят с произвольных потоков.
@@ -82,7 +83,12 @@ final class TunnelManager: ObservableObject {
         return app + ".tunnel"
     }()
 
-    @Published private(set) var status: NEVPNStatus = .invalid
+    @Published private(set) var status: NEVPNStatus = .invalid {
+        didSet {
+            guard oldValue != status else { return }
+            syncNudges()
+        }
+    }
     @Published private(set) var stats: String?
     @Published private(set) var journalText: String?
     @Published private(set) var lastPacketSignal: Date?
@@ -247,6 +253,34 @@ final class TunnelManager: ObservableObject {
         return false
     }
 
+    // ── Нуджи: локальные уведомления ────────────────────────────
+    /// «Долго включен»: повторяющийся нудж каждые 6 ч, пока туннель
+    /// .connected. Планирует СИСТЕМА — сработает, даже если приложение
+    /// убито; снимается при остановке туннеля.
+    private static let longSessionID = "wsbridge.longSession"
+    private static let longSessionInterval: TimeInterval = 6 * 3600
+
+    private func syncNudges() {
+        let center = UNUserNotificationCenter.current()
+        switch status {
+        case .connected:
+            let c = UNMutableNotificationContent()
+            c.title = "Туннель включен давно"
+            c.body = "Больше 6 часов без перезапуска. Если интернет тормозит — выключи и включи его в WSBridge."
+            let t = UNTimeIntervalNotificationTrigger(
+                timeInterval: Self.longSessionInterval, repeats: true)
+            center.add(UNNotificationRequest(
+                identifier: Self.longSessionID, content: c, trigger: t))
+        case .disconnected, .invalid, .disconnecting:
+            center.removePendingNotificationRequests(
+                withIdentifiers: [Self.longSessionID])
+        case .connecting, .reasserting:
+            break
+        @unknown default:
+            break
+        }
+    }
+
     private var manager: NETunnelProviderManager?
     private var darwinObserver: CFRunLoopObserver?
     nonisolated(unsafe) private static var currentReader: JournalReader?
@@ -335,6 +369,12 @@ final class TunnelManager: ObservableObject {
 
     func toggle() async {
         errorMessage = nil
+        // Локальные уведомления (нудж «долго включен» + «сеть сменилась»
+        // из расширения): разрешение спрашиваем один раз, при включении.
+        if status != .connected {
+            UNUserNotificationCenter.current()
+                .requestAuthorization(options: [.alert]) { _, _ in }
+        }
         // Автообновление списка фронтов: тихо, в фоне, ПОСЛЕ включения —
         // не конкурирует с saveToPreferences за UserDefaults и не влияет
         // на старт. Не чаще раза в 30 минут. Применится при след. включении.

@@ -1,5 +1,7 @@
 import NetworkExtension
 import Foundation
+import Network
+import UserNotifications
 
 /// Фаза 2: lwIP + WS-сплайсинг.
 /// Перехватывает TCP к DC Telegram, восстанавливает поток через lwIP,
@@ -18,6 +20,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pollTimer: DispatchSourceTimer?
     private var ioTimer: DispatchSourceTimer?
     private var workerDomain: String?
+    // Смена сети: расширение — единственный живой процесс, пока туннель
+    // включен (приложение в фоне усыплено и NWPathMonitor там молчит).
+    private var pathMonitor: NWPathMonitor?
+    private var lastPathSig: String?
+    private var lastNetNotifAt = Date.distantPast
 
     override func startTunnel(
         options: [String: NSObject]?,
@@ -82,6 +89,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self?.setupLWIP()
             self?.startTimers()
             self?.readLoop()
+            self?.startPathMonitor()
             completionHandler(nil)
         }
     }
@@ -228,6 +236,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         EventLog.append("fronts_health:\(FrontHealthRegistry.summary())")
         EventLog.flush()
         journalServer.stop()
+        pathMonitor?.cancel(); pathMonitor = nil
         pollTimer?.cancel(); pollTimer = nil
         ioTimer?.cancel(); ioTimer = nil
         lwipQueue.sync {
@@ -235,6 +244,52 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             sessions.removeAll()
         }
         completionHandler()
+    }
+
+    /// ponytail: Wi-Fi↔соты и подобные переключения рвут WS-сессии и lwIP-
+    /// состояние молча — трафик «протухает» до ручного перезапуска. Мониторим
+    /// путь здесь (процесс жив, пока туннель включен) и nudg'им пользователя
+    /// локальным уведомлением. Троттлинг 5 мин: флэпы Wi-Fi не спамлят.
+    private func startPathMonitor() {
+        let m = NWPathMonitor()
+        m.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let ifaces = path.availableInterfaces
+                .map { Self.ifaceName($0.type) }
+                .sorted()
+                .joined(separator: "+")
+            let sig = "\(path.status):\(ifaces)"
+            defer { self.lastPathSig = sig }
+            guard let prev = self.lastPathSig, prev != sig else { return }
+            EventLog.append("net_change:\(prev)->\(sig)")
+            guard path.status == .satisfied else { return }
+            guard Date().timeIntervalSince(self.lastNetNotifAt) > 300 else { return }
+            self.lastNetNotifAt = Date()
+            let c = UNMutableNotificationContent()
+            c.title = "Сеть сменилась"
+            let prevIfaces = prev.split(separator: ":", maxSplits: 1)
+                .last.map(String.init) ?? prev
+            c.body = "Телефон переподключился: \(prevIfaces) → \(ifaces). Если интернет тормозит — перезапусти туннель в WSBridge."
+            let req = UNNotificationRequest(
+                identifier: "wsbridge.netChange", content: c,
+                trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false))
+            UNUserNotificationCenter.current().add(req) { err in
+                EventLog.append("notif_net:\(err?.localizedDescription ?? "ok")")
+            }
+        }
+        m.start(queue: DispatchQueue(label: "com.l1ratch.WSBridge.pathmon"))
+        pathMonitor = m
+    }
+
+    private static func ifaceName(_ t: NWInterface.InterfaceType) -> String {
+        switch t {
+        case .wifi: return "Wi-Fi"
+        case .cellular: return "сот."
+        case .wiredEthernet: return "Ethernet"
+        case .loopback: return "loopback"
+        case .other: return "др."
+        @unknown default: return "?"
+        }
     }
 
     override func handleAppMessage(
