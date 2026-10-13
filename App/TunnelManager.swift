@@ -184,6 +184,9 @@ final class TunnelManager: ObservableObject {
     @discardableResult
     func updateFronts() async -> Bool {
         frontsUpdateMessage = "Обновление…"
+        // Причина последнего отказа ПРИ ОТВЕТЕ источника: сеть жива, но файл
+        // негодный (битый/протухший). Отличаем от «нет сети».
+        var rejection: String?
         for urlString in Self.frontListURLs {
             guard let url = URL(string: urlString) else { continue }
             var request = URLRequest(url: url)
@@ -199,7 +202,10 @@ final class TunnelManager: ObservableObject {
                     .split(separator: "\n")
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                     .filter { !$0.isEmpty && $0.range(of: "^[a-z0-9][a-z0-9.-]*$", options: .regularExpression, range: $0.startIndex..<$0.endIndex, locale: nil) != nil }
-                guard domains.count >= 3 else { continue } // слишком мало = битый файл
+                guard domains.count >= 3 else {
+                    rejection = "битый файл (\(domains.count) записей)"
+                    continue
+                }
                 let unique = Array(Set(domains))
                 // Android-порт: DNS-резолв каждого домена ДО сохранения —
                 // мёртвые не попадают в список, файл с <3 живых = протухший
@@ -219,7 +225,10 @@ final class TunnelManager: ObservableObject {
                     for await r in group { if let d = r { out.append(d) } }
                     return out
                 }
-                guard alive.count >= 3 else { continue } // протухший список
+                guard alive.count >= 3 else {
+                    rejection = "протух: живых \(alive.count) из \(unique.count)"
+                    continue
+                }
                 frontBases = alive
                 frontsUpdatedAt = Date()
                 frontsUpdateMessage = "Обновлено: \(alive.count) живых (из \(unique.count))"
@@ -228,7 +237,13 @@ final class TunnelManager: ObservableObject {
                 continue // следующий URL
             }
         }
-        frontsUpdateMessage = "Не удалось обновить (нет сети или источники недоступны)"
+        if let rejection {
+            // Сеть жива, источник ответил — негодный сам файл. Прежний
+            // список frontBases не трогаем, каскад работает на нём.
+            frontsUpdateMessage = "Источник ответил, но список негодный: \(rejection). Оставил прежний."
+        } else {
+            frontsUpdateMessage = "Не удалось обновить (нет сети или источники недоступны)"
+        }
         return false
     }
 
