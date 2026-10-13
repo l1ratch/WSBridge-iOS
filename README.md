@@ -7,16 +7,16 @@ IP-over-WebSocket relay for iOS (Packet Tunnel Provider). Russian version: [READ
 The app creates a virtual network interface (TUN) and forwards all IPv4
 traffic through it as a WebSocket stream:
 
-```
-┌─────────────┐  raw IP packets  ┌──────────────┐  TCP/WS frames  ┌─────────────┐
-│  TUN device │ ───────────────▶ │  lwIP stack  │ ──────────────▶ │  WebSocket  │
-│  (system)   │ ◀─────────────── │  (NO_SYS=1)  │ ◀────────────── │   client    │
-└─────────────┘   re-injected    └──────────────┘                 └──────┬──────┘
-                                                                        │ wss://
-                                                                        ▼
-                                                              ┌─────────────────┐
-                                                              │ HTTP 101 gateway │
-                                                              └─────────────────┘
+```mermaid
+flowchart LR
+    subgraph DEV["iOS · Packet Tunnel Provider process"]
+        direction LR
+        APP(["Apps"]) -->|raw IPv4 packets| TUN[/"TUN device"/]
+        TUN --> LW["lwIP stack<br/>NO_SYS=1 · single-threaded · IPv4-only"]
+        LW -->|terminated TCP flows| WS["WebSocket client"]
+        WS -->|decoded IP packets| TUN
+    end
+    WS <-->|"wss:// (TLS) · HTTP 101 upgrade"| GW["Gateway endpoint"]
 ```
 
 1. System routes all IPv4 traffic into the TUN device.
@@ -31,13 +31,16 @@ traffic through it as a WebSocket stream:
 Connections are established through an ordered cascade:
 
 ```mermaid
-graph LR
-    A[connect] --> B[CDN edge endpoints<br/>round-robin]
-    B -->|fail| C[direct gateway IPs<br/>Host-header routing]
-    C -->|fail| D[native endpoints]
-    D -->|fail| E[mark endpoint dead<br/>10 min ban]
-    E -.next session.-> R[(health registry:<br/>fail count / last fail / last success)]
-    R --> A
+flowchart TD
+    A(["new connection"]) --> B{"persistent health registry<br/>skip: ≥3 consecutive fails and no success in 24 h<br/>order: latest successes first"}
+    B --> T1["tier 1 · CDN edge<br/>kws{dc}.{domain} · round-robin start"]
+    T1 -->|fail| T2["tier 2 · direct IPs<br/>gateway address + Host header"]
+    T2 -->|fail| T3["tier 3 · native<br/>kws{dc}.*"]
+    T3 -->|fail| X(["abort · client reconnects → new cascade"])
+    T1 & T2 & T3 -->|first data received| OK(["session active"])
+    OK -.->|"success: failCount = 0, lastSuccess = now"| R[("health registry<br/>UserDefaults · survives restarts")]
+    T1 & T2 & T3 -.->|"fail before first data: failCount++<br/>+ 10-min runtime ban"| R
+    R -.->|next connect| B
 ```
 
 - **CDN edge** — `kws{dc}.{domain}` hostnames, resolved and rotated
