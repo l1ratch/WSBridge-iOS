@@ -284,6 +284,8 @@ final class TunnelManager: ObservableObject {
     // ── Смена сети: догонялка через журнал ──────────────────────
     /// In-app алерт «сеть менялась, пока туннель был включен».
     @Published var showNetChangeAlert = false
+    /// UN.delegate — слабый; держим презентера навсегда.
+    private static let bannerPresenter = BannerPresenter()
     private var lastActiveAt = Date()
     private static let netTimeFmt: DateFormatter = {
         let f = DateFormatter()
@@ -362,7 +364,7 @@ final class TunnelManager: ObservableObject {
                 if self.status != s { self.status = s }
             }
         }
-        UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().delegate = Self.bannerPresenter
         Task { await reload() }
     }
 
@@ -522,8 +524,10 @@ final class TunnelManager: ObservableObject {
 
 /// ponytail: без willPresent UN-уведомления, пришедшие при открытом
 /// приложении, молча дропаются системой — а смена сети случается именно
-/// когда телефон в руках и приложение на экране.
-extension TunnelManager: UNUserNotificationCenterDelegate {
+/// когда телефон в руках и приложение на экране. TunnelManager не NSObject,
+/// поэтому конформность живёт в отдельном объекте; delegate слабый —
+/// держим его в static let навсегда.
+final class BannerPresenter: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification

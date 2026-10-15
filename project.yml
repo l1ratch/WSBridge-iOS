@@ -20,7 +20,7 @@ targets:
       properties:
         CFBundleDisplayName: WSBridge
         CFBundleShortVersionString: "0.2.0"
-        CFBundleVersion: "83"
+        CFBundleVersion: "84"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
     entitlements:
@@ -58,7 +58,7 @@ targets:
       properties:
         CFBundleDisplayName: WSBridge Tunnel
         CFBundleShortVersionString: "0.2.0"
-        CFBundleVersion: "83"
+        CFBundleVersion: "84"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
