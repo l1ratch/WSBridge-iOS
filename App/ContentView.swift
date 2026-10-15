@@ -65,7 +65,10 @@ struct ContentView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .disabled(tunnel.status == .connecting || tunnel.status == .disconnecting)
+                    // НЕ disabled ни в каком статусе: залипший published-статус
+                    // не должен убивать тап (баг билдов 81-84). Направление
+                    // решения toggle() читает живой connection.status,
+                    // от дабл-тапов защищает дебаунс внутри toggle().
                     .onChange(of: tunnel.status) { _, newStatus in
                         boltFill = (newStatus == .connected)
                     }
@@ -354,6 +357,21 @@ struct StatsView: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
+            if !tunnel.statusHistory.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("История статусов (диагностика кнопки)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ForEach(Array(tunnel.statusHistory.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal)
+                .padding(.bottom)
+            }
         }
         .navigationTitle("Статистика")
         .navigationBarTitleDisplayMode(.inline)

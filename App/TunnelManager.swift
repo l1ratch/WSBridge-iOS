@@ -86,9 +86,16 @@ final class TunnelManager: ObservableObject {
     @Published private(set) var status: NEVPNStatus = .invalid {
         didSet {
             guard oldValue != status else { return }
+            statusHistory.append(
+                "\(Self.netTimeFmt.string(from: Date())) \(oldValue) -> \(status)")
+            if statusHistory.count > 40 {
+                statusHistory.removeFirst(statusHistory.count - 40)
+            }
             syncNudges()
         }
     }
+    /// История переходов статуса — диагностика «мёртвой кнопки».
+    @Published private(set) var statusHistory: [String] = []
     @Published private(set) var stats: String?
     @Published private(set) var journalText: String?
     @Published private(set) var lastPacketSignal: Date?
@@ -286,6 +293,7 @@ final class TunnelManager: ObservableObject {
     @Published var showNetChangeAlert = false
     /// UN.delegate — слабый; держим презентера навсегда.
     private static let bannerPresenter = BannerPresenter()
+    private var lastToggleAt = Date.distantPast
     private var lastActiveAt = Date()
     private static let netTimeFmt: DateFormatter = {
         let f = DateFormatter()
@@ -333,12 +341,12 @@ final class TunnelManager: ObservableObject {
     /// Перезапуск: выкл → дождаться отключения → вкл.
     func restartTunnel() async {
         guard status == .connected || status == .reasserting else { return }
-        await toggle()
+        await toggle(force: true)
         for _ in 0..<40 {
             if status == .disconnected || status == .invalid { break }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
-        await toggle()
+        await toggle(force: true)
     }
 
     private var manager: NETunnelProviderManager?
@@ -438,7 +446,13 @@ final class TunnelManager: ObservableObject {
         status = manager?.connection.status ?? .invalid
     }
 
-    func toggle() async {
+    func toggle(force: Bool = false) async {
+        // Дебаунс: параллельные saveToPreferences от дабл-тапов — гонки.
+        // Кнопка больше не disabled ни в каком статусе: залипший
+        // published-статус не должен убивать тап (баг билдов 81-84);
+        // направление решения читается ниже с живого connection.status.
+        guard force || Date().timeIntervalSince(lastToggleAt) > 2 else { return }
+        lastToggleAt = Date()
         errorMessage = nil
         // Локальные уведомления (нудж «долго включен» + «сеть сменилась»
         // из расширения): разрешение спрашиваем один раз, при включении.
