@@ -43,18 +43,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let dohURL = proto?.providerConfiguration?["doh"] as? String
         let dotHost = proto?.providerConfiguration?["dot"] as? String
         if let dnsList, !dnsList.isEmpty {
-            if let dohURL, !dohURL.isEmpty {
-                // Приоритет 1: DNS-over-HTTPS (порт 443, зашифровано)
-                let doh = NEDNSOverHTTPSSettings(servers: dnsList)
-                doh.serverURL = URL(string: dohURL)
-                settings.dnsSettings = doh
-                NSLog("[WSBridge] DNS: DoH via %@", dohURL)
-            } else if let dotHost, !dotHost.isEmpty {
-                // Приоритет 2: DNS-over-TLS (порт 853, зашифровано)
+            if let dotHost, !dotHost.isEmpty {
+                // Приоритет 1: DNS-over-TLS. Коннект напрямую к IP:853 с SNI —
+                // резолв имени сервера НЕ нужен. Под VPN бутстрап-резолв
+                // DoH-хоста системой ломал malw (всё кроме туннеля умирало),
+                // у DoT этой ступени нет вовсе.
                 let dot = NEDNSOverTLSSettings(servers: dnsList)
                 dot.serverName = dotHost
                 settings.dnsSettings = dot
                 NSLog("[WSBridge] DNS: DoT via %@", dotHost)
+            } else if let dohURL, !dohURL.isEmpty {
+                // Приоритет 2: DNS-over-HTTPS (порт 443, зашифровано)
+                let doh = NEDNSOverHTTPSSettings(servers: dnsList)
+                doh.serverURL = URL(string: dohURL)
+                settings.dnsSettings = doh
+                NSLog("[WSBridge] DNS: DoH via %@", dohURL)
             } else {
                 // Приоритет 3: plain :53 (только свои конфиги без URL)
                 settings.dnsSettings = NEDNSSettings(servers: dnsList)

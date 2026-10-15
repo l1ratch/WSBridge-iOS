@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var showMenu = false
     @State private var boltFill = false
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showDNS = false
 
     var body: some View {
@@ -134,6 +135,17 @@ struct ContentView: View {
                 }
             }
             .task { await tunnel.reload() }
+            .onChange(of: scenePhase) { _, new in
+                if new == .active { tunnel.noteActive() }
+            }
+            .alert("Сеть сменилась", isPresented: $tunnel.showNetChangeAlert) {
+                Button("Перезапустить туннель") {
+                    Task { await tunnel.restartTunnel() }
+                }
+                Button("Позже", role: .cancel) {}
+            } message: {
+                Text("Телефон переподключался к другой сети с включенным туннелем. Если интернет тормозит — перезапусти туннель.")
+            }
         }
     }
 

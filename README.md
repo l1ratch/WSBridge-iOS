@@ -72,9 +72,11 @@ The endpoint list is hot-updatable without rebuilding the app:
 
 ## DNS
 
-Resolver priority chain: DNS-over-HTTPS → DNS-over-TLS → plain UDP.
-Presets and custom servers are configurable in-app; changes take
-effect on next tunnel start.
+Encrypted resolver priority: DNS-over-TLS (when the server publishes a
+hostname) → DNS-over-HTTPS → plain UDP. DoT connects to the server IP
+directly with SNI and needs no hostname bootstrap, which DoH under a
+tunnel cannot always rely on. Presets and custom servers are
+configurable in-app; changes take effect on next tunnel start.
 
 ## Build
 

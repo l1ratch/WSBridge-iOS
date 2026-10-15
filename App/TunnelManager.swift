@@ -281,6 +281,64 @@ final class TunnelManager: ObservableObject {
         }
     }
 
+    // ── Смена сети: догонялка через журнал ──────────────────────
+    /// In-app алерт «сеть менялась, пока туннель был включен».
+    @Published var showNetChangeAlert = false
+    private var lastActiveAt = Date()
+    private static let netTimeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
+    /// Вызывается при выходе приложения на передний план.
+    func noteActive() {
+        let since = lastActiveAt
+        lastActiveAt = Date()
+        // Если уведомления разрешены — их постит расширение (UN работают
+        // и в фоне, и в форграунде через willPresent). Догонялка через
+        // журнал — только при отказе в разрешении, иначе двойные алерты.
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            guard settings.authorizationStatus == .denied else { return }
+            DispatchQueue.main.async {
+                self.fetchStats()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    self.alertMissedNetChanges(since: since)
+                }
+            }
+        }
+    }
+
+    private func alertMissedNetChanges(since: Date) {
+        guard status == .connected, let text = journalText else { return }
+        let cal = Calendar.current
+        for line in text.split(separator: "\n") where line.contains("net_change:") {
+            guard let head = line.split(separator: " ").first,
+                  let t = Self.netTimeFmt.date(from: String(head)) else { continue }
+            var dt = cal.date(
+                bySettingHour: cal.component(.hour, from: t),
+                minute: cal.component(.minute, from: t),
+                second: cal.component(.second, from: t),
+                of: Date()) ?? t
+            if dt < since.addingTimeInterval(-43_200) { dt.addTimeInterval(86_400) }
+            if dt > since {
+                showNetChangeAlert = true
+                return
+            }
+        }
+    }
+
+    /// Перезапуск: выкл → дождаться отключения → вкл.
+    func restartTunnel() async {
+        guard status == .connected || status == .reasserting else { return }
+        await toggle()
+        for _ in 0..<40 {
+            if status == .disconnected || status == .invalid { break }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        await toggle()
+    }
+
     private var manager: NETunnelProviderManager?
     private var darwinObserver: CFRunLoopObserver?
     nonisolated(unsafe) private static var currentReader: JournalReader?
@@ -294,6 +352,17 @@ final class TunnelManager: ObservableObject {
             Task { @MainActor in self?.status = conn.status }
         }
         observeDarwinNotifications()
+        // Статус может рассинхрониться с NEVPNStatusDidChange — кнопка
+        // «выключить» мертвеет при залипшем .connecting (баг 81/82).
+        // Самолечимся: читаем connection.status каждые 5 с, пока живо приложение.
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self, let m = self.manager else { return }
+            let s = m.connection.status
+            DispatchQueue.main.async {
+                if self.status != s { self.status = s }
+            }
+        }
+        UNUserNotificationCenter.current().delegate = self
         Task { await reload() }
     }
 
@@ -448,5 +517,17 @@ final class TunnelManager: ObservableObject {
             errorMessage = error.localizedDescription
             status = manager?.connection.status ?? .invalid
         }
+    }
+}
+
+/// ponytail: без willPresent UN-уведомления, пришедшие при открытом
+/// приложении, молча дропаются системой — а смена сети случается именно
+/// когда телефон в руках и приложение на экране.
+extension TunnelManager: UNUserNotificationCenterDelegate {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner]
     }
 }
