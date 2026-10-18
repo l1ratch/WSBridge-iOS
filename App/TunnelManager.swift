@@ -129,11 +129,12 @@ final class TunnelManager: ObservableObject {
 
         /// Короткая метка транспортов для списков.
         var transportsLabel: String {
+            if servers.isEmpty { return "как в системе" }
             switch (supportsDoT, supportsDoH) {
-            case (true, true): "DoT · DoH"
-            case (true, false): "DoT"
-            case (false, true): "DoH"
-            default: "без шифрования"
+            case (true, true): return "DoT · DoH"
+            case (true, false): return "DoT"
+            case (false, true): return "DoH"
+            default: return "без шифрования"
             }
         }
     }

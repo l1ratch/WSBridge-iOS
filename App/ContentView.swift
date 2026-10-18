@@ -521,7 +521,10 @@ private struct DNSModeFallbackNote: View {
     @ObservedObject var tunnel: TunnelManager
 
     var body: some View {
-        if tunnel.effectiveDNSMode != tunnel.dnsMode {
+        // Пустой список = «Системный»: туннель вообще не трогает DNS,
+        // подсказка про транспорты была бы враньём.
+        if !tunnel.activeDNSServers.isEmpty,
+           tunnel.effectiveDNSMode != tunnel.dnsMode {
             Text(tunnel.effectiveDNSMode == nil
                  ? "У этого сервера нет ни DoT, ни DoH — запросы пойдут простым DNS (порт 53)."
                  : "У этого сервера нет \(tunnel.dnsMode.shortTitle) — будет использован \(tunnel.effectiveDNSMode!.shortTitle).")
