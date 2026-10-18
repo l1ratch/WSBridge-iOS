@@ -26,6 +26,18 @@ jobs:
           sudo xcode-select -s "$XC/Contents/Developer"
           xcodebuild -version
 
+      - name: Read version
+        id: ver
+        run: |
+          # Единственный источник правды — WSB_BUILD в project.yml.
+          # Из него xcodegen выводит CFBundleVersion и 0.2.N для UI,
+          # отсюда же берём версию для GBox-манифеста.
+          BUILD=$(grep -m1 'WSB_BUILD:' project.yml | sed -E 's/.*"([0-9]+)".*/\1/')
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "version=0.2.$BUILD" >> "$GITHUB_OUTPUT"
+          echo "WSB build=$BUILD version=0.2.$BUILD"
+        shell: bash
+
       - name: Generate Xcode Project
         run: xcodegen generate
 
@@ -56,6 +68,25 @@ jobs:
           git push origin main || true
         shell: bash
 
+      - name: Verify version in built app
+        run: |
+          # Страховка от нераскрывшейся подстановки: WSB_MARKETING_VERSION
+          # ссылается на WSB_BUILD, и если xcodegen/Xcode не раскроет
+          # вложенную переменную, в plist уедет литерал "0.2.$(WSB_BUILD)".
+          # Ловим это здесь, а не глазами пользователя в GBox.
+          APP_PLIST=$(find build -name "Info.plist" -path "*.app/*" | head -n 1)
+          SHORT=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PLIST")
+          BUNDLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PLIST")
+          echo "plist: CFBundleShortVersionString=$SHORT CFBundleVersion=$BUNDLE"
+          EXPECT_SHORT="${{ steps.ver.outputs.version }}"
+          EXPECT_BUILD="${{ steps.ver.outputs.build }}"
+          if [ "$SHORT" != "$EXPECT_SHORT" ] || [ "$BUNDLE" != "$EXPECT_BUILD" ]; then
+            echo "::error::Версия в приложении ($SHORT / $BUNDLE) не совпадает с WSB_BUILD ($EXPECT_SHORT / $EXPECT_BUILD)."
+            exit 1
+          fi
+          echo "Версия в приложении совпадает с WSB_BUILD"
+        shell: bash
+
       - name: Package Unsigned IPA
         run: |
           mkdir -p Payload
@@ -76,7 +107,8 @@ jobs:
       - name: Publish to gh-pages
         run: |
           set -e
-          VER=$(grep -m1 'CFBundleVersion' project.yml | sed -E 's/.*"([0-9]+)".*/\1/')
+          VER="${{ steps.ver.outputs.build }}"
+          VERSION="${{ steps.ver.outputs.version }}"
           SIZE=$(stat -f%z WSBridge.ipa)
           cp WSBridge.ipa /tmp/wsb.ipa
           cp WSBridge.ipa /tmp/preview.ipa
@@ -90,7 +122,7 @@ jobs:
                 "name": "WSBridge",
                 "bundleIdentifier": "com.l1ratch.WSBridge",
                 "developerName": "l1ratch",
-                "version": "0.2.$VER",
+                "version": "$VERSION",
                 "versionDate": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
                 "versionDescription": "build $VER",
                 "size": $SIZE,

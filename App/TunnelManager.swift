@@ -210,7 +210,7 @@ final class TunnelManager: ObservableObject {
                   dohURL: "https://xbox-dns.ru/dns-query",
                   dotHostname: "xbox-dns.ru", isPreset: true,
                   site: "https://xbox-dns.ru/#faq"),
-        DNSConfig(id: "malw-gateway", name: "Cloudflare Gateway",
+        DNSConfig(id: "malw-gateway", name: "Alt Malw.link",
                   description: "Для обхода гео-блокировок",
                   servers: ["162.159.36.5", "162.159.36.20"],
                   dohURL: "https://5u35p8m9i7.cloudflare-gateway.com/dns-query",

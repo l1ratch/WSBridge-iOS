@@ -1,14 +1,22 @@
 name: WSBridge
+
+# ── Версия: ОДНО число на весь проект ──────────────────────────────
+# WSB_BUILD — единственное, что правится при релизе. Из него выводятся
+# и версия (0.2.N), и номер сборки (N). Раньше номер жил в четырёх
+# местах (два таргета × два ключа) и разъезжался: в UI одно, в CI другое.
+# CI (build.yml) читает CFBundleVersion из этого же WSB_BUILD.
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    WSB_BUILD: "87"
+    WSB_MARKETING_VERSION: "0.2.$(WSB_BUILD)"
+
 options:
   bundleIdPrefix: com.l1ratch
   deploymentTarget:
     iOS: "17.0"
   createIntermediateGroups: true
-
-settings:
-  base:
-    SWIFT_VERSION: "5.9"
-    TARGETED_DEVICE_FAMILY: "1,2"
 
 targets:
   WSBridge:
@@ -19,8 +27,10 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: WSBridge
-        CFBundleShortVersionString: "0.2.0"
-        CFBundleVersion: "87"
+        # CFBundleVersion обязан быть числом (App Store/GBox) — берём
+        # из WSB_BUILD как есть; CFBundleShortVersionString — 0.2.N.
+        CFBundleVersion: $(WSB_BUILD)
+        CFBundleShortVersionString: $(WSB_MARKETING_VERSION)
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
     entitlements:
@@ -57,8 +67,8 @@ targets:
       path: Tunnel/Info.plist
       properties:
         CFBundleDisplayName: WSBridge Tunnel
-        CFBundleShortVersionString: "0.2.0"
-        CFBundleVersion: "87"
+        CFBundleVersion: $(WSB_BUILD)
+        CFBundleShortVersionString: $(WSB_MARKETING_VERSION)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider

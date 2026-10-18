@@ -28,6 +28,21 @@ jobs:
           sudo xcode-select -s "$XC/Contents/Developer"
           xcodebuild -version
 
+      - name: Check tag matches WSB_BUILD
+        run: |
+          # Тег v0.2.N обязан совпадать с WSB_BUILD в project.yml, иначе
+          # собранный IPA уедет с версией, отличной от номера релиза.
+          BUILD=$(grep -m1 'WSB_BUILD:' project.yml | sed -E 's/.*"([0-9]+)".*/\1/')
+          EXPECTED="v0.2.$BUILD"
+          TAG="${{ github.ref_name }}"
+          if [ "$TAG" != "$EXPECTED" ]; then
+            echo "::error::Тег $TAG не совпадает с WSB_BUILD=$BUILD (ожидался $EXPECTED)."
+            echo "Сначала подними WSB_BUILD в project.yml и запушь в main, потом тегни."
+            exit 1
+          fi
+          echo "Тег $TAG совпадает с WSB_BUILD=$BUILD"
+        shell: bash
+
       - name: Generate Xcode Project
         run: xcodegen generate
 

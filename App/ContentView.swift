@@ -111,8 +111,10 @@ struct ContentView: View {
                     }
                 }
 
-                // Версия и копирайт — одна строка, почти над «Домой»
-                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") (\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?")) · © 2026 l1ratch")
+                // Версия и копирайт — одна строка, почти над «Домой».
+                // Только маркетинговая версия (0.2.N): её последнее число
+                // и есть номер сборки, дублировать его в скобках незачем.
+                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") · © 2026 l1ratch")
                     .font(.caption2)
                     .foregroundStyle(.secondary.opacity(0.5))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
@@ -438,9 +440,8 @@ struct AboutView: View {
     }
 
     private var versionString: String {
-        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
-        return "\(v) (\(b))"
+        // 0.2.N — единый формат везде: N и есть номер сборки (WSB_BUILD).
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
     }
 }
 
