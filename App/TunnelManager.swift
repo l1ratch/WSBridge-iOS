@@ -91,7 +91,6 @@ final class TunnelManager: ObservableObject {
             if statusHistory.count > 40 {
                 statusHistory.removeFirst(statusHistory.count - 40)
             }
-            syncNudges()
         }
     }
     /// История переходов статуса — диагностика «мёртвой кнопки».
@@ -115,26 +114,127 @@ final class TunnelManager: ObservableObject {
         var name: String
         var description: String
         var servers: [String]       // IP-адреса (bootstrap + plain fallback)
-        var dohURL: String?         // DNS-over-HTTPS URL (приоритет 1)
-        var dotHostname: String?    // DNS-over-TLS hostname (приоритет 2)
+        var dohURL: String?         // DNS-over-HTTPS URL
+        var dotHostname: String?    // DNS-over-TLS hostname (SNI)
         var isPreset: Bool
+        var site: String?           // офсайт провайдера (обязателен для пресетов)
+
+        /// Какие транспорты конфиг умеет.
+        var supportsDoT: Bool {
+            !(dotHostname ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        var supportsDoH: Bool {
+            !(dohURL ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+        }
+
+        /// Короткая метка транспортов для списков.
+        var transportsLabel: String {
+            switch (supportsDoT, supportsDoH) {
+            case (true, true): "DoT · DoH"
+            case (true, false): "DoT"
+            case (false, true): "DoH"
+            default: "без шифрования"
+            }
+        }
     }
 
-    /// Пресеты — не удаляются, не редактируются.
-    /// Приоритет: DoH > DoT > plain :53 (только для своих без URL).
+    /// Транспорт шифрованного DNS. По умолчанию DoT: коннект идёт напрямую
+    /// к IP:853 с SNI и не требует бутстрап-резолва имени сервера, который
+    /// система делает уже под туннелем (эта ступень и ломала DoH).
+    enum DNSMode: String, CaseIterable {
+        case dot, doh
+
+        var title: String {
+            switch self {
+            case .dot: "DNS-over-TLS"
+            case .doh: "DNS-over-HTTPS"
+            }
+        }
+        var shortTitle: String {
+            switch self {
+            case .dot: "DoT"
+            case .doh: "DoH"
+            }
+        }
+        var hint: String {
+            switch self {
+            case .dot: "Порт 853. Прямой коннект к IP сервера — без резолва имени под туннелем."
+            case .doh: "Порт 443. Маскируется под обычный HTTPS, но требует резолва имени сервера."
+            }
+        }
+    }
+
+    /// Пресеты: не удаляются и не редактируются. Подписи статичные и
+    /// короткие: базовые резолверы — «без фильтрации», остальные — обход.
     static let dnsPresets: [DNSConfig] = [
-        DNSConfig(id: "system", name: "Системный", description: "DNS устройства (туннель не трогает DNS)",
-                  servers: [], dohURL: nil, dotHostname: nil, isPreset: true),
-        DNSConfig(id: "google", name: "Google", description: "Быстрый, надёжный, без фильтрации",
-                  servers: ["8.8.8.8", "8.8.4.4"], dohURL: "https://dns.google/dns-query", dotHostname: nil, isPreset: true),
-        DNSConfig(id: "cloudflare", name: "Cloudflare", description: "Быстрый, приватный, без фильтрации",
-                  servers: ["1.1.1.1", "1.0.0.1"], dohURL: "https://cloudflare-dns.com/dns-query", dotHostname: nil, isPreset: true),
-        DNSConfig(id: "comss", name: "Comss.one", description: "Доступ к ИИ, блокировка рекламы, счетчиков, вредоносных сайтов и фишинга",
-                  servers: ["83.220.169.155", "212.109.195.93"], dohURL: "https://dns.comss.one/dns-query", dotHostname: nil, isPreset: true),
-        DNSConfig(id: "malw", name: "Malw.link", description: "Разблокирует недоступные сайты, блокирует мусор.",
-                  servers: ["95.216.204.218", "80.253.249.40"], dohURL: "https://dns.malw.link/dns-query",
-                  dotHostname: "dns.malw.link", isPreset: true),
+        DNSConfig(id: "system", name: "Системный",
+                  description: "DNS устройства, туннель его не трогает",
+                  servers: [], dohURL: nil, dotHostname: nil, isPreset: true, site: nil),
+        DNSConfig(id: "cloudflare", name: "Cloudflare",
+                  description: "Базовый, без фильтрации",
+                  servers: ["1.1.1.1", "1.0.0.1"],
+                  dohURL: "https://cloudflare-dns.com/dns-query",
+                  dotHostname: "one.one.one.one", isPreset: true,
+                  site: "https://one.one.one.one/"),
+        DNSConfig(id: "google", name: "Google",
+                  description: "Базовый, без фильтрации",
+                  servers: ["8.8.8.8", "8.8.4.4"],
+                  dohURL: "https://dns.google/dns-query",
+                  dotHostname: "dns.google", isPreset: true,
+                  site: "https://developers.google.com/speed/public-dns"),
+        DNSConfig(id: "comss", name: "Comss.one",
+                  description: "Для обхода гео-блокировок",
+                  servers: ["83.220.169.155", "212.109.195.93"],
+                  dohURL: "https://dns.comss.one/dns-query",
+                  dotHostname: "dns.comss.one", isPreset: true,
+                  site: "https://www.comss.ru/page.php?id=7315"),
+        DNSConfig(id: "malw", name: "Malw.link",
+                  description: "Для обхода гео-блокировок",
+                  servers: ["179.254.166.171", "164.5.224.81"],
+                  dohURL: "https://dns.malw.link/dns-query",
+                  dotHostname: "dns.malw.link", isPreset: true,
+                  site: "https://info.dns.malw.link/"),
+        DNSConfig(id: "geohide", name: "GeoHide",
+                  description: "Для обхода гео-блокировок",
+                  // 159.194.200.33 из офсписка мёртв (53/853/443 закрыты) — не тащим.
+                  servers: ["193.233.112.68", "193.233.112.67", "193.233.112.88",
+                            "37.230.192.51"],
+                  dohURL: "https://geohide.ru/dns-query",
+                  dotHostname: "geohide.ru", isPreset: true,
+                  site: "https://geohide.ru/"),
+        DNSConfig(id: "xbox", name: "XBox DNS",
+                  description: "Для обхода гео-блокировок",
+                  // .55/853 живой, .54 — нет; .56/.57 — то, куда резолвится офхост.
+                  servers: ["111.88.96.55", "111.88.96.54"],
+                  dohURL: "https://xbox-dns.ru/dns-query",
+                  dotHostname: "xbox-dns.ru", isPreset: true,
+                  site: "https://xbox-dns.ru/#faq"),
+        DNSConfig(id: "malw-gateway", name: "Cloudflare Gateway",
+                  description: "Для обхода гео-блокировок",
+                  servers: ["162.159.36.5", "162.159.36.20"],
+                  dohURL: "https://5u35p8m9i7.cloudflare-gateway.com/dns-query",
+                  dotHostname: "5u35p8m9i7.cloudflare-gateway.com", isPreset: true,
+                  site: "https://info.dns.malw.link/"),
     ]
+
+    /// Выбранный транспорт шифрованного DNS (по умолчанию DoT).
+    @Published var dnsModeRaw: String =
+        UserDefaults.standard.string(forKey: "dnsMode") ?? DNSMode.dot.rawValue {
+        didSet { UserDefaults.standard.set(dnsModeRaw, forKey: "dnsMode") }
+    }
+
+    var dnsMode: DNSMode { DNSMode(rawValue: dnsModeRaw) ?? .dot }
+
+    /// Фактический транспорт для выбранного конфига: если предпочитаемый
+    /// недоступен у конфига — берём второй, если и его нет — nil (plain :53).
+    var effectiveDNSMode: DNSMode? {
+        switch dnsMode {
+        case .dot: return selectedDNS.supportsDoT ? .dot
+            : (selectedDNS.supportsDoH ? .doh : nil)
+        case .doh: return selectedDNS.supportsDoH ? .doh
+            : (selectedDNS.supportsDoT ? .dot : nil)
+        }
+    }
 
     /// Свои DNS-конфиги (хранятся в UserDefaults).
     @Published var customDNS: [DNSConfig] = {
@@ -258,34 +358,6 @@ final class TunnelManager: ObservableObject {
             frontsUpdateMessage = "Не удалось обновить (нет сети или источники недоступны)"
         }
         return false
-    }
-
-    // ── Нуджи: локальные уведомления ────────────────────────────
-    /// «Долго включен»: повторяющийся нудж каждые 6 ч, пока туннель
-    /// .connected. Планирует СИСТЕМА — сработает, даже если приложение
-    /// убито; снимается при остановке туннеля.
-    private static let longSessionID = "wsbridge.longSession"
-    private static let longSessionInterval: TimeInterval = 6 * 3600
-
-    private func syncNudges() {
-        let center = UNUserNotificationCenter.current()
-        switch status {
-        case .connected:
-            let c = UNMutableNotificationContent()
-            c.title = "Туннель включен давно"
-            c.body = "Больше 6 часов без перезапуска. Если интернет тормозит — выключи и включи его в WSBridge."
-            let t = UNTimeIntervalNotificationTrigger(
-                timeInterval: Self.longSessionInterval, repeats: true)
-            center.add(UNNotificationRequest(
-                identifier: Self.longSessionID, content: c, trigger: t))
-        case .disconnected, .invalid, .disconnecting:
-            center.removePendingNotificationRequests(
-                withIdentifiers: [Self.longSessionID])
-        case .connecting, .reasserting:
-            break
-        @unknown default:
-            break
-        }
     }
 
     // ── Смена сети: догонялка через журнал ──────────────────────
@@ -487,11 +559,15 @@ final class TunnelManager: ObservableObject {
             if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
             if !activeDNSServers.isEmpty {
                 config["dns"] = activeDNSServers as NSArray
-                if let doh = selectedDNS.dohURL {
-                    config["doh"] = doh as NSString
-                }
-                if let dot = selectedDNS.dotHostname {
-                    config["dot"] = dot as NSString
+                // Транспорт выбирает пользователь (свитчер). Передаём РОВНО
+                // один ключ: расширение ничего не додумывает за него.
+                switch effectiveDNSMode {
+                case .doh:
+                    if let doh = selectedDNS.dohURL { config["doh"] = doh as NSString }
+                case .dot:
+                    if let dot = selectedDNS.dotHostname { config["dot"] = dot as NSString }
+                case nil:
+                    break // ни DoT, ни DoH — plain :53
                 }
             }
             proto.providerConfiguration = config.isEmpty ? nil : config

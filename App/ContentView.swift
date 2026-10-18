@@ -147,7 +147,7 @@ struct ContentView: View {
                 }
                 Button("Позже", role: .cancel) {}
             } message: {
-                Text("Телефон переподключался к другой сети с включенным туннелем. Если интернет тормозит — перезапусти туннель.")
+                Text("Если интернет тормозит — перезапусти туннель.")
             }
         }
     }
@@ -457,6 +457,22 @@ struct DNSView: View {
                     .foregroundStyle(.secondary)
             }
 
+            // Свитчер транспорта: DoT по умолчанию (прямой коннект к IP:853,
+            // без бутстрап-резолва имени под туннелем), DoH — если хочется
+            // маскировку под HTTPS.
+            Section("Шифрование DNS") {
+                Picker("Транспорт", selection: $tunnel.dnsModeRaw) {
+                    ForEach(TunnelManager.DNSMode.allCases, id: \.rawValue) { mode in
+                        Text(mode.shortTitle).tag(mode.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+                Text(tunnel.dnsMode.hint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                DNSModeFallbackNote(tunnel: tunnel)
+            }
+
             Section("DNS-серверы") {
                 ForEach(tunnel.allDNS) { config in
                     Button {
@@ -466,7 +482,7 @@ struct DNSView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(config.name)
                                     .foregroundStyle(.primary)
-                                Text(config.description)
+                                Text("\(config.description) · \(config.transportsLabel)")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -499,6 +515,22 @@ struct DNSView: View {
     }
 }
 
+/// Если у выбранного сервера нет предпочитаемого транспорта — честно
+/// говорим, что пойдёт запасной, а не делаем вид, что всё по свитчеру.
+private struct DNSModeFallbackNote: View {
+    @ObservedObject var tunnel: TunnelManager
+
+    var body: some View {
+        if tunnel.effectiveDNSMode != tunnel.dnsMode {
+            Text(tunnel.effectiveDNSMode == nil
+                 ? "У этого сервера нет ни DoT, ни DoH — запросы пойдут простым DNS (порт 53)."
+                 : "У этого сервера нет \(tunnel.dnsMode.shortTitle) — будет использован \(tunnel.effectiveDNSMode!.shortTitle).")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        }
+    }
+}
+
 /// Управление DNS: просмотр, добавление, редактирование, удаление.
 struct DNSManageView: View {
     @ObservedObject var tunnel: TunnelManager
@@ -517,7 +549,7 @@ struct DNSManageView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(config.name)
                                     .foregroundStyle(.primary)
-                                Text(config.description)
+                                Text("\(config.description) · \(config.transportsLabel)")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -540,7 +572,7 @@ struct DNSManageView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(config.name)
                                     .foregroundStyle(.primary)
-                                Text(config.description)
+                                Text("\(config.description) · \(config.transportsLabel)")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -591,6 +623,12 @@ struct DNSDetailView: View {
                 if !config.description.isEmpty {
                     LabeledContent("Описание", value: config.description)
                 }
+                LabeledContent("Транспорты", value: config.transportsLabel)
+                if let site = config.site, let url = URL(string: site) {
+                    Link(destination: url) {
+                        Label("Сайт провайдера", systemImage: "safari")
+                    }
+                }
             }
             if !config.servers.isEmpty {
                 Section("Серверы") {
@@ -635,7 +673,8 @@ struct DNSEditorView: View {
     @State private var servers: [String] = []
     @State private var dohURL = ""
     @State private var dotHostname = ""
-    @State private var showPlainWarning = false
+    /// Лимит описания: подписи короткие, разъезжаются по строкам иначе.
+    private static let descriptionLimit = 60
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -643,6 +682,14 @@ struct DNSEditorView: View {
             Section("Название") {
                 TextField("Например: Мой DNS", text: $name)
                 TextField("Описание (необязательно)", text: $description)
+                    .onChange(of: description) { _, new in
+                        if new.count > Self.descriptionLimit {
+                            description = String(new.prefix(Self.descriptionLimit))
+                        }
+                    }
+                Text("\(description.count)/\(Self.descriptionLimit)")
+                    .font(.caption2)
+                    .foregroundStyle(description.count >= Self.descriptionLimit ? .orange : .secondary)
             }
             Section("Серверы (IP)") {
                 ForEach(servers.indices, id: \.self) { i in
@@ -669,26 +716,26 @@ struct DNSEditorView: View {
                     Label("Добавить сервер", systemImage: "plus.circle")
                 }
             }
-            Section("DNS-over-HTTPS (рекомендуется)") {
+            Section("DNS-over-TLS (обязательно)") {
+                TextField("dns.example.com", text: $dotHostname)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Text("Имя хоста сервера для SNI. Коннект идёт напрямую к IP:853 — резолв имени под туннелем не нужен, поэтому DoT самый надёжный вариант.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("DNS-over-HTTPS (по желанию)") {
                 TextField("https://example.com/dns-query", text: $dohURL)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
-                Text("Запросы шифруются через HTTPS (порт 443). Провайдер не может перехватить.")
+                Text("Нужен, только если хотите работать через DoH: порт 443, маскировка под обычный HTTPS.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Section("DNS-over-TLS") {
-                TextField("dns.example.com", text: $dotHostname)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                Text("Используется если DoH URL не указан. Запросы шифруются через TLS (порт 853).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if dohURL.trimmingCharacters(in: .whitespaces).isEmpty && dotHostname.trimmingCharacters(in: .whitespaces).isEmpty {
+            if dotHostname.trimmingCharacters(in: .whitespaces).isEmpty {
                 Section {
-                    Label("Без DoH/DoT запросы идут по обычному DNS (порт 53) и могут блокироваться или перехватываться провайдером.", systemImage: "exclamationmark.triangle")
+                    Label("Укажите DoT-хост: свой DNS без TLS не принимается — незашифрованный резолв перехватывается провайдером.", systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -712,7 +759,8 @@ struct DNSEditorView: View {
                 Button("Сохранить") {
                     save()
                 }
-                .disabled(name.isEmpty || servers.allSatisfy { $0.isEmpty })
+                .disabled(name.isEmpty || servers.allSatisfy { $0.isEmpty }
+                          || dotHostname.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
         .onAppear {
@@ -746,7 +794,8 @@ struct DNSEditorView: View {
                 servers: cleanServers,
                 dohURL: cleanDoh.isEmpty ? nil : cleanDoh,
                 dotHostname: cleanDot.isEmpty ? nil : cleanDot,
-                isPreset: false
+                isPreset: false,
+                site: nil
             )
             tunnel.customDNS.append(newConfig)
             tunnel.selectedDNSId = newConfig.id

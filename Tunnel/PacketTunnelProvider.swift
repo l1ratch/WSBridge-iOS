@@ -20,6 +20,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pollTimer: DispatchSourceTimer?
     private var ioTimer: DispatchSourceTimer?
     private var workerDomain: String?
+    /// ID нуджа «долго включен». Владелец — расширение (см. scheduleLongSessionNudge).
+    private static let longSessionID = "wsbridge.longSession"
     // Смена сети: расширение — единственный живой процесс, пока туннель
     // включен (приложение в фоне усыплено и NWPathMonitor там молчит).
     private var pathMonitor: NWPathMonitor?
@@ -93,6 +95,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self?.startTimers()
             self?.readLoop()
             self?.startPathMonitor()
+            self?.scheduleLongSessionNudge()
             completionHandler(nil)
         }
     }
@@ -239,6 +242,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         EventLog.append("fronts_health:\(FrontHealthRegistry.summary())")
         EventLog.flush()
         journalServer.stop()
+        // Нудж 6ч гасим ЗДЕСЬ: stopTunnel исполняется всегда, в отличие от
+        // кода приложения, которое к этому моменту может быть уже убито.
+        cancelLongSessionNudge()
         pathMonitor?.cancel(); pathMonitor = nil
         pollTimer?.cancel(); pollTimer = nil
         ioTimer?.cancel(); ioTimer = nil
@@ -270,9 +276,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.lastNetNotifAt = Date()
             let c = UNMutableNotificationContent()
             c.title = "Сеть сменилась"
-            let prevIfaces = prev.split(separator: ":", maxSplits: 1)
-                .last.map(String.init) ?? prev
-            c.body = "Телефон переподключился: \(prevIfaces) → \(ifaces). Если интернет тормозит — перезапусти туннель в WSBridge."
+            c.body = "Телефон переподключился к другой сети. Если интернет тормозит — перезапусти туннель в WSBridge."
             let req = UNNotificationRequest(
                 identifier: "wsbridge.netChange", content: c,
                 trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false))
@@ -293,6 +297,32 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         case .other: return "др."
         @unknown default: return "?"
         }
+    }
+
+    /// Нудж «долго включен»: одноразовый триггер через 6 ч, планирует и
+    /// снимает САМО расширение. Раньше это делало приложение с repeats:true —
+    /// и после выключения туннеля повторяющийся триггер продолжал жить,
+    /// потому что снять его было некому (приложение уже убито системой).
+    /// Одноразовость + снятие в stopTunnel (он исполняется всегда) закрывают
+    /// этот класс спама полностью.
+    private func scheduleLongSessionNudge() {
+        let c = UNMutableNotificationContent()
+        c.title = "Туннель включен давно"
+        c.body = "Больше 6 часов без перезапуска. Если интернет тормозит — перезапусти туннель в WSBridge."
+        let req = UNNotificationRequest(
+            identifier: Self.longSessionID, content: c,
+            trigger: UNTimeIntervalNotificationTrigger(
+                timeInterval: 6 * 3600, repeats: false))
+        UNUserNotificationCenter.current().add(req) { err in
+            EventLog.append("notif_long:\(err?.localizedDescription ?? "ok")")
+        }
+    }
+
+    private func cancelLongSessionNudge() {
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [Self.longSessionID])
+        UNUserNotificationCenter.current()
+            .removeDeliveredNotifications(withIdentifiers: [Self.longSessionID])
     }
 
     override func handleAppMessage(
