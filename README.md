@@ -91,6 +91,21 @@ xcodegen generate
 xcodebuild -project WSBridge.xcodeproj -scheme WSBridge -sdk iphoneos build
 ```
 
+### Versioning
+
+A single value drives everything: `WSB_BUILD` in `project.yml`. The app and
+the tunnel extension both get `CFBundleVersion = N` and
+`CFBundleShortVersionString = 0.2.N`, so the last number of the version is
+the build number. CI reads the same value for the GBox manifest and fails
+the build if the plists do not match it; the release workflow refuses a tag
+that differs from `WSB_BUILD`. Releasing is therefore one edit plus a tag:
+
+```sh
+# bump WSB_BUILD, then
+git push origin main
+git tag v0.2.88 && git push origin v0.2.88
+```
+
 ## License
 
 MIT © 2026 l1ratch. Portable logic adapted from

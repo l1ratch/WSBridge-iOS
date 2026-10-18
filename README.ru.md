@@ -91,6 +91,21 @@ xcodegen generate
 xcodebuild -project WSBridge.xcodeproj -scheme WSBridge -sdk iphoneos build
 ```
 
+### Версионирование
+
+Всем управляет одно значение — `WSB_BUILD` в `project.yml`. И приложение,
+и расширение получают `CFBundleVersion = N` и
+`CFBundleShortVersionString = 0.2.N`, то есть последнее число версии и
+есть номер сборки. CI берёт это же значение для GBox-манифеста и падает,
+если plist-ы с ним разошлись; релизный workflow отказывается собирать тег,
+не совпадающий с `WSB_BUILD`. Выпуск — одна правка плюс тег:
+
+```sh
+# подними WSB_BUILD, затем
+git push origin main
+git tag v0.2.88 && git push origin v0.2.88
+```
+
 ## Лицензия
 
 MIT © 2026 l1ratch. Портируемая логика —
