@@ -141,6 +141,7 @@ struct ContentView: View {
             }
             .task { await tunnel.reload() }
             .onChange(of: scenePhase) { _, new in
+                // noteActive сам перечитывает менеджер и статус.
                 if new == .active { tunnel.noteActive() }
             }
             .alert("Сеть сменилась", isPresented: $tunnel.showNetChangeAlert) {

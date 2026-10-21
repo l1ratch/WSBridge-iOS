@@ -367,6 +367,9 @@ final class TunnelManager: ObservableObject {
     /// UN.delegate — слабый; держим презентера навсегда.
     private static let bannerPresenter = BannerPresenter()
     private var lastToggleAt = Date.distantPast
+    /// Растёт на каждый toggle/restart: сторож старта сравнивает своё
+    /// поколение с текущим и не срабатывает на устаревших запусках.
+    private var toggleGeneration = 0
     private var lastActiveAt = Date()
     private static let netTimeFmt: DateFormatter = {
         let f = DateFormatter()
@@ -378,6 +381,9 @@ final class TunnelManager: ObservableObject {
     func noteActive() {
         let since = lastActiveAt
         lastActiveAt = Date()
+        // Кэш NETunnelProviderManager после фона устаревает — перечитываем,
+        // иначе первый тап после возврата уйдёт не в ту сторону.
+        Task { await reload() }
         // Если уведомления разрешены — их постит расширение (UN работают
         // и в фоне, и в форграунде через willPresent). Догонялка через
         // журнал — только при отказе в разрешении, иначе двойные алерты.
@@ -411,15 +417,25 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// Перезапуск: выкл → дождаться отключения → вкл.
+    /// Перезапуск: стоп → старт. Без saveToPreferences в фазе стопа:
+    /// сохранение конфигурации включенного туннеля заставляет iOS
+    /// пересоздать сессию (см. комментарий у stop).
     func restartTunnel() async {
-        guard status == .connected || status == .reasserting else { return }
-        await toggle(force: true)
-        for _ in 0..<40 {
-            if status == .disconnected || status == .invalid { break }
-            try? await Task.sleep(nanoseconds: 250_000_000)
+        toggleGeneration += 1
+        let gen = toggleGeneration
+        let m = await refreshManager() ?? freshManager()
+        let s = m.connection.status
+        if s == .connected || s == .connecting || s == .reasserting || s == .disconnecting {
+            await stop(m)
         }
-        await toggle(force: true)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        do {
+            try await start(m, needsFrontsUpdate: false, generation: gen)
+        } catch {
+            NSLog("[WSBridge] restart error: %@", error.localizedDescription)
+            errorMessage = error.localizedDescription
+            status = m.connection.status
+        }
     }
 
     private var manager: NETunnelProviderManager?
@@ -515,100 +531,215 @@ final class TunnelManager: ObservableObject {
     }
 
     func reload() async {
-        manager = try? await NETunnelProviderManager.loadAllFromPreferences().first
+        let all = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
+        if all.count > 1 { await dedupeConfigs(all) }
+        manager = (try? await NETunnelProviderManager.loadAllFromPreferences())?.first
         status = manager?.connection.status ?? .invalid
+    }
+
+    /// За годы сборок каждый «первый запуск» мог создать свою конфигурацию —
+    /// в preferences копились дубликаты VPN-профиля. Живой держим один
+    /// (первый, тот же, что видит System Settings); остальные выключенные
+    /// удаляем, иначе их соединения путают direction-детект и «поднимают»
+    /// туннель неожиданно.
+    private func dedupeConfigs(_ all: [NETunnelProviderManager]) async {
+        // Живой оставляем активный, иначе первый.
+        let active = all.first { m in
+            let s = m.connection.status
+            return s == .connected || s == .connecting || s == .reasserting
+        }
+        guard let survivor = active ?? all.first else { return }
+        for m in all {
+            guard m !== survivor else { continue }
+            let s = m.connection.status
+            // Удаляем только заведомо неактивные дубликаты — чужую
+            // работающую сессию не трогаем.
+            guard s == .disconnected || s == .invalid else { continue }
+            logStatusEvent("dedupe:remove:\(m.localizedDescription ?? "-")")
+            try? await m.removeFromPreferences()
+        }
+    }
+
+    /// Свежий менеджер из preferences. После фона/сна кэш устаревает:
+    /// старый NEVPNConnection перестаёт управлять сессией, и stopVPNTunnel()
+    /// тихо уходит в никуда — это и была «мёртвая кнопка».
+    private func refreshManager() async -> NETunnelProviderManager? {
+        if let fresh = try? await NETunnelProviderManager.loadAllFromPreferences().first {
+            manager = fresh
+        }
+        return manager
     }
 
     func toggle(force: Bool = false) async {
         // Дебаунс: параллельные saveToPreferences от дабл-тапов — гонки.
-        // Кнопка больше не disabled ни в каком статусе: залипший
-        // published-статус не должен убивать тап (баг билдов 81-84);
-        // направление решения читается ниже с живого connection.status.
         guard force || Date().timeIntervalSince(lastToggleAt) > 2 else { return }
         lastToggleAt = Date()
         errorMessage = nil
-        // Локальные уведомления (нудж «долго включен» + «сеть сменилась»
-        // из расширения): разрешение спрашиваем один раз, при включении.
+        toggleGeneration += 1
+        let gen = toggleGeneration
+
+        let loaded = await refreshManager()
+        let m = loaded ?? freshManager()
+        // Направление — ТОЛЬКО по живому статусу, не по published.
+        switch m.connection.status {
+        case .connected, .connecting, .reasserting:
+            await stop(m)
+        default:
+            do {
+                let needsFrontsUpdate =
+                    (frontsUpdatedAt?.timeIntervalSinceNow ?? -3600) < -1800
+                try await start(m, needsFrontsUpdate: needsFrontsUpdate, generation: gen)
+            } catch {
+                NSLog("[WSBridge] start error: %@", error.localizedDescription)
+                errorMessage = error.localizedDescription
+                status = m.connection.status
+            }
+        }
+    }
+
+    /// Первый запуск: конфигурации ещё нет. Сохранять менеджер без
+    /// protocolConfiguration нельзя (NEVPNError 1), но start() заполняет
+    /// его до saveToPreferences — поэтому просто отдаём пустой объект.
+    private func freshManager() -> NETunnelProviderManager {
+        let fresh = NETunnelProviderManager()
+        fresh.localizedDescription = "WSBridge"
+        return fresh
+    }
+
+    /// Выключение. Здесь НИ ОДНОГО saveToPreferences: сохранение
+    /// конфигурации активного туннеля заставляет iOS пересоздать сессию —
+    /// туннель «переподнимается» сам, и выключить его удаётся только со
+    /// второго раза (ровно этот симптом и наблюдался). Конфигурацию пишем
+    /// только в start(), когда туннель уже не работает.
+    ///
+    /// Если iOS всё же поднял сессию обратно (наблюдалось при выключении
+    /// из системных настроек и после фона) — ловим это и гасим повторно:
+    /// три попытки, каждая с записью в историю статусов.
+    private func stop(_ m: NETunnelProviderManager) async {
+        for attempt in 1...3 {
+            logStatusEvent("stop:attempt\(attempt):\(m.connection.status)")
+            m.connection.stopVPNTunnel()
+            status = .disconnecting
+            // Ждём фактического отключения: до 8 с на попытку.
+            var wentDown = false
+            for _ in 0..<32 {
+                let s = m.connection.status
+                if s == .disconnected || s == .invalid {
+                    status = s
+                    wentDown = true
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+            if wentDown {
+                // Контрольный взгляд через секунду: если сессия поднялась
+                // обратно — это и есть «переподнялся сам», гасим ещё раз.
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                let s = m.connection.status
+                if s != .connected && s != .connecting && s != .reasserting {
+                    status = s
+                    logStatusEvent("stop:done")
+                    return
+                }
+                logStatusEvent("stop:resurrected:\(s)")
+                continue
+            }
+            // Не отключился за 8 с — соединение протухло. Перечитываем
+            // менеджер и пробуем снова с живым объектом.
+            logStatusEvent("stop:timeout:\(m.connection.status)")
+            _ = await refreshManager()
+        }
+        status = manager?.connection.status ?? .disconnected
+        logStatusEvent("stop:gaveup:\(status)")
+        // Последняя инстанция: not-responding session гасится только
+        // выключением самой конфигурации. isEnabled обратно поднимет
+        // start() при следующем включении — конфиг не теряется.
+        if let m2 = await refreshManager(), m2.connection.status != .disconnected {
+            logStatusEvent("stop:disableConfig")
+            m2.isEnabled = false
+            try? await m2.saveToPreferences()
+            try? await m2.loadFromPreferences()
+            for _ in 0..<20 {
+                if m2.connection.status == .disconnected || m2.connection.status == .invalid {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+            status = m2.connection.status
+            logStatusEvent("stop:disableConfig->\(status)")
+        }
+        if status == .connected || status == .connecting || status == .reasserting {
+            errorMessage = "Туннель не выключился. Попробуй ещё раз."
+        }
+    }
+
+    /// Строка в историю статусов (видна в Меню → Статистика) — благодаря
+    /// ей следующий отчёт «кнопка не работает» будет с фактами, а не с
+    /// догадками.
+    private func logStatusEvent(_ text: String) {
+        statusHistory.append("\(Self.netTimeFmt.string(from: Date())) \(text)")
+        if statusHistory.count > 40 {
+            statusHistory.removeFirst(statusHistory.count - 40)
+        }
+    }
+
+    /// Включение: конфигурация пересоздаётся (worker/fronts/DNS доезжают
+    /// до расширения только так), затем старт.
+    private func start(
+        _ m: NETunnelProviderManager,
+        needsFrontsUpdate: Bool,
+        generation: Int = 0
+    ) async throws {
         if status != .connected {
             UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert]) { _, _ in }
         }
-        // Автообновление списка фронтов: тихо, в фоне, ПОСЛЕ включения —
-        // не конкурирует с saveToPreferences за UserDefaults и не влияет
-        // на старт. Не чаще раза в 30 минут. Применится при след. включении.
-        let needsFrontsUpdate = (frontsUpdatedAt?.timeIntervalSinceNow ?? -3600) < -1800
-        do {
-            let m: NETunnelProviderManager
-            if let existing = manager {
-                m = existing
-            } else {
-                // Сохранять свежий менеджер БЕЗ protocolConfiguration нельзя:
-                // NEVPNError 1 «Missing protocol or protocol has invalid type».
-                // Протокол назначается ниже, до первого saveToPreferences.
-                let fresh = NETunnelProviderManager()
-                fresh.localizedDescription = "WSBridge"
-                m = fresh
+        let proto = NETunnelProviderProtocol()
+        proto.providerBundleIdentifier = Self.providerBundleId
+        proto.serverAddress = "WSBridge"
+        let wd = workerDomain.trimmingCharacters(in: .whitespacesAndNewlines)        var config: [String: NSObject] = [:]
+        if !wd.isEmpty { config["worker"] = wd as NSString }
+        if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
+        if !activeDNSServers.isEmpty {
+            config["dns"] = activeDNSServers as NSArray
+            // Транспорт выбирает пользователь (свитчер). Передаём РОВНО
+            // один ключ: расширение ничего не додумывает за него.
+            switch effectiveDNSMode {
+            case .doh:
+                if let doh = selectedDNS.dohURL { config["doh"] = doh as NSString }
+            case .dot:
+                if let dot = selectedDNS.dotHostname { config["dot"] = dot as NSString }
+            case nil:
+                break // ни DoT, ни DoH — plain :53
             }
-            // Конфигурация пересоздаётся при каждом включении: домен worker'а
-            // доезжает до расширения через providerConfiguration.
-            let proto = NETunnelProviderProtocol()
-            proto.providerBundleIdentifier = Self.providerBundleId
-            proto.serverAddress = "WSBridge"
-            let wd = workerDomain.trimmingCharacters(in: .whitespacesAndNewlines)
-            var config: [String: NSObject] = [:]
-            if !wd.isEmpty { config["worker"] = wd as NSString }
-            if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
-            if !activeDNSServers.isEmpty {
-                config["dns"] = activeDNSServers as NSArray
-                // Транспорт выбирает пользователь (свитчер). Передаём РОВНО
-                // один ключ: расширение ничего не додумывает за него.
-                switch effectiveDNSMode {
-                case .doh:
-                    if let doh = selectedDNS.dohURL { config["doh"] = doh as NSString }
-                case .dot:
-                    if let dot = selectedDNS.dotHostname { config["dot"] = dot as NSString }
-                case nil:
-                    break // ни DoT, ни DoH — plain :53
-                }
-            }
-            proto.providerConfiguration = config.isEmpty ? nil : config
-            m.protocolConfiguration = proto
+        }
+        proto.providerConfiguration = config.isEmpty ? nil : config
+        m.protocolConfiguration = proto
+        try await m.saveToPreferences()
+        try await m.loadFromPreferences()
+        // NEVPNErrorDomain error 2 (configurationDisabled): менеджер по умолчанию
+        // сохраняется выключенным — включаем конфигурацию до старта туннеля.
+        if !m.isEnabled {
+            m.isEnabled = true
             try await m.saveToPreferences()
             try await m.loadFromPreferences()
-            // NEVPNErrorDomain error 2 (configurationDisabled): менеджер по умолчанию
-            // сохраняется выключенным — включаем конфигурацию до старта туннеля.
-            if !m.isEnabled {
-                m.isEnabled = true
-                try await m.saveToPreferences()
-                try await m.loadFromPreferences()
+        }
+        manager = m
+        try m.connection.startVPNTunnel()
+        status = m.connection.status
+        if needsFrontsUpdate {
+            Task { await updateFronts() }
+        }
+        // Сторож: статус не сдвинулся за 20 с — расширение умерло молча.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            guard let self, self.toggleGeneration == generation,
+                  self.status == .connecting || self.status == .reasserting
+            else { return }
+            self.errorMessage = "Туннель не запустился. Попробуй ещё раз."
+            if let conn = self.manager?.connection {
+                self.status = conn.status
             }
-            manager = m
-            switch m.connection.status {
-            case .connected, .connecting, .reasserting:
-                m.connection.stopVPNTunnel()
-            default:
-                try m.connection.startVPNTunnel()
-                if needsFrontsUpdate {
-                    Task { await updateFronts() }
-                }
-                // Сторож: если за 20с статус не сдвинулся (расширение умерло
-                // молча) — показываем ошибку и разблокируем кнопку.
-                let startStatus = m.connection.status
-                Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: 20_000_000_000)
-                    guard let self, self.status == startStatus,
-                          startStatus == .connecting || startStatus == .reasserting else { return }
-                    self.errorMessage = "Туннель не запустился. Попробуй ещё раз."
-                    if let conn = self.manager?.connection {
-                        self.status = conn.status
-                    }
-                }
-            }
-            status = m.connection.status
-        } catch {
-            NSLog("[WSBridge] toggle error: %@", error.localizedDescription)
-            errorMessage = error.localizedDescription
-            status = manager?.connection.status ?? .invalid
         }
     }
 }

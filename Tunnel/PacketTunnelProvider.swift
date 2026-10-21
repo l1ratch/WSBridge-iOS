@@ -241,18 +241,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         FrontHealthRegistry.flush(immediate: true)
         EventLog.append("fronts_health:\(FrontHealthRegistry.summary())")
         EventLog.flush()
-        journalServer.stop()
         // Нудж 6ч гасим ЗДЕСЬ: stopTunnel исполняется всегда, в отличие от
         // кода приложения, которое к этому моменту может быть уже убито.
         cancelLongSessionNudge()
+        journalServer.stop()
         pathMonitor?.cancel(); pathMonitor = nil
         pollTimer?.cancel(); pollTimer = nil
         ioTimer?.cancel(); ioTimer = nil
-        lwipQueue.sync {
-            for (_, session) in sessions { session.handleClose(reason: 1) }
-            sessions.removeAll()
-        }
+        // ВАЖНО: completionHandler зовём ДО дренажа сессий и НЕ через
+        // lwipQueue.sync. Если очередь занята (WS-запись в мёртвую сеть,
+        // poll с ретрансмитами), sync не вернётся никогда — iOS не получает
+        // подтверждения остановки, убивает провайдер по таймауту и ПОДНИМАЕТ
+        // туннель заново. Снаружи это выглядит как «выключил — он сам
+        // включился, со второго раза выключается».
         completionHandler()
+        lwipQueue.async { [weak self] in
+            guard let self else { return }
+            for (_, session) in self.sessions { session.handleClose(reason: 1) }
+            self.sessions.removeAll()
+        }
     }
 
     /// ponytail: Wi-Fi↔соты и подобные переключения рвут WS-сессии и lwIP-
