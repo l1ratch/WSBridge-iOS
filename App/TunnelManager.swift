@@ -697,7 +697,8 @@ final class TunnelManager: ObservableObject {
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = Self.providerBundleId
         proto.serverAddress = "WSBridge"
-        let wd = workerDomain.trimmingCharacters(in: .whitespacesAndNewlines)        var config: [String: NSObject] = [:]
+        let wd = workerDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+        var config: [String: NSObject] = [:]
         if !wd.isEmpty { config["worker"] = wd as NSString }
         if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
         if !activeDNSServers.isEmpty {
