@@ -769,13 +769,12 @@ final class TunnelManager: ObservableObject {
         start: Date
     ) {
         let state = TunnelActivityAttributes.ContentState(phase: phase, startDate: start)
-        Task { await activity.update(state) }
+        Task { await activity.update(using: state) }
     }
 
     private func endLiveActivity(_ activity: Activity<TunnelActivityAttributes>) {
         Task {
-            await activity.end(
-                activity.contentState, dismissalPolicy: .immediate)
+            await activity.end(activity.content, dismissalPolicy: .immediate)
         }
     }
 
