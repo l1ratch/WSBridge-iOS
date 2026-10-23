@@ -205,6 +205,14 @@ struct MenuView: View {
                     }
                 }
                 Section("Настройки") {
+                    Toggle(isOn: $tunnel.liveActivityEnabled) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("Live Activity", systemImage: "bolt.badge.clock")
+                            Text("Молния и таймер аптайма в Dynamic Island и на экране блокировки. Таймер рисует система, на батарею не влияет.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                     NavigationLink {
                         DNSManageView(tunnel: tunnel)
                     } label: {

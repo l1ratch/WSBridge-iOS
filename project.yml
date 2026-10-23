@@ -9,7 +9,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
-    WSB_BUILD: "95"
+    WSB_BUILD: "96"
     WSB_MARKETING_VERSION: "0.2.$(WSB_BUILD)"
 
 options:
@@ -22,7 +22,7 @@ targets:
   WSBridge:
     type: application
     platform: iOS
-    sources: [App]
+    sources: [App, Shared]
     info:
       path: App/Info.plist
       properties:
@@ -33,12 +33,14 @@ targets:
         CFBundleShortVersionString: $(WSB_MARKETING_VERSION)
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSSupportsLiveActivities: true
     entitlements:
       path: App/WSBridge.entitlements
       properties:
         com.apple.developer.networking.vpn.api: [allow-vpn]
     dependencies:
       - target: WSBridgeTunnel
+      - target: WSBridgeLive
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.l1ratch.WSBridge
@@ -83,6 +85,24 @@ targets:
         HEADER_SEARCH_PATHS: ["$(SRCROOT)/Tunnel", "$(SRCROOT)/Tunnel/lwip/include"]
         GCC_C_LANGUAGE_STANDARD: c11
         CLANG_ENABLE_MODULES: NO
+
+  # Live Activity (Dynamic Island / локскрин): молния + системный таймер
+  # аптайма. UI живёт здесь, стартует/гасит активность приложение.
+  WSBridgeLive:
+    type: app-extension
+    platform: iOS
+    sources: [Live, Shared]
+    info:
+      path: Live/Info.plist
+      properties:
+        CFBundleDisplayName: WSBridge Live
+        CFBundleVersion: $(WSB_BUILD)
+        CFBundleShortVersionString: $(WSB_MARKETING_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.l1ratch.WSBridge.live
 
 schemes:
   WSBridge:

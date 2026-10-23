@@ -2,6 +2,7 @@ import Foundation
 import Network
 import NetworkExtension
 import UserNotifications
+import ActivityKit
 
 /// Читает журнал расширения loopback TCP (127.0.0.1:51001, JournalServer).
 /// Nonisolated: колбэки NWConnection приходят с произвольных потоков.
@@ -115,6 +116,16 @@ final class TunnelManager: ObservableObject {
     /// по одной на строку. Пусто = как прилетело от Telegram.
     @Published var dcMapText: String = UserDefaults.standard.string(forKey: "dcMap") ?? "" {
         didSet { UserDefaults.standard.set(dcMapText, forKey: "dcMap") }
+    }
+
+    /// Live Activity (Dynamic Island / локскрин): молния + таймер аптайма.
+    /// Выключено = активность не стартует, живая гасится сразу.
+    @Published var liveActivityEnabled: Bool =
+        UserDefaults.standard.object(forKey: "liveActivityEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(liveActivityEnabled, forKey: "liveActivityEnabled")
+            if !liveActivityEnabled { endAllLiveActivities() }
+        }
     }
 
     // MARK: - DNS
@@ -397,6 +408,9 @@ final class TunnelManager: ObservableObject {
         // Кэш NETunnelProviderManager после фона устаревает — перечитываем,
         // иначе первый тап после возврата уйдёт не в ту сторону.
         Task { await reload() }
+        // Сверка Live Activity: если туннель умер в фоне, активность могла
+        // залипнуть «включено» — гасим при первом же пробуждении.
+        syncLiveActivity()
         // Догоняем статистику: копим дельту байтов и секунды работы
         // (таймеров нет — только по событию возврата в foreground).
         Task { await recordUsageSnapshot() }
@@ -699,6 +713,75 @@ final class TunnelManager: ObservableObject {
             lastSnapshot = nil
         default:
             break
+        }
+        syncLiveActivity()
+    }
+
+    // MARK: - Live Activity
+
+    /// Сверяет активность с реальным статусом. Вызывается на каждую смену
+    /// статуса и при выходе на передний план ( сверка после сна/смерти
+    /// туннеля в фоне). Таймер внутри активности рисует система — мы лишь
+    /// стартуем/обновляем/гасим её по статусу.
+    func syncLiveActivity() {
+        guard liveActivityEnabled else {
+            endAllLiveActivities()
+            return
+        }
+        let acts = Activity<TunnelActivityAttributes>.activities
+        switch status {
+        case .connecting, .reasserting:
+            if acts.isEmpty {
+                startLiveActivity(phase: .starting, start: Date())
+            }
+        case .connected:
+            let start = connectedSince ?? Date()
+            if let first = acts.first {
+                updateLiveActivity(first, phase: .on, start: start)
+                for extra in acts.dropFirst() { endLiveActivity(extra) }
+            } else {
+                startLiveActivity(phase: .on, start: start)
+            }
+        case .disconnected, .invalid:
+            endAllLiveActivities()
+        default:
+            break
+        }
+    }
+
+    private func startLiveActivity(phase: TunnelActivityAttributes.Phase, start: Date) {
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
+        let content = ActivityContent(
+            state: TunnelActivityAttributes.ContentState(phase: phase, startDate: start),
+            staleDate: nil)
+        do {
+            _ = try Activity.request(
+                attributes: TunnelActivityAttributes(), content: content, pushType: nil)
+            logStatusEvent("live:start:\(phase.rawValue)")
+        } catch {
+            logStatusEvent("live:err:\(error.localizedDescription)")
+        }
+    }
+
+    private func updateLiveActivity(
+        _ activity: Activity<TunnelActivityAttributes>,
+        phase: TunnelActivityAttributes.Phase,
+        start: Date
+    ) {
+        let state = TunnelActivityAttributes.ContentState(phase: phase, startDate: start)
+        Task { await activity.update(state) }
+    }
+
+    private func endLiveActivity(_ activity: Activity<TunnelActivityAttributes>) {
+        Task {
+            await activity.end(
+                activity.contentState, dismissalPolicy: .immediate)
+        }
+    }
+
+    private func endAllLiveActivities() {
+        for a in Activity<TunnelActivityAttributes>.activities {
+            endLiveActivity(a)
         }
     }
 
