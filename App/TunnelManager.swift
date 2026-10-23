@@ -380,6 +380,9 @@ final class TunnelManager: ObservableObject {
     /// Растёт на каждый toggle/restart: сторож старта сравнивает своё
     /// поколение с текущим и не срабатывает на устаревших запусках.
     private var toggleGeneration = 0
+    /// Выдана команда stop, подтверждение ещё идёт. Защищает быстрый
+    // второй тап по «выкл» от превращения в старт.
+    private var pendingStopIssued = false
     private var lastActiveAt = Date()
     private static let netTimeFmt: DateFormatter = {
         let f = DateFormatter()
@@ -438,10 +441,19 @@ final class TunnelManager: ObservableObject {
         let gen = toggleGeneration
         let m = await refreshManager() ?? freshManager()
         let s = m.connection.status
-        if s == .connected || s == .connecting || s == .reasserting || s == .disconnecting {
-            await stop(m)
+        if s == .connected || s == .connecting || s == .reasserting {
+            pendingStopIssued = true
+            await stop(m, generation: gen)
         }
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        // Ждём фактической смерти старой сессии: старт поверх dying
+        // iOS не примет.
+        for _ in 0..<40 {
+            guard toggleGeneration == gen else { return }
+            let cur = m.connection.status
+            if cur == .disconnected || cur == .invalid { break }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        guard toggleGeneration == gen else { return }
         do {
             try await start(m, needsFrontsUpdate: false, generation: gen)
         } catch {
@@ -617,8 +629,10 @@ final class TunnelManager: ObservableObject {
     /// статистики, смена статуса, возврат приложения в foreground.
     /// Таймеров НЕТ — батарея не страдает, точности «по дням» хватает.
     func recordUsageSnapshot() async {
+        // connectedSince, а не status: stop() зовёт снапшот, когда статус уже
+        // оптимистично .disconnecting — сессию ещё можно опросить.
         guard let session = manager?.connection as? NETunnelProviderSession,
-              status == .connected
+              connectedSince != nil
         else { return }
         // Uptime капаем здесь же: секунды, проведённые в .connected с
         // последнего снапшота (день сменился — пишется в новый слот).
@@ -737,32 +751,53 @@ final class TunnelManager: ObservableObject {
     }
 
     func toggle(force: Bool = false) async {
-        // Дебаунс: параллельные saveToPreferences от дабл-тапов — гонки.
-        guard force || Date().timeIntervalSince(lastToggleAt) > 1.2 else { return }
-        lastToggleAt = Date()
+        // Дебаунс минимальный — глотает только случайный дабл-тап. Быстрый
+        // «выкл→вкл» — нормальный сценарий, он не должен съедаться.
+        let tapAt = Date()
+        let gap = tapAt.timeIntervalSince(lastToggleAt)
+        guard force || gap > 0.4 else { return }
+        lastToggleAt = tapAt
         errorMessage = nil
         toggleGeneration += 1
         let gen = toggleGeneration
 
-        // МГНОВЕННЫЙ отклик UI: выставляем намерение синхронно, ДО первого
-        // await. Иначе между тапом и первой реакцией экрана стоит IPC
-        // loadAllPreferences (сотни мс) — кнопка выглядит «тупой», и
-        // пользователь тычет второй раз, которого дебаунс не ждёт.
+        // МГНОВЕННЫЙ отклик UI: намерение выставляется синхронно, ДО первого
+        // await. Иначе между тапом и реакцией экрана стоит IPC
+        // loadAllPreferences (сотни мс) — кнопка выглядит «тупой».
         let cached = manager?.connection.status ?? status
         switch cached {
         case .connected, .connecting, .reasserting:
             status = .disconnecting
         default:
-            status = .connecting
+            status = .connecting // включая .disconnecting: тап = «включить»
         }
 
-        let loaded = await refreshManager()
-        let m = loaded ?? freshManager()
+        let m = await refreshManager() ?? freshManager()
         // Направление — ТОЛЬКО по живому статусу, не по published.
         switch m.connection.status {
         case .connected, .connecting, .reasserting:
-            await stop(m)
+            pendingStopIssued = true
+            await stop(m, generation: gen) // НЕ блокирует: команду отдали и вышли
+        case .disconnecting:
+            // Сессия ещё умирает. Тап в первые 0.8 с после «выкл» — это
+            // дабл-тап по той же кнопке, игнорируем; позже — намерение «вкл»,
+            // start() сам дождётся смерти старой сессии.
+            if pendingStopIssued && gap < 0.8 {
+                logStatusEvent("toggle:dup-stop:ignored")
+                return
+            }
+            pendingStopIssued = false
+            do {
+                let needsFrontsUpdate =
+                    (frontsUpdatedAt?.timeIntervalSinceNow ?? -3600) < -1800
+                try await start(m, needsFrontsUpdate: needsFrontsUpdate, generation: gen)
+            } catch {
+                NSLog("[WSBridge] start error: %@", error.localizedDescription)
+                errorMessage = error.localizedDescription
+                status = m.connection.status
+            }
         default:
+            pendingStopIssued = false
             do {
                 let needsFrontsUpdate =
                     (frontsUpdatedAt?.timeIntervalSinceNow ?? -3600) < -1800
@@ -784,26 +819,33 @@ final class TunnelManager: ObservableObject {
         return fresh
     }
 
-    /// Выключение. Здесь НИ ОДНОГО saveToPreferences: сохранение
-    /// конфигурации активного туннеля заставляет iOS пересоздать сессию —
-    /// туннель «переподнимается» сам, и выключить его удаётся только со
-    /// второго раза (ровно этот симптом и наблюдался). Конфигурацию пишем
-    /// только в start(), когда туннель уже не работает.
-    ///
-    /// Если iOS всё же поднял сессию обратно (наблюдалось при выключении
-    /// из системных настроек и после фона) — ловим это и гасим повторно:
-    /// три попытки, каждая с записью в историю статусов.
-    private func stop(_ m: NETunnelProviderManager) async {
+    /// Выключение НЕ БЛОКИРУЕТ тап: команда stopVPNTunnel отдаётся системе и
+    /// toggle возвращается — кнопка свободна сразу, быстрый «выкл→вкл»
+    /// работает. Подтверждение отключения, борьба с «переподнялся сам» и
+    // last-resort идут фоном под защитой поколения: новый тап гасит старый
+    /// вотчер. НИ ОДНОГО saveToPreferences на живом туннеле: сохранение
+    /// конфигурации активной сессии пересоздаёт её (симптом «выключил — сам
+    /// включился, со второго раза выключается»).
+    private func stop(_ m: NETunnelProviderManager, generation: Int) async {
         // Финальный снапшот статистики ДО остановки: после stopVPNTunnel
         // расширение уже не ответит, и последняя дельта байтов потерялась бы.
         await recordUsageSnapshot()
+        m.connection.stopVPNTunnel()
+        status = .disconnecting
+        logStatusEvent("stop:issued:\(m.connection.status)")
+        Task { @MainActor [weak self] in
+            await self?.confirmStop(m, generation: generation)
+        }
+    }
+
+    /// Фоновое подтверждение остановки: до 3 попыток, контрольный взгляд на
+    /// «воскресение», в самом конце — выключение конфигурации (isEnabled
+    /// вернёт start() при следующем включении).
+    private func confirmStop(_ m: NETunnelProviderManager, generation: Int) async {
         for attempt in 1...3 {
-            logStatusEvent("stop:attempt\(attempt):\(m.connection.status)")
-            m.connection.stopVPNTunnel()
-            status = .disconnecting
-            // Ждём фактического отключения: до 8 с на попытку.
             var wentDown = false
-            for _ in 0..<32 {
+            for _ in 0..<24 {
+                guard toggleGeneration == generation else { return }
                 let s = m.connection.status
                 if s == .disconnected || s == .invalid {
                     status = s
@@ -812,43 +854,37 @@ final class TunnelManager: ObservableObject {
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
+            guard toggleGeneration == generation else { return }
             if wentDown {
                 // Контрольный взгляд через секунду: если сессия поднялась
                 // обратно — это и есть «переподнялся сам», гасим ещё раз.
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard toggleGeneration == generation else { return }
                 let s = m.connection.status
-                if s != .connected && s != .connecting && s != .reasserting {
-                    status = s
+                if s == .disconnected || s == .invalid {
+                    pendingStopIssued = false
                     logStatusEvent("stop:done")
                     return
                 }
                 logStatusEvent("stop:resurrected:\(s)")
+                m.connection.stopVPNTunnel()
                 continue
             }
-            // Не отключился за 8 с — соединение протухло. Перечитываем
-            // менеджер и пробуем снова с живым объектом.
             logStatusEvent("stop:timeout:\(m.connection.status)")
             _ = await refreshManager()
         }
-        status = manager?.connection.status ?? .disconnected
-        logStatusEvent("stop:gaveup:\(status)")
-        // Последняя инстанция: not-responding session гасится только
-        // выключением самой конфигурации. isEnabled обратно поднимет
-        // start() при следующем включении — конфиг не теряется.
-        if let m2 = await refreshManager(), m2.connection.status != .disconnected {
+        guard toggleGeneration == generation else { return }
+        if let m2 = await refreshManager(),
+           m2.connection.status != .disconnected, m2.connection.status != .invalid {
+            guard toggleGeneration == generation else { return }
             logStatusEvent("stop:disableConfig")
             m2.isEnabled = false
             try? await m2.saveToPreferences()
             try? await m2.loadFromPreferences()
-            for _ in 0..<20 {
-                if m2.connection.status == .disconnected || m2.connection.status == .invalid {
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 250_000_000)
-            }
             status = m2.connection.status
             logStatusEvent("stop:disableConfig->\(status)")
         }
+        pendingStopIssued = false
         if status == .connected || status == .connecting || status == .reasserting {
             errorMessage = "Туннель не выключился. Попробуй ещё раз."
         }
@@ -871,6 +907,14 @@ final class TunnelManager: ObservableObject {
         needsFrontsUpdate: Bool,
         generation: Int = 0
     ) async throws {
+        // Быстрый «выкл→вкл»: старая сессия могла ещё умирать. iOS не
+        // поднимет новую поверх dying — дожидаемся слота, оптимистичный
+        // .connecting уже показывает намерение на экране.
+        for _ in 0..<40 {
+            if m.connection.status != .disconnecting { break }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        guard toggleGeneration == generation else { return }
         if status != .connected {
             UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert]) { _, _ in }
