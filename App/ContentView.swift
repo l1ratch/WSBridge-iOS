@@ -264,20 +264,34 @@ struct MenuView: View {
     }
 }
 
-/// CF Worker: настройка собственного worker'а или реле.
+/// CF Worker: настройка собственного worker'а или реле + «DC → IP».
 struct WorkerView: View {
     @ObservedObject var tunnel: TunnelManager
 
     var body: some View {
         Form {
             Section("CF Worker или реле") {
-                TextField("worker.example.com или ip:port", text: $tunnel.workerDomain)
+                TextField("worker.example.com, второй.doma.in или ip:port", text: $tunnel.workerDomain)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .disabled(tunnel.status == .connected)
                 Text(workerHint)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+            Section("Датацентры Telegram (DC → IP)") {
+                TextEditor(text: $tunnel.dcMapText)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minHeight: 80)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .disabled(tunnel.status == .connected)
+                Text("По одному правилу на строку, формат «номер:IP». Перенаправляет dial worker'а: соединение к DC с этим номером пойдёт на указанный IP. Пусто — как выбрал Telegram. Работает только в режиме CF Worker.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Канонические адреса: DC2 — 149.154.167.220, DC4 — 149.154.167.91. Пример: «2:149.154.167.220»")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
         }
         .navigationTitle("CF Worker")
@@ -291,6 +305,10 @@ struct WorkerView: View {
         }
         if wd.contains(":") {
             return "Прямой режим: сырой TCP на реле host:port, без CF."
+        }
+        let count = wd.split(separator: ",").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
+        if count > 1 {
+            return "Pipe-режим, \(count) домена: соединения распределяются round-robin. Перезапусти туннель."
         }
         return "Pipe-режим через свой CF worker. Перезапусти туннель, чтобы применилось."
     }

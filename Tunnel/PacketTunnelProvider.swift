@@ -20,6 +20,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pollTimer: DispatchSourceTimer?
     private var ioTimer: DispatchSourceTimer?
     private var workerDomain: String?
+    /// Работники из «домены через запятую» + счётчик round-robin.
+    private var workerDomains: [String] = []
+    private var workerRRIndex = 0
+    /// «DC → IP» маппинг из настроек.
+    private var dcOverride: [String: String] = [:]
     /// ID нуджа «долго включен». Владелец — расширение (см. scheduleLongSessionNudge).
     private static let longSessionID = "wsbridge.longSession"
     // Смена сети: расширение — единственный живой процесс, пока туннель
@@ -78,8 +83,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let proto = self?.protocolConfiguration as? NETunnelProviderProtocol
             let wd = (proto?.providerConfiguration?["worker"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            self?.workerDomain = (wd?.isEmpty == false) ? wd : nil
-            EventLog.append("cfg:worker=\(self?.workerDomain ?? "-")")
+            // Несколько worker-доменов через запятую (как в десктопном
+            // tg-ws-proxy). Пустые элементы режем; каждый ходит отдельной
+            // сессией, распределяются round-robin.
+            let domains = wd?.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty } ?? []
+            self?.workerDomains = domains
+            self?.workerDomain = domains.first
+            EventLog.append("cfg:worker=\(self?.workerDomain ?? "-")(x\(domains.count))")
+            // «DC → IP» маппинг: строки «номер:IP».
+            self?.dcOverride = TunnelSession.parseDCOverride(
+                proto?.providerConfiguration?["dcMap"] as? [String])
+            if !(self?.dcOverride.isEmpty ?? true) {
+                EventLog.append("cfg:dc_map=\(self?.dcOverride.count ?? 0)")
+            }
             // Hot-обновление фронтов: свежий список от приложения (или встроенный).
             let fronts = proto?.providerConfiguration?["fronts"] as? [String]
             CFDomains.update(fronts ?? [])
@@ -155,7 +173,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func handleAccept(connId: UInt32, dcIP: UInt32) {
         NSLog("[WSBridge] accept conn \(connId) dc=\(dcIP)")
         postDarwinEvent("accept")
-        let session = TunnelSession(connId: connId, dcIP: dcIP, workerDomain: workerDomain, bridge: lwip, queue: lwipQueue)
+        // Несколько worker'ов: распределяем соединения round-robin, чтобы
+        // CF не троттлил один домен и было живое разнесение нагрузки.
+        let domain: String?
+        if workerDomains.count > 1 {
+            domain = workerDomains[workerRRIndex % workerDomains.count]
+            workerRRIndex += 1
+        } else {
+            domain = workerDomain
+        }
+        let session = TunnelSession(
+            connId: connId, dcIP: dcIP, workerDomain: domain,
+            dcOverride: dcOverride, bridge: lwip, queue: lwipQueue)
         sessions[connId] = session
     }
 

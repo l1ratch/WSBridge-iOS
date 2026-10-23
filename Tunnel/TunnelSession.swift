@@ -9,6 +9,9 @@ class TunnelSession {
     let connId: UInt32
     let dcIP: UInt32
     let workerDomain: String?
+    /// Override «DC → IP» из настроек: канонический DC-адрес → IP, который
+    /// worker'у реально диалить. Пусто = как прилетело от Telegram.
+    let dcOverride: [String: String]
     let bridge: LWIPBridge
     let queue: DispatchQueue
     private var ws: WSClient?
@@ -26,10 +29,11 @@ class TunnelSession {
     private var dead = false
     private static var wfailLogged = 0
 
-    init(connId: UInt32, dcIP: UInt32, workerDomain: String?, bridge: LWIPBridge, queue: DispatchQueue) {
+    init(connId: UInt32, dcIP: UInt32, workerDomain: String?, dcOverride: [String: String], bridge: LWIPBridge, queue: DispatchQueue) {
         self.connId = connId
         self.dcIP = dcIP
         self.workerDomain = workerDomain
+        self.dcOverride = dcOverride
         self.bridge = bridge
         self.queue = queue
     }
@@ -94,7 +98,13 @@ class TunnelSession {
 
     private func startPipe() {
         guard let workerDomain else { return }
-        let dst = String(format: "%d.%d.%d.%d", (dcIP >> 24) & 255, (dcIP >> 16) & 255, (dcIP >> 8) & 255, dcIP & 255)
+        var dst = String(format: "%d.%d.%d.%d", (dcIP >> 24) & 255, (dcIP >> 16) & 255, (dcIP >> 8) & 255, dcIP & 255)
+        // Android-совместимый «DC → IP»: если на этот канонический адрес DC
+        // в настройках назначен другой IP — worker диалит его, а не исходный.
+        if let overrideIP = dcOverride[dst], !overrideIP.isEmpty {
+            postEvent("pipe_remap:\(dst)->\(overrideIP)")
+            dst = overrideIP
+        }
         postEvent("pipe:conn\(connId):\(dst)" + (dcIP == 0 ? ":raw=0" : ""))
         let ws = WSClient(tag: "c\(connId)")
         self.ws = ws
@@ -231,5 +241,42 @@ class TunnelSession {
         ws?.close()
         ws = nil
         wsConnected = false
+    }
+
+    // MARK: - «DC → IP» маппинг (как в десктопном tg-ws-proxy)
+
+    /// Канонические IPv4 главных датацентров. По ним узнаём, к какому DC
+    /// идёт соединение по адресу назначения (в pipe-режиме init не парсится,
+    /// DC-номер недоступен — матчим именно по адресу).
+    static let canonicalIPs: [(dc: Int, ip: String)] = [
+        (1, "149.154.175.50"),
+        (2, "149.154.167.220"),
+        (3, "149.154.175.100"),
+        (4, "149.154.167.91"),
+        (5, "91.108.56.130"),
+    ]
+
+    /// Из строк «номер:IP» (по одной на строку) строит карту
+    /// канонический_IP_этого_DC → указанный_IP. Невалидные строки молча
+    /// пропускаются — список руками правит пользователь, ошибки тут не фатальны.
+    static func parseDCOverride(_ rawLines: [String]?) -> [String: String] {
+        guard let rawLines else { return [:] }
+        let canonByDC = Dictionary(uniqueKeysWithValues: canonicalIPs.map { ($0.dc, $0.ip) })
+        var map: [String: String] = [:]
+        for raw in rawLines {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2,
+                  let dc = Int(parts[0]),
+                  let canon = canonByDC[dc] else { continue }
+            let ip = parts[1].trimmingCharacters(in: .whitespaces)
+            // IP грубо валидируем: 4 октета числами 0-255.
+            let octets = ip.split(separator: ".").compactMap { Int($0) }
+            guard octets.count == 4,
+                  octets.allSatisfy({ $0 >= 0 && $0 <= 255 }) else { continue }
+            map[canon] = ip
+        }
+        return map
     }
 }

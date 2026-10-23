@@ -103,8 +103,15 @@ final class TunnelManager: ObservableObject {
     @Published private(set) var lastAccept: Date?
     @Published var errorMessage: String?
     /// Домен собственного CF worker'а пользователя (pipe-режим). пустой = kws-каскад.
+    /// Несколько доменов — через запятую (балансировка round-robin в расширении).
     @Published var workerDomain: String = UserDefaults.standard.string(forKey: "workerDomain") ?? "" {
         didSet { UserDefaults.standard.set(workerDomain, forKey: "workerDomain") }
+    }
+
+    /// «DC → IP» маппинг (как в десктопном tg-ws-proxy): строки «номер:IP»
+    /// по одной на строку. Пусто = как прилетело от Telegram.
+    @Published var dcMapText: String = UserDefaults.standard.string(forKey: "dcMap") ?? "" {
+        didSet { UserDefaults.standard.set(dcMapText, forKey: "dcMap") }
     }
 
     // MARK: - DNS
@@ -700,6 +707,12 @@ final class TunnelManager: ObservableObject {
         let wd = workerDomain.trimmingCharacters(in: .whitespacesAndNewlines)
         var config: [String: NSObject] = [:]
         if !wd.isEmpty { config["worker"] = wd as NSString }
+        // «DC → IP»: по строке «номер:IP», невалидные расширение отбросит.
+        let dcLines = dcMapText
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        if !dcLines.isEmpty { config["dcMap"] = dcLines as NSArray }
         if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
         if !activeDNSServers.isEmpty {
             config["dns"] = activeDNSServers as NSArray
