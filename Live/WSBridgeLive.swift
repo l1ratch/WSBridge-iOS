@@ -24,33 +24,32 @@ struct TunnelLiveActivity: Widget {
                         .font(.title3.weight(.semibold))
                 }
                 .frame(width: 44, height: 44)
-                // Левый блок тянется и не переносится: «Туннель активен»
-                // в одну строку, иначе композиция разваливается.
-                VStack(alignment: .leading, spacing: 3) {
+                // Компоновка уровня билда 101 (доказано рендерится на
+                // устройстве): никаких frame(maxWidth:)/fixedSize — в
+                // Live Activity они дали вырожденный layout и пустую
+                // карточку в 102. Переносы лечим размером шрифта и lineLimit.
+                VStack(alignment: .leading, spacing: 2) {
                     Text(context.state.phase == .on ? "Туннель активен" : "Туннель стартует")
-                        .font(.headline)
+                        .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.7)
                     Text("Начало в \(context.state.startDate.formatted(date: .omitted, time: .shortened))")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.6))
                         .lineLimit(1)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                // Правый блок — жёсткий и у края: подпись НАД таймером,
-                // fixedSize не даёт системе расползтись по ширине.
+                Spacer(minLength: 8)
+                // Правый блок: таймер + подпись, компактно (title3 вместо
+                // title2 — освобождает место слева, заголовок не переносится).
                 VStack(alignment: .trailing, spacing: 2) {
+                    Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
+                        .font(.system(.title3, design: .monospaced).weight(.bold))
+                        .foregroundStyle(.white)
+                        .monospacedDigit()
                     Text("аптайм")
                         .font(.caption2)
                         .foregroundStyle(.white.opacity(0.55))
-                    Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
-                        .font(.system(.title2, design: .monospaced).weight(.bold))
-                        .foregroundStyle(.white)
-                        .monospacedDigit()
-                        .lineLimit(1)
                 }
-                .fixedSize()
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 14)
