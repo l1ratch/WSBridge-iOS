@@ -780,6 +780,9 @@ final class TunnelManager: ObservableObject {
     /// из системных настроек и после фона) — ловим это и гасим повторно:
     /// три попытки, каждая с записью в историю статусов.
     private func stop(_ m: NETunnelProviderManager) async {
+        // Финальный снапшот статистики ДО остановки: после stopVPNTunnel
+        // расширение уже не ответит, и последняя дельта байтов потерялась бы.
+        await recordUsageSnapshot()
         for attempt in 1...3 {
             logStatusEvent("stop:attempt\(attempt):\(m.connection.status)")
             m.connection.stopVPNTunnel()
