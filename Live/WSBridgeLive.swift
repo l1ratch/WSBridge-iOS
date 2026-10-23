@@ -25,7 +25,7 @@ struct TunnelLiveActivity: Widget {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(context.state.phase == .on ? "Туннель активен" : "Туннель стартует")
                         .font(.headline)
-                    Text("Начало в \(context.state.startDate.formatted(date: .omit, time: .shortened))")
+                    Text("Начало в \(context.state.startDate.formatted(date: .omitted, time: .shortened))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
