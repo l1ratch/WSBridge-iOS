@@ -558,7 +558,7 @@ final class TunnelManager: ObservableObject {
     }
 
     /// Опубликованная история для графиков: [yyyy-MM-dd: DayUsage].
-    @Published private(set) var usageHistory: [String: DayUsage] = Self.loadHistory()
+    @Published private(set) var usageHistory: [String: DayUsage] = TunnelManager.loadHistory()
 
     /// Последний снапшот счётчиков от расширения (монотонные, в рамках
     /// текущего запуска туннеля) — от него считаются дельты.
@@ -601,11 +601,11 @@ final class TunnelManager: ObservableObject {
     }
 
     /// Дневной слот (создаёт при первом обращении).
-    private func day(_ key: String = Self.dayKey()) -> DayUsage {
+    private func day(_ key: String) -> DayUsage {
         usageHistory[key] ?? DayUsage()
     }
 
-    private func mutateDay(_ key: String = Self.dayKey(), _ body: (inout DayUsage) -> Void) {
+    private func mutateDay(_ key: String, _ body: (inout DayUsage) -> Void) {
         var d = day(key)
         body(&d)
         usageHistory[key] = d
@@ -676,7 +676,7 @@ final class TunnelManager: ObservableObject {
         switch status {
         case .connected:
             if connectedSince == nil { connectedSince = Date() }
-            mutateDay { $0.sessions += 1 }
+            mutateDay(Self.dayKey()) { $0.sessions += 1 }
             lastSnapshot = nil // счётчики расширения обнулились
         case .disconnected, .invalid:
             // Финальный снапшот байтов — асинхронно, сколько успеем.
