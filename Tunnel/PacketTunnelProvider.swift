@@ -365,7 +365,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         _ messageData: Data,
         completionHandler: ((Data?) -> Void)?
     ) {
-        let text = "pkts=\(packetCount) bytes=\(byteCount) uptime=\(Int(Date().timeIntervalSince(startedAt)))s conns=\(sessions.count)"
-        completionHandler?(text.data(using: .utf8))
+        // История по дням копит ПРИЛОЖЕНИЕ — расширение умирает в любой
+        // момент и персистентности ему не доверяют. Здесь только отдаём
+        // структурированный снапшот уже посчитанных чисел.
+        let json: [String: Any] = [
+            "pkts": packetCount,
+            "bytes": byteCount,
+            "upBytes": EventLog.upBytes,
+            "rxBytes": EventLog.rxBytes,
+            "uptime": Int(Date().timeIntervalSince(startedAt)),
+            "conns": sessions.count,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: json) {
+            completionHandler?(data)
+        } else {
+            completionHandler?(nil)
+        }
     }
 }

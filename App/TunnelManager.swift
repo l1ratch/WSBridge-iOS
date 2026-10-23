@@ -91,6 +91,9 @@ final class TunnelManager: ObservableObject {
             if statusHistory.count > 40 {
                 statusHistory.removeFirst(statusHistory.count - 40)
             }
+            // Глобальная статистика: фиксируем включение/выключение сессии
+            // (это единственное место, где мы гарантированно видим переход).
+            noteSessionEvent()
         }
     }
     /// История переходов статуса — диагностика «мёртвой кнопки».
@@ -391,6 +394,9 @@ final class TunnelManager: ObservableObject {
         // Кэш NETunnelProviderManager после фона устаревает — перечитываем,
         // иначе первый тап после возврата уйдёт не в ту сторону.
         Task { await reload() }
+        // Догоняем статистику: копим дельту байтов и секунды работы
+        // (таймеров нет — только по событию возврата в foreground).
+        Task { await recordUsageSnapshot() }
         // Если уведомления разрешены — их постит расширение (UN работают
         // и в фоне, и в форграунде через willPresent). Догонялка через
         // журнал — только при отказе в разрешении, иначе двойные алерты.
@@ -526,6 +532,9 @@ final class TunnelManager: ObservableObject {
 
     func fetchStats() {
         updateStatsDisplay()
+        // История: тянем снапшот счётчиков у расширения и капаем дельту в
+        // дневную агрегацию (событийно, без таймеров — батарея не страдает).
+        Task { await recordUsageSnapshot() }
         // ponytail: журнал читается loopback TCP с 127.0.0.1:51001 — расширение
         // держит там NWListener (JournalServer). Loopback в туннель не попадает,
         // песочницы сокетам между процессами не мешают.
@@ -535,6 +544,154 @@ final class TunnelManager: ObservableObject {
         }
         Self.currentReader = reader
         reader.run { Self.currentReader = nil }
+    }
+
+    // MARK: - Глобальная статистика по дням
+
+    /// Один день истории. Всё в «сырых» единицах (байты, секунды) —
+    /// форматирование на экране.
+    struct DayUsage: Codable, Equatable {
+        var upBytes: UInt64 = 0        // от клиента (rxBytes расширения)
+        var downBytes: UInt64 = 0      // к клиенту
+        var seconds: TimeInterval = 0  // время в .connected
+        var sessions: Int = 0          // сколько раз включали
+    }
+
+    /// Опубликованная история для графиков: [yyyy-MM-dd: DayUsage].
+    @Published private(set) var usageHistory: [String: DayUsage] = Self.loadHistory()
+
+    /// Последний снапшот счётчиков от расширения (монотонные, в рамках
+    /// текущего запуска туннеля) — от него считаются дельты.
+    private var lastSnapshot: (up: UInt64, down: UInt64, at: Date)?
+    /// Время, когда туннель стал .connected в этот раз.
+    private var connectedSince: Date?
+
+    private static let historyKey = "usageHistory"
+    private static let historyDays = 90
+
+    private static func loadHistory() -> [String: DayUsage] {
+        guard let data = UserDefaults.standard.data(forKey: historyKey),
+              let dict = try? JSONDecoder().decode([String: DayUsage].self, from: data)
+        else { return [:] }
+        return dict
+    }
+
+    private static func dayKey(_ date: Date = Date()) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: date)
+    }
+
+    private static func saveHistory(_ dict: [String: DayUsage]) {
+        // Ротация: старше 90 дней — вон.
+        let cutoff = Calendar.current.date(byAdding: .day, value: -historyDays, to: Date()) ?? Date()
+        let filtered = dict.filter { key, _ in
+            guard let d = dayDate(from: key) else { return false }
+            return d >= cutoff
+        }
+        if let data = try? JSONEncoder().encode(filtered) {
+            UserDefaults.standard.set(data, forKey: historyKey)
+        }
+    }
+
+    private static func dayDate(from key: String) -> Date? {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f.date(from: key)
+    }
+
+    /// Дневной слот (создаёт при первом обращении).
+    private func day(_ key: String = Self.dayKey()) -> DayUsage {
+        usageHistory[key] ?? DayUsage()
+    }
+
+    private func mutateDay(_ key: String = Self.dayKey(), _ body: (inout DayUsage) -> Void) {
+        var d = day(key)
+        body(&d)
+        usageHistory[key] = d
+        Self.saveHistory(usageHistory)
+    }
+
+    /// Событийный снапшот: опрашивает расширение через providerMessage,
+    /// капает дельту байтов в сегодняшний слот. Вызывается: открытие экрана
+    /// статистики, смена статуса, возврат приложения в foreground.
+    /// Таймеров НЕТ — батарея не страдает, точности «по дням» хватает.
+    func recordUsageSnapshot() async {
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              status == .connected
+        else { return }
+        // Uptime капаем здесь же: секунды, проведённые в .connected с
+        // последнего снапшота (день сменился — пишется в новый слот).
+        if let since = connectedSince {
+            let now = Date()
+            var seconds = now.timeIntervalSince(since)
+            if seconds > 0 {
+                // При переходе через полночь делим пропорционально.
+                let key = Self.dayKey(now)
+                let startKey = Self.dayKey(since)
+                if key == startKey {
+                    mutateDay(key) { $0.seconds += seconds }
+                } else {
+                    let midnight = Calendar.current.startOfDay(for: now)
+                    let beforeMidnight = midnight.timeIntervalSince(since)
+                    if beforeMidnight > 0 {
+                        mutateDay(startKey) { $0.seconds += beforeMidnight }
+                        seconds -= beforeMidnight
+                    }
+                    mutateDay(key) { $0.seconds += max(seconds, 0) }
+                }
+                connectedSince = now
+            }
+        }
+        let reply: Data? = await withCheckedContinuation { cont in
+            do {
+                try session.sendProviderMessage(Data("stats".utf8)) { data in
+                    cont.resume(returning: data)
+                }
+            } catch {
+                cont.resume(returning: nil)
+            }
+        }
+        guard let reply,
+              let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+              let up = json["upBytes"] as? UInt64,
+              let down = json["rxBytes"] as? UInt64
+        else { return }
+        let now = Date()
+        if let last = lastSnapshot {
+            let dUp = up >= last.up ? up - last.up : 0   // перезапуск счётчиков = 0
+            let dDown = down >= last.down ? down - last.down : 0
+            if dUp > 0 || dDown > 0 {
+                mutateDay(Self.dayKey(now)) {
+                    $0.upBytes += dUp
+                    $0.downBytes += dDown
+                }
+            }
+        }
+        lastSnapshot = (up, down, now)
+    }
+
+    /// Смена статуса: фиксируем включение/выключение сессии.
+    func noteSessionEvent() {
+        switch status {
+        case .connected:
+            if connectedSince == nil { connectedSince = Date() }
+            mutateDay { $0.sessions += 1 }
+            lastSnapshot = nil // счётчики расширения обнулились
+        case .disconnected, .invalid:
+            // Финальный снапшот байтов — асинхронно, сколько успеем.
+            Task { await recordUsageSnapshot() }
+            connectedSince = nil
+            lastSnapshot = nil
+        default:
+            break
+        }
+    }
+
+    /// Для экрана: отсортированные дни за N последних.
+    func usageDays(_ n: Int) -> [(day: String, usage: DayUsage)] {
+        let keys = usageHistory.keys.sorted().suffix(n)
+        return keys.map { ($0, usageHistory[$0]!) }
     }
 
     func reload() async {

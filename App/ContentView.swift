@@ -1,6 +1,7 @@
 import SwiftUI
 import NetworkExtension
 import UIKit
+import Charts
 
 /// Главный экран: только молния-кнопка. Меню — системный ellipsis сверху справа.
 /// iOS 26: настоящий Liquid Glass (glassEffect); 17-25: деградация в material.
@@ -370,14 +371,192 @@ struct JournalView: View {
 /// Статистика живого туннеля (Darwin-события от расширения).
 struct StatsView: View {
     @ObservedObject var tunnel: TunnelManager
+    @State private var rangeDays = 7
+    /// Свежий снапшот с расширения при открытии экрана.
+    @State private var refreshed = false
+
+    private var days: [(day: String, usage: TunnelManager.DayUsage)] {
+        tunnel.usageDays(rangeDays)
+    }
 
     var body: some View {
         ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                summaryCards
+                trafficChart
+                uptimeChart
+                livePulse
+                diagnosticsSection
+            }
+            .padding(.vertical)
+        }
+        .navigationTitle("Статистика")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Picker("", selection: $rangeDays) {
+                    Text("7д").tag(7)
+                    Text("30д").tag(30)
+                    Text("90д").tag(90)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 150)
+            }
+        }
+        .onAppear {
+            tunnel.fetchStats()
+            // Опрос счётчиков у расширения — чтобы текущая сессия попала
+            // в историю ещё до выключения.
+            if !refreshed {
+                refreshed = true
+                Task { await tunnel.recordUsageSnapshot() }
+            }
+        }
+    }
+
+    // MARK: - Сводка
+
+    private var totalUp: UInt64 { tunnel.usageHistory.values.reduce(0) { $0 + $1.upBytes } }
+    private var totalDown: UInt64 { tunnel.usageHistory.values.reduce(0) { $0 + $1.downBytes } }
+    private var totalSeconds: TimeInterval { tunnel.usageHistory.values.reduce(0) { $0 + $1.seconds } }
+    private var totalSessions: Int { tunnel.usageHistory.values.reduce(0) { $0 + $1.sessions } }
+
+    private var summaryCards: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                statCard(
+                    title: "Всего",
+                    value: Self.bytes(totalUp + totalDown),
+                    subtitle: "↑\(Self.bytes(totalUp)) ↓\(Self.bytes(totalDown))",
+                    icon: "arrow.up.arrow.down", tint: 0x17A05E)
+                statCard(
+                    title: "Наработано",
+                    value: Self.duration(totalSeconds),
+                    subtitle: totalSessions > 0 ? "\(totalSessions) включений" : "—",
+                    icon: "clock", tint: 0x1E3A6E)
+            }
+            if tunnel.status == .connected {
+                Text("Текущая сессия идёт — данные обновятся при выключении туннеля.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+            }
+        }
+        .padding(.horizontal)
+    }
+
+    private func statCard(title: String, value: String, subtitle: String,
+                          icon: String, tint: UInt32) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.caption2.weight(.semibold))
+                Text(title)
+                    .font(.caption2.weight(.semibold))
+            }
+            .foregroundStyle(Color(hex: tint).opacity(0.9))
+            Text(value)
+                .font(.system(.title3, design: .rounded).weight(.semibold))
+                .minimumScaleFactor(0.7)
+                .lineLimit(1)
+            Text(subtitle)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    // MARK: - Графики
+
+    private var trafficChart: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Трафик")
+                .font(.headline)
+                .padding(.horizontal)
+            if days.allSatisfy({ $0.usage.upBytes + $0.usage.downBytes == 0 }) {
+                emptyHint("Пока пусто — данные появятся после работы туннеля.")
+            } else {
+                Chart(days, id: \.day) { item in
+                    BarMark(
+                        x: .value("День", Self.shortDay(item.day)),
+                        y: .value("Байт", Double(item.usage.downBytes) / 1_048_576.0)
+                    )
+                    .foregroundStyle(by: .value("Направление", "Входящий"))
+                    .position(by: .value("Направление", "Входящий"))
+                    BarMark(
+                        x: .value("День", Self.shortDay(item.day)),
+                        y: .value("Байт", Double(item.usage.upBytes) / 1_048_576.0)
+                    )
+                    .foregroundStyle(by: .value("Направление", "Исходящий"))
+                    .position(by: .value("Направление", "Исходящий"))
+                }
+                .chartForegroundStyleScale([
+                    "Входящий": Color(hex: 0x17A05E),
+                    "Исходящий": Color(hex: 0x4A7BD0),
+                ])
+                .chartYAxisLabel("МБ")
+                .chartLegend(position: .bottom, spacing: 8)
+                .frame(height: 190)
+                .padding(.horizontal)
+            }
+        }
+    }
+
+    private var uptimeChart: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Время работы")
+                .font(.headline)
+                .padding(.horizontal)
+            if days.allSatisfy({ $0.usage.seconds == 0 }) {
+                emptyHint("Пока пусто — данные появятся после работы туннеля.")
+            } else {
+                Chart(days, id: \.day) { item in
+                    BarMark(
+                        x: .value("День", Self.shortDay(item.day)),
+                        y: .value("Часы", item.usage.seconds / 3600.0)
+                    )
+                    .foregroundStyle(Color(hex: 0x17A05E).gradient)
+                    .cornerRadius(3)
+                }
+                .chartYAxisLabel("часы")
+                .frame(height: 150)
+                .padding(.horizontal)
+            }
+        }
+    }
+
+    private func emptyHint(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal)
+    }
+
+    // MARK: - Живой пульс (бывшая «статистика туннеля»)
+
+    private var livePulse: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Сейчас")
+                .font(.headline)
             Text(tunnel.stats ?? "Нет данных — туннель не запущен")
                 .font(.system(.footnote, design: .monospaced))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
+                .padding(12)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        }
+        .padding(.horizontal)
+    }
+
+    // MARK: - Диагностика
+
+    private var diagnosticsSection: some View {
+        Group {
             if !tunnel.statusHistory.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("История статусов (диагностика кнопки)")
@@ -391,17 +570,35 @@ struct StatsView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal)
-                .padding(.bottom)
+                .padding(.top, 8)
             }
         }
-        .navigationTitle("Статистика")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Обновить") { tunnel.fetchStats() }
-            }
-        }
-        .onAppear { tunnel.fetchStats() }
+    }
+
+    // MARK: - Форматирование
+
+    static func bytes(_ b: UInt64) -> String {
+        let mb = Double(b) / 1_048_576.0
+        if mb >= 1024 { return String(format: "%.2f ГБ", mb / 1024) }
+        if mb >= 1 { return String(format: "%.1f МБ", mb) }
+        return String(format: "%.0f КБ", Double(b) / 1024.0)
+    }
+
+    static func duration(_ s: TimeInterval) -> String {
+        let h = Int(s) / 3600
+        let m = (Int(s) % 3600) / 60
+        if h > 0 { return "\(h) ч \(m) мин" }
+        return "\(m) мин"
+    }
+
+    static func shortDay(_ key: String) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        guard let d = f.date(from: key) else { return key }
+        let out = DateFormatter()
+        out.dateFormat = "d MMM"
+        out.locale = Locale(identifier: "ru_RU")
+        return out.string(from: d)
     }
 }
 
