@@ -21,9 +21,9 @@ struct TunnelLiveActivity: Widget {
                         startPoint: .top, endPoint: .bottom))
                     Image(systemName: "bolt.fill")
                         .foregroundStyle(.white)
-                        .font(.headline)
+                        .font(.title3.weight(.semibold))
                 }
-                .frame(width: 40, height: 40)
+                .frame(width: 44, height: 44)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(context.state.phase == .on ? "Туннель активен" : "Туннель стартует")
                         .font(.headline)
@@ -32,25 +32,36 @@ struct TunnelLiveActivity: Widget {
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.6))
                 }
-                Spacer()
-                // Системный тикающий таймер: рендерит ОС, процессы не будим.
-                Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
-                    .font(.system(.title3, design: .monospaced).weight(.semibold))
-                    .foregroundStyle(.white)
-                    .monospacedDigit()
+                Spacer(minLength: 8)
+                // Правый блок заполняет пустоту: крупный таймер + подпись,
+                // а не одинокая цифра в море чёрного.
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
+                        .font(.system(.title2, design: .monospaced).weight(.bold))
+                        .foregroundStyle(.white)
+                        .monospacedDigit()
+                    Text("аптайм")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.55))
+                }
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            // Дефолтная подложка активности — глухой чёрный прямоугольник
-            // («выглядит стремно»). На локскрине её красит ТОЛЬКО
-            // activityBackgroundTint (containerBackground там игнорируется);
-            // containerBackground оставляем для StandBy/прочих контекстов.
-            .activityBackgroundTint(Color(wsbHex: 0x12233F))
-            .containerBackground(for: .widget) {
-                LinearGradient(
-                    colors: [Color(wsbHex: 0x0D1526), Color(wsbHex: 0x16294A)],
-                    startPoint: .topLeading, endPoint: .bottomTrailing)
+            .padding(.vertical, 14)
+            // Фон контента: свой градиент поверх системной подложки
+            // (activityBackgroundTint умеет только ровный цвет, а
+            // containerBackground на локскрине игнорируется). База —
+            // navy→indigo, сверху зелёное свечение из правого верха.
+            .background {
+                ZStack {
+                    LinearGradient(
+                        colors: [Color(wsbHex: 0x0D1526), Color(wsbHex: 0x1E3A6E)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing)
+                    RadialGradient(
+                        colors: [Color(wsbHex: 0x17A05E).opacity(0.35), .clear],
+                        center: .topTrailing, startRadius: 4, endRadius: 180)
+                }
             }
+            .activityBackgroundTint(.clear)
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
