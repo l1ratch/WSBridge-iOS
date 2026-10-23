@@ -20,14 +20,26 @@ struct ContentView: View {
                 Color(hex: colorScheme == .dark ? 0x0D1526 : 0xE8EDF5).ignoresSafeArea()
 
                 // Верхнее свечение: одинаковое в обеих темах.
-                Ellipse()
-                    .fill(topWashColor)
-                    .frame(width: 560, height: 520)
-                    .blur(radius: 110)
-                    .opacity(colorScheme == .dark ? 0.55 : 0.45)
-                    .offset(y: -250)
-                    .animation(.easeInOut(duration: 0.8), value: tunnel.status)
-                    .ignoresSafeArea()
+                // ponytail: blur 110 — дорогая операция. Раньше ЦВЕТ свечения
+                // анимировался на каждый статус = перерисовка blur каждый кадр
+                // (лаги на слабых устройствах, «кнопка тупит»). Теперь два
+                // статичных blur-слоя кроссфейдятся по opacity — blur рендерится
+                // один раз и кэшируется, анимируется только дешёвая прозрачность.
+                ZStack {
+                    Ellipse()
+                        .fill(Color(hex: 0x1E3A6E))
+                        .frame(width: 560, height: 520)
+                        .blur(radius: 110)
+                        .opacity(tunnel.status == .connected ? 0 : (colorScheme == .dark ? 0.55 : 0.45))
+                    Ellipse()
+                        .fill(Color(hex: 0x17A05E))
+                        .frame(width: 560, height: 520)
+                        .blur(radius: 110)
+                        .opacity(tunnel.status == .connected ? (colorScheme == .dark ? 0.55 : 0.45) : 0)
+                }
+                .offset(y: -250)
+                .animation(.easeInOut(duration: 0.8), value: tunnel.status)
+                .ignoresSafeArea()
 
                 // Нижняя глубина: тёмная тема — почти чёрный, светлая — мягкий тёплый серый.
                 Ellipse()
@@ -164,11 +176,6 @@ struct ContentView: View {
         case .disconnecting: "Отключение…"
         default: "Туннель выключен"
         }
-    }
-
-    /// Цвет верхнего свечения: живой изумруд при работе, глубокий индиго в покое.
-    private var topWashColor: Color {
-        tunnel.status == .connected ? Color(hex: 0x17A05E) : Color(hex: 0x1E3A6E)
     }
 
     /// Подпись DNS-бара: название выбранного DNS.
@@ -396,6 +403,7 @@ struct StatsView: View {
             Text("7 дней").tag(7)
             Text("30 дней").tag(30)
             Text("90 дней").tag(90)
+            Text("Всё").tag(0)
         }
         .pickerStyle(.segmented)
         .padding(.horizontal)

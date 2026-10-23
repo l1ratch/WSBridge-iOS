@@ -688,9 +688,11 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// Для экрана: отсортированные дни за N последних.
+    /// Для экрана: отсортированные дни за N последних; 0 = за всё время.
     func usageDays(_ n: Int) -> [(day: String, usage: DayUsage)] {
-        let keys = usageHistory.keys.sorted().suffix(n)
+        let keys = n <= 0
+            ? usageHistory.keys.sorted()
+            : Array(usageHistory.keys.sorted().suffix(n))
         return keys.map { ($0, usageHistory[$0]!) }
     }
 
@@ -736,11 +738,23 @@ final class TunnelManager: ObservableObject {
 
     func toggle(force: Bool = false) async {
         // Дебаунс: параллельные saveToPreferences от дабл-тапов — гонки.
-        guard force || Date().timeIntervalSince(lastToggleAt) > 2 else { return }
+        guard force || Date().timeIntervalSince(lastToggleAt) > 1.2 else { return }
         lastToggleAt = Date()
         errorMessage = nil
         toggleGeneration += 1
         let gen = toggleGeneration
+
+        // МГНОВЕННЫЙ отклик UI: выставляем намерение синхронно, ДО первого
+        // await. Иначе между тапом и первой реакцией экрана стоит IPC
+        // loadAllPreferences (сотни мс) — кнопка выглядит «тупой», и
+        // пользователь тычет второй раз, которого дебаунс не ждёт.
+        let cached = manager?.connection.status ?? status
+        switch cached {
+        case .connected, .connecting, .reasserting:
+            status = .disconnecting
+        default:
+            status = .connecting
+        }
 
         let loaded = await refreshManager()
         let m = loaded ?? freshManager()
