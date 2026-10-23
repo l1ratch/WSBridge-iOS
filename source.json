@@ -7,10 +7,10 @@
       "name": "WSBridge",
       "bundleIdentifier": "com.l1ratch.WSBridge",
       "developerName": "l1ratch",
-      "version": "0.2.101",
-      "versionDate": "2026-10-23T18:21:45Z",
-      "versionDescription": "build 101",
-      "size": 3676713,
+      "version": "0.2.102",
+      "versionDate": "2026-10-23T18:35:13Z",
+      "versionDescription": "build 102",
+      "size": 3679133,
       "downloadURL": "https://l1ratch.github.io/WSBridge-iOS/wsb.ipa",
       "localizedDescription": "Telegram WS-туннель. Неподписанный IPA — GBox подпишет при установке."
     }
