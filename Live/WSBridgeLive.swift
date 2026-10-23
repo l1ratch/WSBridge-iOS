@@ -16,27 +16,38 @@ struct TunnelLiveActivity: Widget {
             // Локскрин / StandBy: молния, статус и живой таймер аптайма.
             HStack(spacing: 14) {
                 ZStack {
-                    Circle().fill(Color.green.opacity(0.18))
+                    Circle().fill(LinearGradient(
+                        colors: [Color(wsbHex: 0x17A05E), Color(wsbHex: 0x0E7A43)],
+                        startPoint: .top, endPoint: .bottom))
                     Image(systemName: "bolt.fill")
-                        .foregroundStyle(.green)
+                        .foregroundStyle(.white)
                         .font(.headline)
                 }
                 .frame(width: 40, height: 40)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(context.state.phase == .on ? "Туннель активен" : "Туннель стартует")
                         .font(.headline)
+                        .foregroundStyle(.white)
                     Text("Начало в \(context.state.startDate.formatted(date: .omitted, time: .shortened))")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.white.opacity(0.6))
                 }
                 Spacer()
                 // Системный тикающий таймер: рендерит ОС, процессы не будим.
                 Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
                     .font(.system(.title3, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(.white)
                     .monospacedDigit()
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+            // Дефолтная подложка активности — глухой чёрный прямоугольник
+            // («выглядит стремно»). Красим в фирменный navy-градиент.
+            .containerBackground(for: .widget) {
+                LinearGradient(
+                    colors: [Color(wsbHex: 0x0D1526), Color(wsbHex: 0x16294A)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing)
+            }
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
@@ -67,5 +78,19 @@ struct TunnelLiveActivity: Widget {
                     .foregroundStyle(.green)
             }
         }
+    }
+}
+
+/// Локальный hex-цвет: app-таргетный Color(hex:) в расширение не доезжает,
+/// а общий тащить нельзя — будет дубликат в app-модуле (Shared уже в обоих).
+private extension Color {
+    init(wsbHex: UInt32) {
+        self.init(
+            .sRGB,
+            red: Double((wsbHex >> 16) & 0xFF) / 255,
+            green: Double((wsbHex >> 8) & 0xFF) / 255,
+            blue: Double(wsbHex & 0xFF) / 255,
+            opacity: 1
+        )
     }
 }
