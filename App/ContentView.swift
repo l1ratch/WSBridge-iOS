@@ -239,21 +239,6 @@ struct MenuView: View {
                     }
                 }
 
-                Section {
-                    HStack(spacing: 24) {
-                        Link(destination: URL(string: "https://github.com/l1ratch/WSBridge-iOS")!) {
-                            Image(systemName: "chevron.left.forwardslash.chevron.right")
-                                .font(.title2)
-                        }
-                        Link(destination: URL(string: "https://github.com/Flowseal/tg-ws-proxy")!) {
-                            Image(systemName: "arrow.up.right.square")
-                                .font(.title2)
-                        }
-                    }
-                    .frame(maxWidth: .infinity)
-                    .foregroundStyle(.secondary)
-                }
-                .listRowBackground(Color.clear)
             }
             .navigationTitle("Меню")
             .toolbar {
@@ -382,6 +367,7 @@ struct StatsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                rangePicker
                 summaryCards
                 trafficChart
                 uptimeChart
@@ -392,17 +378,6 @@ struct StatsView: View {
         }
         .navigationTitle("Статистика")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Picker("", selection: $rangeDays) {
-                    Text("7д").tag(7)
-                    Text("30д").tag(30)
-                    Text("90д").tag(90)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 150)
-            }
-        }
         .onAppear {
             tunnel.fetchStats()
             // Опрос счётчиков у расширения — чтобы текущая сессия попала
@@ -412,6 +387,18 @@ struct StatsView: View {
                 Task { await tunnel.recordUsageSnapshot() }
             }
         }
+    }
+
+    /// Период — сегмент-контрол в контенте, НЕ в тулбаре: на iOS 26 тулбар
+    /// сам стеклянный, и Picker поверх него рисовал второе стекло.
+    private var rangePicker: some View {
+        Picker("", selection: $rangeDays) {
+            Text("7 дней").tag(7)
+            Text("30 дней").tag(30)
+            Text("90 дней").tag(90)
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal)
     }
 
     // MARK: - Сводка
@@ -620,11 +607,12 @@ struct AboutView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
 
-                // Суть
+                // Суть — короткое саммари текущего README.
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("Что это")
-                        .font(.headline)
-                    Text("WSBridge — VPN-туннель, работающий локально на вашем устройстве. Он перехватывает трафик Telegram и перенаправляет его через WebSocket-соединение к серверам Telegram в обход устаревшего сетевого оборудования. Настройка в самом Telegram не требуется.")
+                    Text("WSBridge — локальный VPN-туннель для iOS. Приложение создаёт виртуальный интерфейс (TUN), встроенный стек lwIP терминирует TCP, и каждый поток переносится зашифрованным WebSocket до гейтвей-эндпоинта.")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                    Text("Эндпоинты выбираются каскадом (CDN edge → прямые IP → native) с персистентным реестром здоровья. DNS — DoT или DoH на выбор в приложении. Список эндпоинтов обновляется без пересборки.")
                         .font(.body)
                         .foregroundStyle(.secondary)
                 }
@@ -633,17 +621,17 @@ struct AboutView: View {
 
                 Divider().padding(.horizontal, 24)
 
-                // Разработчик
+                // Ссылки — без блока «разработчик».
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Разработчик")
-                        .font(.headline)
-                    LabeledContent("Автор", value: "l1ratch")
                     Link(destination: URL(string: "https://github.com/l1ratch/WSBridge-iOS")!) {
-                        Label("Исходный код WSBridge", systemImage: "chevron.left.forwardslash.chevron.right")
+                        Label("Исходный код", systemImage: "chevron.left.forwardslash.chevron.right")
                     }
                     Link(destination: URL(string: "https://github.com/Flowseal/tg-ws-proxy")!) {
                         Label("Оригинал: tg-ws-proxy (Flowseal)", systemImage: "arrow.up.right.square")
                     }
+                    Text("Лицензия MIT")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 24)

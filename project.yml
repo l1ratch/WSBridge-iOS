@@ -9,7 +9,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
-    WSB_BUILD: "92"
+    WSB_BUILD: "93"
     WSB_MARKETING_VERSION: "0.2.$(WSB_BUILD)"
 
 options:
