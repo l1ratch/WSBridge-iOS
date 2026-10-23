@@ -42,7 +42,10 @@ struct TunnelLiveActivity: Widget {
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
             // Дефолтная подложка активности — глухой чёрный прямоугольник
-            // («выглядит стремно»). Красим в фирменный navy-градиент.
+            // («выглядит стремно»). На локскрине её красит ТОЛЬКО
+            // activityBackgroundTint (containerBackground там игнорируется);
+            // containerBackground оставляем для StandBy/прочих контекстов.
+            .activityBackgroundTint(Color(wsbHex: 0x12233F))
             .containerBackground(for: .widget) {
                 LinearGradient(
                     colors: [Color(wsbHex: 0x0D1526), Color(wsbHex: 0x16294A)],
