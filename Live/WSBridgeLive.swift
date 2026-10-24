@@ -39,7 +39,11 @@ struct TunnelLiveActivity: Widget {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 6)
-                VStack(alignment: .trailing, spacing: 2) {
+                // Правый блок ОДНОЙ строкой на baseline: вертикальный VStack
+                // система на локскрине раскидывала по карточке (таймер и
+                // «аптайм» жили в разных углах, билды 101-104). Одной
+                // строке разваливаться негде.
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
                         .font(.system(.body, design: .monospaced).weight(.bold))
                         .foregroundStyle(.white)

@@ -188,6 +188,7 @@ struct ContentView: View {
 struct MenuView: View {
     @ObservedObject var tunnel: TunnelManager
     @Environment(\.dismiss) private var dismiss
+    @State private var showLiveInfo = false
 
     var body: some View {
         NavigationStack {
@@ -206,12 +207,22 @@ struct MenuView: View {
                 }
                 Section("Настройки") {
                     Toggle(isOn: $tunnel.liveActivityEnabled) {
-                        VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
                             Label("Live Activity", systemImage: "bolt.badge.clock")
-                            Text("Молния и таймер аптайма в Dynamic Island и на экране блокировки. Таймер рисует система, на батарею не влияет.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            // Инфо-бейдж как в системных настройках: описание
+                            // живёт в поповере, а не простынёй под тумблером.
+                            Image(systemName: "info.circle")
+                                .font(.body.weight(.medium))
+                                .foregroundStyle(Color.accentColor.opacity(0.8))
+                                .onTapGesture { showLiveInfo = true }
                         }
+                    }
+                    .popover(isPresented: $showLiveInfo) {
+                        Text("Молния и таймер аптайма в Dynamic Island и на экране блокировки. Таймер рисует система, на батарею не влияет.")
+                            .font(.callout)
+                            .padding()
+                            .frame(maxWidth: 260)
+                            .presentationCompactAdaptation(.popover)
                     }
                     NavigationLink {
                         DNSManageView(tunnel: tunnel)
