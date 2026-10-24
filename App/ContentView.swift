@@ -223,28 +223,29 @@ struct MenuView: View {
                     } label: {
                         Label("CF Worker", systemImage: "cloud")
                     }
+                    // Кнопка на всю область строки; состояние и ответ
+                    // обновления — отдельными строками ПОД ней (вместо
+                    // описания и вместо крошки внутри кнопки).
                     Button {
                         Task { await tunnel.updateFronts() }
                     } label: {
-                        HStack {
-                            Label("Обновить список фронтов", systemImage: "arrow.triangle.2.circlepath")
-                            Spacer()
+                        Label("Обновить список фронтов", systemImage: "arrow.triangle.2.circlepath")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if tunnel.frontsUpdateMessage != nil || tunnel.frontsUpdatedAt != nil {
+                        VStack(alignment: .leading, spacing: 2) {
                             if let msg = tunnel.frontsUpdateMessage {
                                 Text(msg)
-                                    .font(.caption2)
+                                    .font(.caption)
                                     .foregroundStyle(.secondary)
-                                    .lineLimit(1)
+                            }
+                            if let updated = tunnel.frontsUpdatedAt {
+                                Text("Список обновлён: \(updated.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
-                    if let updated = tunnel.frontsUpdatedAt {
-                        Text("Список обновлён: \(updated.formatted(date: .abbreviated, time: .shortened))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Text("Фронты — входы Cloudflare к серверам Telegram. Апстрим периодически меняет их; обновление подхватится при следующем включении туннеля.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
                 Section("Информация") {
                     NavigationLink {
