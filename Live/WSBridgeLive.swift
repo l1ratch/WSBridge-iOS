@@ -38,14 +38,9 @@ struct TunnelLiveActivity: Widget {
                         .foregroundStyle(.white.opacity(0.6))
                         .lineLimit(1)
                 }
-                Spacer(minLength: 6)
-                // Таймер прижат к правому краю (с полем карточки), без
-                // подписи «аптайм» — она не несла информации, а вертикальный
-                // VStack система на локскрине раскидывала по карточке.
-                Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
-                    .font(.system(.body, design: .monospaced).weight(.bold))
-                    .foregroundStyle(.white)
-                    .monospacedDigit()
+                Spacer(minLength: 70)
+                // Резерв под таймер: текст слева не должен подлезать под
+                // оверлей на узких карточках.
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
@@ -66,6 +61,17 @@ struct TunnelLiveActivity: Widget {
                         colors: [Color(wsbHex: 0x17A05E).opacity(0.35), .clear],
                         center: .topTrailing, startRadius: 4, endRadius: 180)
                 }
+            }
+            // Таймер ВНЕ потока раскладки: оверлей прибит к правому краю
+            // карточки. В HStack/VStack система на локскрине трижды
+            // переставляла правый блок по-своему (билды 101-106) — оверлей
+            // она не трогает.
+            .overlay(alignment: .trailing) {
+                Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
+                    .font(.system(.body, design: .monospaced).weight(.bold))
+                    .foregroundStyle(.white)
+                    .monospacedDigit()
+                    .padding(.trailing, 14)
             }
             .activityBackgroundTint(.clear)
         } dynamicIsland: { context in
