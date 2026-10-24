@@ -211,18 +211,24 @@ struct MenuView: View {
                             Label("Live Activity", systemImage: "bolt.badge.clock")
                             // Инфо-бейдж как в системных настройках: описание
                             // живёт в поповере, а не простынёй под тумблером.
+                            // Поповер якорим К САМОМУ значку — иначе стрелка
+                            // бьёт из середины строки (баг 105).
                             Image(systemName: "info.circle")
                                 .font(.body.weight(.medium))
                                 .foregroundStyle(Color.accentColor.opacity(0.8))
                                 .onTapGesture { showLiveInfo = true }
+                                .popover(isPresented: $showLiveInfo) {
+                                    Text("Молния и таймер аптайма в Dynamic Island и на экране блокировки. Таймер рисует система, на батарею не влияет.")
+                                        .font(.callout)
+                                        // Без fixedSize поповер обрезал текст
+                                        // на полуслове и оставлял пустой
+                                        // отступ сверху (баг 105).
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .padding(14)
+                                        .frame(width: 240)
+                                        .presentationCompactAdaptation(.popover)
+                                }
                         }
-                    }
-                    .popover(isPresented: $showLiveInfo) {
-                        Text("Молния и таймер аптайма в Dynamic Island и на экране блокировки. Таймер рисует система, на батарею не влияет.")
-                            .font(.callout)
-                            .padding()
-                            .frame(maxWidth: 260)
-                            .presentationCompactAdaptation(.popover)
                     }
                     NavigationLink {
                         DNSManageView(tunnel: tunnel)

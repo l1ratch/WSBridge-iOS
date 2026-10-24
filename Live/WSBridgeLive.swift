@@ -39,22 +39,20 @@ struct TunnelLiveActivity: Widget {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 6)
-                // Правый блок ОДНОЙ строкой на baseline: вертикальный VStack
-                // система на локскрине раскидывала по карточке (таймер и
-                // «аптайм» жили в разных углах, билды 101-104). Одной
-                // строке разваливаться негде.
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
-                    Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
-                        .font(.system(.body, design: .monospaced).weight(.bold))
-                        .foregroundStyle(.white)
-                        .monospacedDigit()
-                    Text("аптайм")
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.55))
-                }
+                // Таймер прижат к правому краю (с полем карточки), без
+                // подписи «аптайм» — она не несла информации, а вертикальный
+                // VStack система на локскрине раскидывала по карточке.
+                Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
+                    .font(.system(.body, design: .monospaced).weight(.bold))
+                    .foregroundStyle(.white)
+                    .monospacedDigit()
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
+            // Растягиваем контент на всю высоту системной карточки ДО фона:
+            // иначе сверху и снизу остаются прозрачные полосы системного
+            // стекла (баг 101-105).
+            .frame(maxHeight: .infinity)
             // Фон контента: свой градиент поверх системной подложки
             // (activityBackgroundTint умеет только ровный цвет, а
             // containerBackground на локскрине игнорируется). База —
