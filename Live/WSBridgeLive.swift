@@ -38,16 +38,23 @@ struct TunnelLiveActivity: Widget {
                         .foregroundStyle(.white.opacity(0.6))
                         .lineLimit(1)
                 }
-                Spacer(minLength: 70)
-                // Резерв под таймер: текст слева не должен подлезать под
-                // оверлей на узких карточках.
+                Spacer(minLength: 6)
+                // Таймер в потоке, прижимается Spacer'ом. Работает ТОЛЬКО
+                // потому, что ниже корню принудительно задан размер карточки:
+                // без этого локскрин даёт контент-вью «свою» ширину, и
+                // Spacer/overlay пляшут от узкой базы (билды 101-107:
+                // разброс по углам, таймер поверх молнии).
+                Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
+                    .font(.system(.body, design: .monospaced).weight(.bold))
+                    .foregroundStyle(.white)
+                    .monospacedDigit()
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
-            // Растягиваем контент на всю высоту системной карточки ДО фона:
-            // иначе сверху и снизу остаются прозрачные полосы системного
-            // стекла (баг 101-105).
-            .frame(maxHeight: .infinity)
+            // «Будь размером с контейнер» (карточку активности) по обеим
+            // осям: высота — чтобы фон залил без прозрачных полос,
+            // ширина — чтобы Spacer реально прижимал таймер к правому краю.
+            .containerRelativeFrame([.horizontal, .vertical])
             // Фон контента: свой градиент поверх системной подложки
             // (activityBackgroundTint умеет только ровный цвет, а
             // containerBackground на локскрине игнорируется). База —
@@ -61,17 +68,6 @@ struct TunnelLiveActivity: Widget {
                         colors: [Color(wsbHex: 0x17A05E).opacity(0.35), .clear],
                         center: .topTrailing, startRadius: 4, endRadius: 180)
                 }
-            }
-            // Таймер ВНЕ потока раскладки: оверлей прибит к правому краю
-            // карточки. В HStack/VStack система на локскрине трижды
-            // переставляла правый блок по-своему (билды 101-106) — оверлей
-            // она не трогает.
-            .overlay(alignment: .trailing) {
-                Text(timerInterval: context.state.startDate...Date.distantFuture, countsDown: false)
-                    .font(.system(.body, design: .monospaced).weight(.bold))
-                    .foregroundStyle(.white)
-                    .monospacedDigit()
-                    .padding(.trailing, 14)
             }
             .activityBackgroundTint(.clear)
         } dynamicIsland: { context in
