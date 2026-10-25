@@ -1,0 +1,81 @@
+name: Release (Tag v*)
+
+# Релизный сборщик. Запускается ТОЛЬКО пушем тега v0.2.58 / v0.3.0 и т.п.
+# Создаёт GitHub Release с unsigned IPA.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build_and_release:
+    name: Build & Release IPA
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Set Xcode Version
+        run: |
+          ls /Applications/ | grep -i xcode
+          XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+
+      - name: Check tag matches version
+        run: |
+          # Тег обязан совпадать с версией из project.yml: "<WSB_VERSION>.<WSB_BUILD>"
+          # (v0.3.0), иначе собранный IPA уедет с версией, отличной от тега.
+          BUILD=$(grep -m1 'WSB_BUILD:' project.yml | sed -E 's/.*"([0-9]+)".*/\1/')
+          BLOCK=$(grep -m1 'WSB_VERSION:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
+          EXPECTED="v$BLOCK.$BUILD"
+          TAG="${{ github.ref_name }}"
+          if [ "$TAG" != "$EXPECTED" ]; then
+            echo "::error::Тег $TAG не совпадает с версией $BLOCK.$BUILD (ожидался $EXPECTED)."
+            echo "Сначала подними WSB_BUILD/WSB_VERSION в project.yml и запушь в main, потом тегни."
+            exit 1
+          fi
+          echo "Тег $TAG совпадает с версией $BLOCK.$BUILD"
+        shell: bash
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build iOS App (no codesign)
+        run: |
+          xcodebuild -project WSBridge.xcodeproj \
+            -scheme WSBridge \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+        shell: bash
+
+      - name: Package Unsigned IPA
+        run: |
+          mkdir -p Payload
+          APP_PATH=$(find build -name "*.app" -type d | head -n 1)
+          echo "Found app at: $APP_PATH"
+          cp -r "$APP_PATH" Payload/
+          zip -r "WSBridge-${{ github.ref_name }}.ipa" Payload
+          rm -rf Payload
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            "WSBridge-${{ github.ref_name }}.ipa" \
+            --title "WSBridge ${{ github.ref_name }}" \
+            --notes "Unsigned IPA. Подпиши своим сертификатом (GBox / SideStore / AltStore)." \
+            --prerelease=false

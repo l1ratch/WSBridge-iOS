@@ -1,0 +1,49 @@
+# reference clones, not part of the build
+ref-tg-ws-proxy/
+ref-krasava/
+ref-lwip/
+
+# downloaded CI artifacts
+dist/
+
+# macOS / Xcode
+.DS_Store
+build/
+DerivedData/
+xcuserdata/
+*.ipa
+*.xcodeproj
+!project.yml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# debug / temp
+compile_error.txt
+
+# local dev tools (not part of the app)
+tools/
+worker-pipe*.js
+icon/
+
+# personal / sensitive
+tools/vps_relay.py
+tools/mcp_ssh.py
+tools/gen_icon_api.py
+tools/inspect_provision.py
+tools/dec_streams.py
+tools/dec_uphead.py
+tools/fetch_ci_log.py
+tools/check_runs.py
+tools/parse_crash.py
+tools/test_tls_probe.py
+tools/port_probe.py
+tools/watch.py
+tools/worker_selftest.py
+tools/v6test.py
+tools/raw_dump.py
+tools/gw_origin.py
+tools/gw_web.py
+worker-pipe-vps.js

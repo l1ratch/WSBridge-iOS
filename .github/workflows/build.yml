@@ -1,0 +1,159 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build_ipa:
+    name: Build iOS Unsigned IPA
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Set Xcode Version
+        run: |
+          # Prefer Xcode 26 (iOS 26 SDK: настоящий Liquid Glass). Фолбэк - 16.x.
+          ls /Applications/ | grep -i xcode
+          XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+
+      - name: Read version
+        id: ver
+        run: |
+          # Источник правды — project.yml: WSB_VERSION (блок) и
+          # WSB_BUILD (сборка внутри блока). Версия = "<VERSION>.<BUILD>",
+          # ровно то, что видит пользователь: 0.3.0.
+          BUILD=$(grep -m1 'WSB_BUILD:' project.yml | sed -E 's/.*"([0-9]+)".*/\1/')
+          BLOCK=$(grep -m1 'WSB_VERSION:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "version=$BLOCK.$BUILD" >> "$GITHUB_OUTPUT"
+          echo "WSB build=$BUILD version=$BLOCK.$BUILD"
+        shell: bash
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build iOS App (no codesign)
+        run: |
+          xcodebuild -project WSBridge.xcodeproj \
+            -scheme WSBridge \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build 2>&1 | tee build_output.log
+        shell: bash
+
+      # Идея из l1ratch/AnimeGen: ошибки компиляции коммитятся в compile_error.txt
+      - name: Commit error log on failure
+        if: failure()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "=== COMPILER ERRORS ===" > compile_error.txt
+          grep -E "(: error:|fatal error:)" build_output.log -B 2 -A 5 >> compile_error.txt || tail -n 200 build_output.log >> compile_error.txt
+          git add compile_error.txt
+          git commit -m "ci: capture compiler error [skip ci]" || true
+          git push origin main || true
+        shell: bash
+
+      - name: Verify version in built app
+        run: |
+          # Страховка от нераскрывшейся подстановки: WSB_MARKETING_VERSION
+          # ссылается на WSB_BUILD, и если xcodegen/Xcode не раскроет
+          # вложенную переменную, в plist уедет литерал "0.2.$(WSB_BUILD)".
+          # Ловим это здесь, а не глазами пользователя в GBox.
+          APP_PLIST=$(find build -name "Info.plist" -path "*.app/*" | head -n 1)
+          SHORT=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PLIST")
+          BUNDLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PLIST")
+          echo "plist: CFBundleShortVersionString=$SHORT CFBundleVersion=$BUNDLE"
+          EXPECT_SHORT="${{ steps.ver.outputs.version }}"
+          EXPECT_BUILD="${{ steps.ver.outputs.build }}"
+          if [ "$SHORT" != "$EXPECT_SHORT" ] || [ "$BUNDLE" != "$EXPECT_BUILD" ]; then
+            echo "::error::Версия в приложении ($SHORT / $BUNDLE) не совпадает с WSB_BUILD ($EXPECT_SHORT / $EXPECT_BUILD)."
+            exit 1
+          fi
+          echo "Версия в приложении совпадает с WSB_BUILD"
+        shell: bash
+
+      - name: Package Unsigned IPA
+        run: |
+          mkdir -p Payload
+          APP_PATH=$(find build -name "*.app" -type d | head -n 1)
+          echo "Found app at: $APP_PATH"
+          cp -r "$APP_PATH" Payload/
+          zip -r "WSBridge.ipa" Payload
+          rm -rf Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WSBridge-IPA
+          path: WSBridge.ipa
+          if-no-files-found: error
+
+      # GBox-источник: IPA + манифест (AltStore-формат) в gh-pages,
+      # раздаётся через https://l1ratch.github.io/WSBridge-iOS/
+      - name: Publish to gh-pages
+        run: |
+          set -e
+          VER="${{ steps.ver.outputs.build }}"
+          VERSION="${{ steps.ver.outputs.version }}"
+          SIZE=$(stat -f%z WSBridge.ipa)
+          cp WSBridge.ipa /tmp/wsb.ipa
+          cp WSBridge.ipa /tmp/preview.ipa
+          cat > /tmp/source.json <<EOF
+          {
+            "name": "WSBridge",
+            "identifier": "wsbridge.gh",
+            "sourceURL": "https://l1ratch.github.io/WSBridge-iOS/source.json",
+            "apps": [
+              {
+                "name": "WSBridge",
+                "bundleIdentifier": "com.l1ratch.WSBridge",
+                "developerName": "l1ratch",
+                "version": "$VERSION",
+                "versionDate": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+                "versionDescription": "build $VER",
+                "size": $SIZE,
+                "downloadURL": "https://l1ratch.github.io/WSBridge-iOS/wsb.ipa",
+                "localizedDescription": "IP-over-WebSocket relay для iOS. Неподписанный IPA — GBox подпишет при установке."
+              }
+            ]
+          }
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages --depth=1 || true
+          git checkout -B gh-pages FETCH_HEAD 2>/dev/null || git checkout --orphan gh-pages
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          cp /tmp/wsb.ipa wsb.ipa
+          cp /tmp/source.json source.json
+          git add -f wsb.ipa source.json
+          git commit -m "publish build $VER" || echo "no changes"
+          git push -f origin gh-pages
+
+      # Каждый пуш в main обновляет prerelease "preview" с последним IPA.
+      # Стабильные релизы — через теги v* (release.yml).
+      - name: Update preview release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete preview --yes 2>/dev/null || true
+          git push origin :refs/tags/preview 2>/dev/null || true
+          gh release create preview \
+            /tmp/preview.ipa \
+            --title "Preview (latest main)" \
+            --notes "Дев-сборка с последнего пуша в main. Для стабильных версий — Releases." \
+            --prerelease
