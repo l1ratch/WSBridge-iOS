@@ -16,7 +16,7 @@ jobs:
     name: Build & Release IPA
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -83,7 +83,7 @@ jobs:
             --notes "Unsigned IPA. Подпиши своим сертификатом (GBox / SideStore / AltStore)." \
             --prerelease=false
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: WSBridge-${{ github.ref_name }}
           path: WSBridge-${{ github.ref_name }}.ipa
