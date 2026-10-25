@@ -56,18 +56,15 @@ jobs:
             build 2>&1 | tee build_output.log
         shell: bash
 
-      # Идея из l1ratch/AnimeGen: ошибки компиляции коммитятся в compile_error.txt
-      - name: Commit error log on failure
+      # Лог ошибок компиляции — артефактом, не коммитом в main.
+      # Коммит-бот загрязнял историю и рекурсивно триггерил новый билд.
+      - name: Upload build log on failure
         if: failure()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "=== COMPILER ERRORS ===" > compile_error.txt
-          grep -E "(: error:|fatal error:)" build_output.log -B 2 -A 5 >> compile_error.txt || tail -n 200 build_output.log >> compile_error.txt
-          git add compile_error.txt
-          git commit -m "ci: capture compiler error [skip ci]" || true
-          git push origin main || true
-        shell: bash
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build_output.log
+          if-no-files-found: ignore
 
       - name: Verify version in built app
         run: |

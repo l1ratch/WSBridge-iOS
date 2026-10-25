@@ -36,6 +36,10 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         NSSupportsLiveActivities: true
+        # Приложение не использует шифрование, требующее экспортной
+        # декларации: CommonCrypto применяется только к трафику самого
+        # туннеля, наружу как продукт шифрования не поставляется.
+        ITSAppUsesNonExemptEncryption: false
     entitlements:
       path: App/WSBridge.entitlements
       properties:
@@ -67,6 +71,10 @@ targets:
         headerVisibility: private
       - path: Tunnel/arch
         headerVisibility: private
+      # Манифест приватности нужен каждому бандлу отдельно: расширение
+      # тоже читает UserDefaults (статистика фронтов, журнал событий).
+      - path: Shared/PrivacyInfo.xcprivacy
+        buildPhase: resources
     info:
       path: Tunnel/Info.plist
       properties:
