@@ -1,30 +1,55 @@
 # WSBridge
 
-IP-over-WebSocket relay for iOS (Packet Tunnel Provider). Russian version: [README.ru.md](README.ru.md)
+IP-over-WebSocket relay for iOS (Packet Tunnel Provider), scoped to
+Telegram. Russian version: [README.ru.md](README.ru.md)
 
 ## What it does
 
-The app creates a virtual network interface (TUN) and forwards all IPv4
-traffic through it as a WebSocket stream:
+The app creates a virtual network interface (TUN) and carries Telegram's
+IPv4 TCP traffic through it as a WebSocket stream. Everything else keeps
+using the device's normal connection:
 
 ```mermaid
 flowchart LR
     subgraph DEV["iOS · Packet Tunnel Provider process"]
         direction LR
-        APP(["Apps"]) -->|raw IPv4 packets| TUN[/"TUN device"/]
-        TUN --> LW["lwIP stack<br/>NO_SYS=1 · single-threaded · IPv4-only"]
+        TUN[/"TUN device"/] --> LW["lwIP stack<br/>NO_SYS=1 · single-threaded · IPv4-only"]
         LW -->|terminated TCP flows| WS["WebSocket client"]
         WS -->|decoded IP packets| TUN
     end
+    APP(["Apps"]) -->|"Telegram IPv4 ranges only"| TUN
+    APP -->|"everything else"| DIR(["direct · no tunnel"])
     WS <-->|"wss:// (TLS) · HTTP 101 upgrade"| GW["Gateway endpoint"]
 ```
 
-1. System routes all IPv4 traffic into the TUN device.
+1. The system routes only the Telegram IPv4 ranges into the TUN device;
+   all other destinations leave the device directly.
 2. An in-process lwIP stack (single-threaded, `NO_SYS=1`, IPv4-only)
    terminates TCP and re-emits each flow as a WebSocket frame stream.
 3. Frames are carried over TLS (`wss://`) to an HTTP endpoint that
    upgrades to WebSocket (status 101) and relays the stream.
 4. Responses are decoded back to IP packets and written to TUN.
+
+## Scope
+
+This is a split tunnel, not a device-wide VPN. What it does and does not
+carry:
+
+| Traffic | Carried |
+| --- | --- |
+| Telegram IPv4, TCP | yes — through the relay |
+| Telegram IPv4, other protocols (UDP, ICMP) | no — dropped |
+| IPv6 | no — no IPv6 route is announced |
+| Every other destination | no — bypasses the tunnel |
+
+The routed ranges are `149.154.0.0/16`, `91.108.0.0/16` and
+`91.105.192.0/24` ([`Tunnel/TelegramDCs.swift`](Tunnel/TelegramDCs.swift)).
+Full ranges are used rather than the known DC addresses alone, because
+Telegram may connect to any address inside them.
+
+Encrypted DNS (see below) is supplied in the tunnel configuration; how
+widely iOS applies it depends on the system's split-tunnel routing, not
+on this app.
 
 ## Endpoint selection
 

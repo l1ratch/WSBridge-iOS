@@ -25,3 +25,40 @@ SOFTWARE.
 Portions of this project are derived from Flowseal/tg-ws-proxy
 (https://github.com/Flowseal/tg-ws-proxy), also licensed under the MIT License.
 Copyright (c) Flowseal.
+
+---
+
+Third-party components
+======================
+
+lwIP TCP/IP stack
+-----------------
+Location: Tunnel/lwip/
+
+This project vendors a copy of the lwIP lightweight TCP/IP stack, originally
+written by Adam Dunkels and maintained by lwIP contributors. lwIP is
+distributed under a BSD 3-Clause style license. The full text is reproduced in
+Tunnel/lwip/COPYING, which matches the per-file headers carried by the vendored
+sources. Principal copyright holder:
+
+    Copyright (c) 2001-2004 Swedish Institute of Computer Science.
+    All rights reserved.
+
+Individual files in the vendored tree carry additional copyright lines from
+their own authors (Axon Digital Design B.V., Inico Technologies Ltd., Leon
+Woestenberg, Simon Goldschmidt, Dominik Spies, Jasper Verschueren, Verisure
+Innovation AB, Elias Oenal, Dirk Ziegelmeier, Erik Andersson, Benjamin Aigner,
+Joel Cunningham / Garmin International, Deltatee Enterprises, CITEL
+Technologies, Marc Boucher / MBSI, and others). Those per-file headers are the
+authoritative record and must be preserved.
+
+A scan of all 296 .c/.h files under Tunnel/lwip found no GPL or LGPL licensed
+code. The lwIP license is permissive and compatible with the MIT terms above,
+so combining lwIP with WSBridge source imposes no copyleft obligations. Note
+that the PPP support files under Tunnel/lwip/netif/ppp (including its polarssl
+subdirectory, which is BSD licensed, not GPL) are present in the tree but are
+not compiled: PPP_SUPPORT is not defined in Tunnel/lwipopts.h.
+
+If you redistribute WSBridge in binary form, reproduce the lwIP copyright
+notices and license terms for the vendored files you ship, and keep
+Tunnel/lwip/COPYING alongside this file.
