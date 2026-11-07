@@ -368,18 +368,30 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // История по дням копит ПРИЛОЖЕНИЕ — расширение умирает в любой
         // момент и персистентности ему не доверяют. Здесь только отдаём
         // структурированный снапшот уже посчитанных чисел.
-        let json: [String: Any] = [
-            "pkts": packetCount,
-            "bytes": byteCount,
-            "upBytes": EventLog.upBytes,
-            "rxBytes": EventLog.rxBytes,
-            "uptime": Int(Date().timeIntervalSince(startedAt)),
-            "conns": sessions.count,
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: json) {
-            completionHandler?(data)
-        } else {
-            completionHandler?(nil)
+        //
+        // Снапшот снимается на lwipQueue: handleAppMessage приходит с
+        // IPC-потока системы, а sessions (словарь) и счётчики мутируются
+        // только на lwipQueue. Чтение с чужого потока во время вставки/
+        // удаления — краш расширения (реhash словаря на середине), после
+        // которого iOS переподнимает включённый конфиг: статус качается
+        // connected↔disconnecting, сокеты умирают пачкой (ENOTCONN),
+        // «выключить» не выходит до перезапуска приложения. sync здесь
+        // безопасен: вызывающий — IPC-поток приложения, НЕ системный путь
+        // остановки (stopTunnel зовёт completionHandler до дренажа).
+        lwipQueue.sync {
+            let json: [String: Any] = [
+                "pkts": packetCount,
+                "bytes": byteCount,
+                "upBytes": EventLog.upBytes,
+                "rxBytes": EventLog.rxBytes,
+                "uptime": Int(Date().timeIntervalSince(startedAt)),
+                "conns": sessions.count,
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: json) {
+                completionHandler?(data)
+            } else {
+                completionHandler?(nil)
+            }
         }
     }
 }
