@@ -271,8 +271,14 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// ID выбранного DNS ("comss" по умолчанию при первой установке).
-    @Published var selectedDNSId: String = UserDefaults.standard.string(forKey: "selectedDNSId") ?? "comss" {
+    /// ID выбранного DNS ("system" по умолчанию при первой установке:
+    /// split-туннель маршрутизирует только подсети Telegram, но iOS
+    /// применяет dnsSettings провайдера на ВСЁ устройство, пока туннель
+    /// поднят. Telegram DNS не нужен (хардкодные IP DC), а замена DNS
+    /// всем остальным приложениям из туннеля — побочный эффект: на сетях,
+    /// где порт 853 (DoT) до выбранного резолвера зарезан, умирает весь
+    /// DNS устройства. «Системный» не выставляет dnsSettings вовсе.)
+    @Published var selectedDNSId: String = UserDefaults.standard.string(forKey: "selectedDNSId") ?? "system" {
         didSet { UserDefaults.standard.set(selectedDNSId, forKey: "selectedDNSId") }
     }
 
