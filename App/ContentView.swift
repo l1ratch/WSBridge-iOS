@@ -12,6 +12,8 @@ struct ContentView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @State private var showDNS = false
+    /// DNS-выборщик заблокирован при живом туннеле: показываем алерт.
+    @State private var showDNSBlockedAlert = false
 
     var body: some View {
         NavigationStack {
@@ -90,8 +92,16 @@ struct ContentView: View {
                     }
 
                     // DNS-строка: крупнее, ближе к молнии.
+                    // При включённом туннеле выборщик не открывается:
+                    // смена DNS требует пересоздания конфига — сначала стоп.
                     Button {
-                        showDNS = true
+                        if tunnel.status == .connected
+                            || tunnel.status == .connecting
+                            || tunnel.status == .reasserting {
+                            showDNSBlockedAlert = true
+                        } else {
+                            showDNS = true
+                        }
                     } label: {
                         HStack(spacing: 8) {
                             Image(systemName: "network")
@@ -165,6 +175,11 @@ struct ContentView: View {
                 Button("Позже", role: .cancel) {}
             } message: {
                 Text("Если интернет тормозит — перезапусти туннель.")
+            }
+            .alert("Туннель включен", isPresented: $showDNSBlockedAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Для смены DNS выключите туннель.")
             }
         }
     }
@@ -1084,19 +1099,7 @@ struct LocalDNSView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-                if !tunnel.hostsListProbe.isEmpty {
-                    // Топ адресов по живости: детали пробы.
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(tunnel.hostsListProbe.sorted(by: { ($0.value.ms ?? 9999) < ($1.value.ms ?? 9999) })).prefix(12), id: \.key) { ip, r in
-                            HStack {
-                                Text(ip)
-                                    .font(.caption.monospaced())
-                                Spacer()
-                                HealthBadge(result: r)
-                            }
-                        }
-                    }
+                        .textSelection(.enabled)
                 }
                 if tunnel.localDNSUpdateMessage != nil || tunnel.localDNSHostsUpdatedAt != nil {
                     VStack(alignment: .leading, spacing: 2) {

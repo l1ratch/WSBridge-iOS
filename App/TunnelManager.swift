@@ -611,38 +611,36 @@ final class TunnelManager: ObservableObject {
                 }
             }
         }
-        // Сводка: живые/мёртвые IP + примеры доменов.
-        let alive = results.filter { if case .alive = $0.value { true } else { false } }.count
-        let slow = results.filter { if case .slow = $0.value { true } else { false } }.count
-        let dead = results.count - alive - slow
-        // Топ-домены на живых IP.
-        var examples: [String] = []
-        for (ip, r) in results.sorted(by: { ($0.value.ms ?? 9999) < ($1.value.ms ?? 9999) }) {
-            if case .alive = r, let doms = domainsByIP[ip] {
-                let sample = doms.prefix(2).joined(separator: ", ")
-                if !sample.isEmpty { examples.append(sample) }
+        // Сводка по ДОМЕНАМ (не IP): каждый домен смотрим по его IP.
+        // IP-таблицу и «примеры» не показываем — только счётчики
+        // доступности и два списка доменов: работающие и нет.
+        let aliveIPs = Set(results.filter {
+            if case .alive = $0.value { true } else { false }
+        }.keys)
+        let slowIPs = Set(results.filter {
+            if case .slow = $0.value { true } else { false }
+        }.keys)
+        var working: [String] = []      // домены на живых IP
+        var flaky: [String] = []        // домены на медленных IP
+        var broken: [String] = []       // домены на мёртвых IP
+        var seen = Set<String>()
+        for (ip, doms) in domainsByIP {
+            for d in doms {
+                let domain = d.lowercased().trimmingCharacters(in: ".")
+                guard !domain.isEmpty, !seen.contains(domain) else { continue }
+                seen.insert(domain)
+                if aliveIPs.contains(ip) { working.append(domain) }
+                else if slowIPs.contains(ip) { flaky.append(domain) }
+                else { broken.append(domain) }
             }
-            if examples.count >= 4 { break }
         }
-        var deadExamples: [String] = []
-        for (ip, r) in results where {
-            if case .dead = r { true } else { false }
-        }() {
-            if let doms = domainsByIP[ip] {
-                let sample = doms.prefix(2).joined(separator: ", ")
-                if !sample.isEmpty { deadExamples.append(sample) }
-            }
-            if deadExamples.count >= 3 { break }
-        }
-        var lines: [String] = []
-        lines.append("Адресов: \(results.count) · живых: \(alive) · медленных: \(slow) · мёртвых: \(dead)")
-        if !examples.isEmpty {
-            lines.append("Доступны (примеры): " + examples.joined(separator: "; "))
-        }
-        if !deadExamples.isEmpty {
-            lines.append("Недоступны (примеры): " + deadExamples.joined(separator: "; "))
-        }
-        hostsListProbeSummary = lines.joined(separator: "\n")
+        hostsListProbeSummary = [
+            "Работают: \(working.count) доменов",
+            working.count > 0 ? "  " + working.prefix(30).joined(separator: ", ") : nil,
+            flaky.count > 0 ? "Медленные (нестабильно): \(flaky.count) доменов" : nil,
+            broken.count > 0 ? "Не работают: \(broken.count) доменов" : nil,
+            broken.count > 0 ? "  " + broken.prefix(30).joined(separator: ", ") : nil,
+        ].compactMap { $0 }.joined(separator: "\n")
     }
 
     /// Загружает контент выбранного списка rewrites. Валидация: в файле
