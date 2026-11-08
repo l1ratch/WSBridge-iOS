@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import Darwin.resolv
 /// res_query (системный DNS-путь) — из Darwin resolv.h; socket-API —
 /// из системных заголовков, доступных через Foundation/Darwin.
 
