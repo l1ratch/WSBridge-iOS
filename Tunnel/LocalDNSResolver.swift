@@ -193,7 +193,7 @@ final class LocalDNSResolver {
                    doT: String? = nil, doHURL: String? = nil) {
         self.upstreams = upstreams
         self.upstreamDoTHost = doT
-        self.upstreamDoHURL = doHURL.map { URL(string: $0) ?? nil }
+        self.upstreamDoHURL = doHURL.flatMap { URL(string: $0) }
         var table: [String: UInt32] = [:]
         if let text = hostsText {
             for rawLine in text.split(separator: "\n") {
