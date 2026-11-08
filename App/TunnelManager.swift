@@ -160,28 +160,33 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// Транспорт шифрованного DNS. По умолчанию DoT: коннект идёт напрямую
-    /// к IP:853 с SNI и не требует бутстрап-резолва имени сервера, который
+    /// Транспорт DNS. По умолчанию DoT: коннект идёт напрямую к IP:853
+    /// с SNI и не требует бутстрап-резолва имени сервера, который
     /// система делает уже под туннелем (эта ступень и ломала DoH).
+    /// UDP — plain :53 без шифрования: нужен как upstream локального
+    /// DNS (LRDNS пересылает запросы туда сырыми).
     enum DNSMode: String, CaseIterable {
-        case dot, doh
+        case dot, doh, udp
 
         var title: String {
             switch self {
             case .dot: "DNS-over-TLS"
             case .doh: "DNS-over-HTTPS"
+            case .udp: "UDP (порт 53)"
             }
         }
         var shortTitle: String {
             switch self {
             case .dot: "DoT"
             case .doh: "DoH"
+            case .udp: "UDP"
             }
         }
         var hint: String {
             switch self {
             case .dot: "Порт 853. Прямой коннект к IP сервера — без резолва имени под туннелем."
             case .doh: "Порт 443. Маскируется под обычный HTTPS, но требует резолва имени сервера."
+            case .udp: "Порт 53, без шифрования. Провайдер видит и может подменить ответы. Нужен только как upstream Локального DNS — иначе выбирайте DoT/DoH."
             }
         }
     }
@@ -249,12 +254,14 @@ final class TunnelManager: ObservableObject {
 
     /// Фактический транспорт для выбранного конфига: если предпочитаемый
     /// недоступен у конфига — берём второй, если и его нет — nil (plain :53).
+    /// UDP для конфигов с IP всегда доступен.
     var effectiveDNSMode: DNSMode? {
         switch dnsMode {
         case .dot: return selectedDNS.supportsDoT ? .dot
             : (selectedDNS.supportsDoH ? .doh : nil)
         case .doh: return selectedDNS.supportsDoH ? .doh
             : (selectedDNS.supportsDoT ? .dot : nil)
+        case .udp: return selectedDNS.servers.isEmpty ? nil : .udp
         }
     }
 
@@ -271,16 +278,18 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// ID выбранного DNS ("system" по умолчанию при первой установке:
-    /// split-туннель маршрутизирует только подсети Telegram, но iOS
-    /// применяет dnsSettings провайдера на ВСЁ устройство, пока туннель
-    /// поднят. Telegram DNS не нужен (хардкодные IP DC), а замена DNS
-    /// всем остальным приложениям из туннеля — побочный эффект: на сетях,
-    /// где порт 853 (DoT) до выбранного резолвера зарезан, умирает весь
-    /// DNS устройства. «Системный» не выставляет dnsSettings вовсе.)
-    @Published var selectedDNSId: String = UserDefaults.standard.string(forKey: "selectedDNSId") ?? "system" {
+    /// ID выбранного DNS ("lrdns" по умолчанию при первой установке —
+    /// локальный резолвер с rewrites; "system" — DNS устройства, туннель
+    /// его не трогает). Спец-ID:
+    ///   "lrdns"  — локальный DNS (LRDNS): обработка в туннеле;
+    ///   "system" — не выставляет dnsSettings вовсе.
+    /// Реальные резолверы — остальными ID из allDNS.
+    @Published var selectedDNSId: String = UserDefaults.standard.string(forKey: "selectedDNSId") ?? "lrdns" {
         didSet { UserDefaults.standard.set(selectedDNSId, forKey: "selectedDNSId") }
     }
+
+    /// Включён ли локальный DNS: выбирается в общему выборщике DNS.
+    var localDNSEnabled: Bool { selectedDNSId == "lrdns" }
 
     /// Все DNS: пресеты + свои.
     var allDNS: [DNSConfig] { Self.dnsPresets + customDNS }
@@ -331,21 +340,15 @@ final class TunnelManager: ObservableObject {
 
     var allHostsLists: [HostsList] { Self.hostsListPresets + customHostsLists }
 
-    /// Выбранный список rewrites. nil = локальный DNS без списка
-    /// (только upstream-проксирование).
-    @Published var selectedHostsListId: String? = UserDefaults.standard.string(forKey: "selectedHostsListId") {
+    /// Выбранный список rewrites. ГеоHide по умолчанию (большой, RU).
+    @Published var selectedHostsListId: String = UserDefaults.standard.string(forKey: "selectedHostsListId") ?? "geohide" {
         didSet { UserDefaults.standard.set(selectedHostsListId, forKey: "selectedHostsListId") }
     }
 
     /// Upstream для локального DNS: ID DNS-конфига из общего списка или
-    /// "system". "system" = резолвер спрашивает системный DNS.
+    /// "system" (по умолчанию). "system" = резолвер спрашивает системный DNS.
     @Published var localDNSUpstreamId: String = UserDefaults.standard.string(forKey: "localDNSUpstreamId") ?? "system" {
         didSet { UserDefaults.standard.set(localDNSUpstreamId, forKey: "localDNSUpstreamId") }
-    }
-
-    /// Локальный DNS включён.
-    @Published var localDNSEnabled: Bool = UserDefaults.standard.bool(forKey: "localDNSEnabled") {
-        didSet { UserDefaults.standard.set(localDNSEnabled, forKey: "localDNSEnabled") }
     }
 
     /// Кеш контента выбранного списка (текст hosts-файла).
@@ -365,9 +368,8 @@ final class TunnelManager: ObservableObject {
     /// должно быть ≥3 строк «IP имя» (см. updateFronts для аналога).
     @discardableResult
     func updateLocalDNSHosts() async -> Bool {
-        guard localDNSEnabled else { return false }
         guard let list = selectedHostsList else {
-            localDNSUpdateMessage = "Список не выбран"
+            localDNSUpdateMessage = "Список не найден"
             return false
         }
         localDNSUpdateMessage = "Загрузка…"
@@ -399,10 +401,11 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// Выбранный список rewrites.
+    /// Выбранный список rewrites (nil, если сохранённый ID указывает на
+    /// удалённый список — фолбэк на первый пресет).
     var selectedHostsList: HostsList? {
-        guard let id = selectedHostsListId else { return nil }
-        return allHostsLists.first { $0.id == id }
+        allHostsLists.first { $0.id == selectedHostsListId }
+            ?? Self.hostsListPresets.first
     }
 
     // MARK: - Фронты (hot-обновление без пересборки)
@@ -1157,6 +1160,8 @@ final class TunnelManager: ObservableObject {
                 if let doh = selectedDNS.dohURL { config["doh"] = doh as NSString }
             case .dot:
                 if let dot = selectedDNS.dotHostname { config["dot"] = dot as NSString }
+            case .udp:
+                break // plain :53 — без шифрования
             case nil:
                 break // ни DoT, ни DoH — plain :53
             }
