@@ -966,21 +966,48 @@ struct DNSManageView: View {
 
 /// Локальный DNS (LRDNS): настройки резолвера туннеля. Включается
 /// выбором «Локальный» в общем выборщике DNS.
+/// Режимы: Hosts (перезаписи имён) и Прокси (домены через прокси) —
+/// независимы, можно оба; настройки выключенного режима серые.
 struct LocalDNSView: View {
     @ObservedObject var tunnel: TunnelManager
     @State private var showAddList = false
 
+    private var tunnelUp: Bool {
+        tunnel.status == .connected || tunnel.status == .connecting || tunnel.status == .reasserting
+    }
+
     var body: some View {
         Form {
             Section {
-                Text("Включается выбором «Локальный (LRDNS)» в выборщике DNS на главном экране. Запросы обрабатывает туннель: имена из списка получают адреса из списка, остальные идут на сервер ниже.")
+                Text("Включается выбором «Локальный (LRDNS)» в выборщике DNS на главном экране.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
+            // ── Режимы работы ─────────────────────────────────────
+            Section("Режим работы") {
+                Toggle(isOn: $tunnel.hostsRewritesEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Hosts (перезаписи)")
+                        Text("Имена из списка получают адреса из списка")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .disabled(tunnelUp)
+                Toggle(isOn: $tunnel.proxyDomainsEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Прокси-домены")
+                        Text("Выбранные домены ходят через SOCKS5/HTTP-прокси")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .disabled(tunnelUp)
+            }
+
+            // ── DNS после списков (общий для обоих режимов) ────────
             Section("DNS после списков") {
-                // Транспорт upstream'а: DoT/DoH/UDP. Сервер — из общего
-                // списка DNS (редактируется только там, в «Настройках DNS»).
                 Picker("Транспорт", selection: $tunnel.localDNSUpstreamModeRaw) {
                     ForEach(TunnelManager.DNSMode.allCases, id: \.rawValue) { mode in
                         Text(mode.shortTitle).tag(mode.rawValue)
@@ -1032,15 +1059,13 @@ struct LocalDNSView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section {
-                NavigationLink {
-                    ProxyDomainsView(tunnel: tunnel)
-                } label: {
-                    Label("Прокси-домены", systemImage: "arrow.triangle.swap")
+            // ── Hosts: список перезаписей (серо, если режим выкл) ──
+            Section("Hosts — список перезаписей") {
+                if !tunnel.hostsRewritesEnabled {
+                    Text("Режим Hosts выключен — перезаписи не применяются.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-            }
-
-            Section("Список перезаписей") {
                 ForEach(tunnel.allHostsLists) { list in
                     Button {
                         tunnel.selectedHostsListId = list.id
@@ -1062,7 +1087,8 @@ struct LocalDNSView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    if !list.isPreset {
+                    .disabled(!tunnel.hostsRewritesEnabled)
+                    if !list.isPreset && tunnel.hostsRewritesEnabled {
                         Button(role: .destructive) {
                             tunnel.customHostsLists.removeAll { $0.id == list.id }
                             if tunnel.selectedHostsListId == list.id {
@@ -1079,16 +1105,18 @@ struct LocalDNSView: View {
                 } label: {
                     Label("Добавить список", systemImage: "plus.circle")
                 }
+                .disabled(!tunnel.hostsRewritesEnabled)
             }
 
-            // Обновление списка + тест живости + статус.
-            Section {
+            // ── Hosts: загрузка и тест (серо, если режим выкл) ─────
+            Section("Hosts — обновление и тест") {
                 Button {
                     Task { await tunnel.updateLocalDNSHosts() }
                 } label: {
                     Label("Загрузить список заново", systemImage: "arrow.triangle.2.circlepath")
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .disabled(!tunnel.hostsRewritesEnabled)
                 Button {
                     Task { await tunnel.probeHostsList() }
                 } label: {
@@ -1101,7 +1129,7 @@ struct LocalDNSView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .disabled(tunnel.hostsListProbeRunning || tunnel.localDNSHostsText == nil)
+                .disabled(!tunnel.hostsRewritesEnabled || tunnel.hostsListProbeRunning || tunnel.localDNSHostsText == nil)
                 if let summary = tunnel.hostsListProbeSummary {
                     Text(summary)
                         .font(.caption)
@@ -1125,6 +1153,21 @@ struct LocalDNSView: View {
                 }
             }
 
+            // ── Прокси: домены и прокси (серо, если режим выкл) ────
+            Section("Прокси — домены и серверы") {
+                if !tunnel.proxyDomainsEnabled {
+                    Text("Режим прокси выключен — домены не перенаправляются.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                NavigationLink {
+                    ProxyDomainsView(tunnel: tunnel)
+                } label: {
+                    Label("Списки доменов и прокси", systemImage: "arrow.triangle.swap")
+                }
+                .disabled(!tunnel.proxyDomainsEnabled)
+            }
+
             Section {
                 Text("Изменения применятся при следующем включении туннеля. Список кешируется: без сети работает последний загруженный.")
                     .font(.caption)
@@ -1140,8 +1183,9 @@ struct LocalDNSView: View {
         }
         .task {
             // При открытии страницы: кеш пустой или старше 30 дней —
-            // обновим тихо.
-            if (tunnel.localDNSHostsUpdatedAt?.timeIntervalSinceNow ?? -720 * 3600) < -(30 * 24 * 3600) {
+            // обновим тихо (только если режим Hosts включен).
+            if tunnel.hostsRewritesEnabled,
+               (tunnel.localDNSHostsUpdatedAt?.timeIntervalSinceNow ?? -720 * 3600) < -(30 * 24 * 3600) {
                 _ = await tunnel.updateLocalDNSHosts()
             }
         }

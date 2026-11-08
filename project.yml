@@ -12,7 +12,7 @@ settings:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
     WSB_VERSION: "0.3"
-    WSB_BUILD: "8"
+    WSB_BUILD: "9"
 
 options:
   bundleIdPrefix: com.l1ratch

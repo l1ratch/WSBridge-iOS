@@ -515,6 +515,18 @@ final class TunnelManager: ObservableObject {
         allDNS.first { $0.id == localDNSUpstreamId }
     }
 
+    /// Режим Hosts (перезаписи имён из списка). Общий тумблер LRDNS-
+    /// страницы: выключен = rewrites не передаются в туннель.
+    @Published var hostsRewritesEnabled: Bool = UserDefaults.standard.object(forKey: "hostsRewritesEnabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(hostsRewritesEnabled, forKey: "hostsRewritesEnabled") }
+    }
+
+    /// Режим прокси-доменов: выключен = домены не перенаправляются
+    /// через прокси (прокси в настройках остаются, но не используются).
+    @Published var proxyDomainsEnabled: Bool = UserDefaults.standard.object(forKey: "proxyDomainsEnabled") as? Bool ?? false {
+        didSet { UserDefaults.standard.set(proxyDomainsEnabled, forKey: "proxyDomainsEnabled") }
+    }
+
     /// Кеш контента выбранного списка (текст hosts-файла).
     @Published private(set) var localDNSHostsText: String? = UserDefaults.standard.string(forKey: "localDNSHostsText") {
         didSet { UserDefaults.standard.set(localDNSHostsText, forKey: "localDNSHostsText") }
@@ -1582,7 +1594,8 @@ final class TunnelManager: ObservableObject {
         // странице LRDNS). «Системный» = пустой upstream.
         if localDNSEnabled {
             config["localDNS"] = true as NSNumber
-            if let hosts = localDNSHostsText, !hosts.isEmpty {
+            // Режим Hosts: таблица перезаписей (только при тумблере).
+            if hostsRewritesEnabled, let hosts = localDNSHostsText, !hosts.isEmpty {
                 config["localDNSHosts"] = hosts as NSString
             }
             if let up = localDNSUpstreamConfig, !up.servers.isEmpty {
@@ -1598,20 +1611,23 @@ final class TunnelManager: ObservableObject {
                 }
             }
             // Прокси-домены: список доменов (fake-IP в резолвере) + один
-            // активный прокси. При автовыборе — лучший из пробитых.
-            let domainList = await loadProxyDomains()
-            let activeProxy: String?
-            if selectedProxyIndex >= 0, selectedProxyIndex < proxyURLs.count {
-                activeProxy = proxyURLs[selectedProxyIndex]
-            } else if let best = bestProxyURL {
-                activeProxy = best
-            } else {
-                activeProxy = proxyURLs.first
-            }
-            if !domainList.isEmpty, let activeProxy,
-               ProxyEndpoint.parse(activeProxy) != nil {
-                config["proxyDomains"] = domainList as NSArray
-                config["proxies"] = [activeProxy] as NSArray
+            // активный прокси. Только при тумблере режима; при автовыборе
+            // — лучший из пробитых.
+            if proxyDomainsEnabled {
+                let domainList = await loadProxyDomains()
+                let activeProxy: String?
+                if selectedProxyIndex >= 0, selectedProxyIndex < proxyURLs.count {
+                    activeProxy = proxyURLs[selectedProxyIndex]
+                } else if let best = bestProxyURL {
+                    activeProxy = best
+                } else {
+                    activeProxy = proxyURLs.first
+                }
+                if !domainList.isEmpty, let activeProxy,
+                   ProxyEndpoint.parse(activeProxy) != nil {
+                    config["proxyDomains"] = domainList as NSArray
+                    config["proxies"] = [activeProxy] as NSArray
+                }
             }
         }
         if !activeDNSServers.isEmpty {
