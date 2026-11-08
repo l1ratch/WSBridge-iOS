@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import Network
 
 /// Локальный DNS-резолвер туннеля: перехватывает UDP:53 запросы из
 /// packetFlow, применяет hosts-rewrite правила, непокрытые имена
@@ -23,6 +24,10 @@ final class LocalDNSResolver {
     private(set) var statRewritten: UInt64 = 0
     private(set) var statForwarded: UInt64 = 0
     private(set) var statFailed: UInt64 = 0
+    /// DoT-upstream: SNI-хост (nil = UDP:53). TLS-коннект к IP:853.
+    private var upstreamDoTHost: String?
+    /// DoH-upstream: URL (nil = не DoH). Запросы POST/GET-типа wireformat.
+    private var upstreamDoHURL: URL?
     /// Страховочный UDP-листенер на 198.18.0.2:53: если ядро доставляет
     /// пакеты на TUN-адрес локально (а не через packetFlow), их ловит он.
     /// Оба пути валидны; ядро iOS выбирает один — сработает занятый.
@@ -179,8 +184,16 @@ final class LocalDNSResolver {
     }
 
     /// Конфигурация на старте туннеля (один раз, до первого пакета).
-    func configure(hostsText: String?, upstreams: [String]) {
+    /// - Parameters:
+    ///   - hostsText: текст hosts-файла (таблица rewrites).
+    ///   - upstreams: IP-адреса upstream DNS (UDP:53 или DoT-IP:853).
+    ///   - doT: SNI-хост для TLS-upstream (nil = UDP:53).
+    ///   - doHURL: URL DoH-upstream (альтернатива DoT; nil = не DoH).
+    func configure(hostsText: String?, upstreams: [String],
+                   doT: String? = nil, doHURL: String? = nil) {
         self.upstreams = upstreams
+        self.upstreamDoTHost = doT
+        self.upstreamDoHURL = doHURL.map { URL(string: $0) ?? nil }
         var table: [String: UInt32] = [:]
         if let text = hostsText {
             for rawLine in text.split(separator: "\n") {
@@ -343,21 +356,130 @@ final class LocalDNSResolver {
             }
             return
         }
-        // Конкретный upstream: сырой UDP. Failover по списку.
+        // Конкретный upstream: транспорт по конфигурации (DoT/DoH/UDP).
         let servers = upstreams
+        let doT = upstreamDoTHost
+        let doH = upstreamDoHURL
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            for server in servers {
-                if let answer = Self.udpQuery(question, server: server) {
+            // DoH: POST к URL, тело — wireformat-запрос.
+            if let doH {
+                if let answer = Self.doHQuery(question, url: doH) {
                     self.replyFromUpstream(answer, question: question,
                                            original: originalPacket)
                     return
+                }
+            } else if let doT {
+                // DoT: TLS к IP:853 с SNI; фрейминг — 2-байтовый length
+                // prefix (RFC 7858). Failover по IP.
+                for server in servers {
+                    if let answer = Self.doTQuery(question, server: server, sni: doT) {
+                        self.replyFromUpstream(answer, question: question,
+                                               original: originalPacket)
+                        return
+                    }
+                }
+            } else {
+                // UDP: сырой :53. Failover по списку.
+                for server in servers {
+                    if let answer = Self.udpQuery(question, server: server) {
+                        self.replyFromUpstream(answer, question: question,
+                                               original: originalPacket)
+                        return
+                    }
                 }
             }
             self.reply(packet: originalPacket, question: question,
                        answer: Data(), rcode: 2)  // SERVFAIL
             self.statFailed += 1
         }
+    }
+
+    /// DoT-запрос: TLS-коннект к server:853 с SNI, RFC 7858 фрейминг
+    /// (2-байтовый big-endian length перед каждым сообщением).
+    /// Синхронный, на global-очереди.
+    private static func doTQuery(_ question: Data, server: String, sni: String) -> Data? {
+        // Семафор: таймаут общий (upstreamTimeout + коннект).
+        let sem = DispatchSemaphore(value: 0)
+        var answer: Data?
+        let tlsOpts = NWProtocolTLS.Options()
+        let sec = tlsOpts.securityProtocolOptions
+        _ = sni.withCString { sniC in
+            sec_protocol_options_set_tls_server_name(sec, sniC)
+        }
+        let params = NWParameters(tls: tlsOpts)
+        let conn = NWConnection(
+            host: NWEndpoint.Host(server),
+            port: NWEndpoint.Port(rawValue: 853)!,
+            using: params)
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                // Отправляем: length-prefix + запрос.
+                var frame = Data()
+                frame.append(contentsOf: [UInt8((question.count >> 8) & 0xFF),
+                                          UInt8(question.count & 0xFF)])
+                frame.append(question)
+                conn.send(content: frame, completion: .contentProcessed { err in
+                    if err != nil { sem.signal(); return }
+                    Self.receiveDoTFrame(conn) { data in
+                        answer = data
+                        sem.signal()
+                    }
+                })
+            case .failed, .cancelled:
+                sem.signal()
+            default:
+                break
+            }
+        }
+        conn.start(queue: .global(qos: .userInitiated))
+        // Таймаут: освобождаем ожидание, коннект отменяем после.
+        _ = sem.wait(timeout: .now() + upstreamTimeout + 1)
+        conn.cancel()
+        return answer
+    }
+
+    /// Приём одного DoT-фрейма: 2-байтовый length + сообщение.
+    private static func receiveDoTFrame(_ conn: NWConnection, done: @escaping (Data?) -> Void) {
+        conn.receive(minimumIncompleteLength: 2, maximumLength: 2) { data, _, _, err in
+            guard let lenBytes = data, lenBytes.count == 2, err == nil else {
+                done(nil); return
+            }
+            let len = (Int(lenBytes[0]) << 8) | Int(lenBytes[1])
+            guard len > 12, len < 65536 else { done(nil); return }
+            conn.receive(minimumIncompleteLength: len, maximumLength: len) { msg, _, _, err2 in
+                guard let msg = msg, msg.count == len, err2 == nil else {
+                    done(nil); return
+                }
+                done(msg)
+            }
+        }
+    }
+
+    /// DoH-запрос: POST wireformat-тела к URL (RFC 8484). Синхронная
+    /// обёртка над URLSession.
+    private static func doHQuery(_ question: Data, url: URL) -> Data? {
+        let sem = DispatchSemaphore(value: 0)
+        var answer: Data?
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/dns-message", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = upstreamTimeout
+        request.httpBody = question
+        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+            if let http = response as? HTTPURLResponse,
+               http.statusCode == 200,
+               let data, data.count > 12,
+               let mime = (http.value(forHTTPHeaderField: "Content-Type")),
+               mime.contains("application/dns-message") {
+                answer = data
+            }
+            sem.signal()
+        }
+        task.resume()
+        _ = sem.wait(timeout: .now() + upstreamTimeout + 1)
+        return answer
     }
 
     /// UDP-запрос к одному серверу с таймаутом. Синхронный вызов на

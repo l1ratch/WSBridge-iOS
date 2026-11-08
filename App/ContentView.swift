@@ -702,11 +702,14 @@ struct DNSView: View {
                     .foregroundStyle(.secondary)
             }
 
-            // Свитчер транспорта: DoT по умолчанию (прямой коннект к IP:853,
-            // без бутстрап-резолва имени под туннелем), DoH — если хочется
-            // маскировку под HTTPS.
-            Section("Шифрование DNS") {
-                Picker("Транспорт", selection: $tunnel.dnsModeRaw) {
+            // Транспорт: для обычных серверов — DoT/DoH/UDP. Правило:
+            // выбор «Локальный» ниже фиксирует транспорт на UDP; уход
+            // с UDP сбрасывает режим на «Системный».
+            Section("Транспорт") {
+                Picker("Транспорт", selection: Binding(
+                    get: { tunnel.dnsModeRaw },
+                    set: { tunnel.dnsModeRaw = $0 }
+                )) {
                     ForEach(TunnelManager.DNSMode.allCases, id: \.rawValue) { mode in
                         Text(mode.shortTitle).tag(mode.rawValue)
                     }
@@ -718,10 +721,10 @@ struct DNSView: View {
                 DNSModeFallbackNote(tunnel: tunnel)
             }
 
-            Section("Режим DNS") {
-                // «Системный» и «Локальный» — спец-режимы, первыми.
+            // ЕДИНЫЙ список: «Системный» → «Локальный (LRDNS)» → серверы.
+            Section("DNS") {
                 Button {
-                    tunnel.selectedDNSId = "system"
+                    tunnel.setDNSMode("system")
                 } label: {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -734,13 +737,13 @@ struct DNSView: View {
                         Spacer()
                         if tunnel.selectedDNSId == "system" {
                             Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
+                                .foregroundStyle(.green)
                         }
                     }
                 }
                 .buttonStyle(.plain)
                 Button {
-                    tunnel.selectedDNSId = "lrdns"
+                    tunnel.setDNSMode("lrdns")
                 } label: {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -753,30 +756,14 @@ struct DNSView: View {
                         Spacer()
                         if tunnel.selectedDNSId == "lrdns" {
                             Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
+                                .foregroundStyle(.green)
                         }
                     }
                 }
                 .buttonStyle(.plain)
-            }
-
-            Section("Шифрование DNS") {
-                Picker("Транспорт", selection: $tunnel.dnsModeRaw) {
-                    ForEach(TunnelManager.DNSMode.allCases, id: \.rawValue) { mode in
-                        Text(mode.shortTitle).tag(mode.rawValue)
-                    }
-                }
-                .pickerStyle(.segmented)
-                Text(tunnel.dnsMode.hint)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                DNSModeFallbackNote(tunnel: tunnel)
-            }
-
-            Section("DNS-серверы") {
                 ForEach(tunnel.allDNS.filter { $0.id != "system" }) { config in
                     Button {
-                        tunnel.selectedDNSId = config.id
+                        tunnel.setDNSMode(config.id)
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
@@ -930,7 +917,15 @@ struct LocalDNSView: View {
             }
 
             Section("DNS после списков") {
-                // Upstream: «Системный» + все конфиги с IP.
+                // Транспорт upstream'а: DoT/DoH/UDP. Сервер — из общего
+                // списка DNS (редактируется только там, в «Настройках DNS»).
+                Picker("Транспорт", selection: $tunnel.localDNSUpstreamModeRaw) {
+                    ForEach(TunnelManager.DNSMode.allCases, id: \.rawValue) { mode in
+                        Text(mode.shortTitle).tag(mode.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(tunnel.localDNSUpstreamId == "system")
                 Button {
                     tunnel.localDNSUpstreamId = "system"
                 } label: {
@@ -970,7 +965,7 @@ struct LocalDNSView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                Text("Upstream всегда по UDP:53 — шифрование остаётся за системным DNS. Для DoT/DoH выбирайте «Системный» + системный VPN-профиль.")
+                Text("Транспорт применяется к серверу выше: DoT — IP:853 с SNI, DoH — HTTPS-запрос, UDP — порт 53 без шифрования. Серверы и их адреса редактируются в «Настройках DNS».")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

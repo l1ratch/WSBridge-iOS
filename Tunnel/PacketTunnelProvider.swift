@@ -129,15 +129,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self?.localDNS = resolver
             if (proto?.providerConfiguration?["localDNS"] as? Bool) == true {
                 let hosts = proto?.providerConfiguration?["localDNSHosts"] as? String
-                // Upstream: IP выбранного DNS (пусто = системный). DoT/DoH
-                // сюда не передаются — upstream локального резолвера всегда
-                // plain UDP:53 (шифрование остаётся за системным выбором).
+                // Upstream: IP выбранного DNS + опциональный транспорт:
+                // localDNSUpstreamDoT (SNI) или localDNSUpstreamDoH (URL);
+                // оба пусты = plain UDP:53.
                 let upstreams = (proto?.providerConfiguration?["localDNSUpstream"] as? [String]) ?? []
-                resolver.configure(hostsText: hosts, upstreams: upstreams)
+                let doT = proto?.providerConfiguration?["localDNSUpstreamDoT"] as? String
+                let doH = proto?.providerConfiguration?["localDNSUpstreamDoH"] as? String
+                resolver.configure(hostsText: hosts, upstreams: upstreams,
+                                   doT: doT, doHURL: doH)
                 // Страховочный листенер: если ядро доставляет DNS на
                 // TUN-адрес локально (не через packetFlow), ловит сокет.
                 resolver.startListener()
-                EventLog.append("cfg:localdns=on rules=\(resolver.rewriteCount) upstream=\(upstreams.first ?? "system")")
+                let transport = doT != nil ? "dot" : (doH != nil ? "doh" : "udp")
+                EventLog.append("cfg:localdns=on rules=\(resolver.rewriteCount) upstream=\(upstreams.first ?? "system"):\(transport)")
             } else {
                 resolver.configure(hostsText: nil, upstreams: [])
             }

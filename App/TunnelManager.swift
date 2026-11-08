@@ -245,12 +245,30 @@ final class TunnelManager: ObservableObject {
     ]
 
     /// Выбранный транспорт шифрованного DNS (по умолчанию DoT).
+    /// Правило LRDNS: при выборе «Локальный» транспорт фиксируется на UDP
+    /// (upstream резолвера — сырые пересылки на :53), а попытка уйти с
+    /// UDP на DoT/DoH сбрасывает режим на «Системный».
     @Published var dnsModeRaw: String =
         UserDefaults.standard.string(forKey: "dnsMode") ?? DNSMode.dot.rawValue {
-        didSet { UserDefaults.standard.set(dnsModeRaw, forKey: "dnsMode") }
+        didSet {
+            UserDefaults.standard.set(dnsModeRaw, forKey: "dnsMode")
+            // Правило связки: LRDNS + не-UDP → сброс режима на системный.
+            if selectedDNSId == "lrdns", DNSMode(rawValue: dnsModeRaw) != .udp {
+                selectedDNSId = "system"
+            }
+        }
     }
 
     var dnsMode: DNSMode { DNSMode(rawValue: dnsModeRaw) ?? .dot }
+
+    /// Установка режима DNS с автофиксацией транспорта: LRDNS тянет за
+    /// собой UDP. Единая точка записи selectedDNSId (UI зовёт только её).
+    func setDNSMode(_ id: String) {
+        if id == "lrdns" {
+            dnsModeRaw = DNSMode.udp.rawValue
+        }
+        selectedDNSId = id
+    }
 
     /// Фактический транспорт для выбранного конфига: если предпочитаемый
     /// недоступен у конфига — берём второй, если и его нет — nil (plain :53).
@@ -349,6 +367,22 @@ final class TunnelManager: ObservableObject {
     /// "system" (по умолчанию). "system" = резолвер спрашивает системный DNS.
     @Published var localDNSUpstreamId: String = UserDefaults.standard.string(forKey: "localDNSUpstreamId") ?? "system" {
         didSet { UserDefaults.standard.set(localDNSUpstreamId, forKey: "localDNSUpstreamId") }
+    }
+
+    /// Транспорт upstream'а локального DNS: DoT / DoH / UDP. Своё
+    /// значение, отдельное от глобального свитчера. По умолчанию UDP.
+    /// Конфиг upstream'а берётся из ОБЩЕГО списка DNS (единственная
+    /// точка, где редактируются серверы).
+    @Published var localDNSUpstreamModeRaw: String =
+        UserDefaults.standard.string(forKey: "localDNSUpstreamMode") ?? DNSMode.udp.rawValue {
+        didSet { UserDefaults.standard.set(localDNSUpstreamModeRaw, forKey: "localDNSUpstreamMode") }
+    }
+
+    var localDNSUpstreamMode: DNSMode { DNSMode(rawValue: localDNSUpstreamModeRaw) ?? .udp }
+
+    /// Конфиг, выбранный upstream'ом LRDNS (nil = системный).
+    var localDNSUpstreamConfig: DNSConfig? {
+        allDNS.first { $0.id == localDNSUpstreamId }
     }
 
     /// Кеш контента выбранного списка (текст hosts-файла).
@@ -1136,19 +1170,25 @@ final class TunnelManager: ObservableObject {
         if !dcLines.isEmpty { config["dcMap"] = dcLines as NSArray }
         if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
         // Локальный DNS: резолвер туннеля с hosts-rewrite списком.
-        // Таблица передаётся текстом hosts-файла, upstream — IP серверов
-        // конфига, выбранного НА СТРАНИЦЕ локального DNS (не глобального
-        // selectedDNSId!).
+        // Таблица передаётся текстом hosts-файла, upstream — конфиг из
+        // ОБЩЕГО списка DNS + его транспорт (DoT/DoH/UDP — выбор на
+        // странице LRDNS). «Системный» = пустой upstream.
         if localDNSEnabled {
             config["localDNS"] = true as NSNumber
             if let hosts = localDNSHostsText, !hosts.isEmpty {
                 config["localDNSHosts"] = hosts as NSString
             }
-            let upstreamServers: [String] = localDNSUpstreamId == "system"
-                ? []
-                : (allDNS.first { $0.id == localDNSUpstreamId }?.servers ?? [])
-            if !upstreamServers.isEmpty {
-                config["localDNSUpstream"] = upstreamServers as NSArray
+            if let up = localDNSUpstreamConfig, !up.servers.isEmpty {
+                config["localDNSUpstream"] = up.servers as NSArray
+                // Транспорт upstream'а: DoT-хост, DoH-URL или пусто (UDP:53).
+                switch localDNSUpstreamMode {
+                case .dot:
+                    if let host = up.dotHostname { config["localDNSUpstreamDoT"] = host as NSString }
+                case .doh:
+                    if let url = up.dohURL { config["localDNSUpstreamDoH"] = url as NSString }
+                case .udp:
+                    break // plain :53
+                }
             }
         }
         if !activeDNSServers.isEmpty {
