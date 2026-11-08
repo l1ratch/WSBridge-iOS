@@ -108,7 +108,7 @@ enum DNSProbe {
     /// TCP-коннект к server:port с замером. Таймаут 4 с.
     static func tcp(_ server: String, port: UInt16) async -> ProbeResult {
         let start = DispatchTime.now()
-        let ok = await withCheckedContinuation { cont in
+        let ok: Bool = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             let conn = NWConnection(host: NWEndpoint.Host(server),
                                     port: NWEndpoint.Port(rawValue: port)!,
                                     using: .tcp)
@@ -165,7 +165,7 @@ enum DNSProbe {
         query.append(Data("com".utf8))
         query.append(contentsOf: [0x00])                     // конец имени
         query.append(contentsOf: [0x00, 0x01, 0x00, 0x01])  // A, IN
-        let ok: Bool = await withCheckedContinuation { cont in
+        let ok: Bool = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let sock = socket(AF_INET, SOCK_DGRAM, 0)
                 guard sock >= 0 else { cont.resume(returning: false); return }
@@ -589,11 +589,11 @@ final class TunnelManager: ObservableObject {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty, !line.hasPrefix("#") else { continue }
             let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            guard parts.count >= 2,
-                  let ip = IPv4AddrQuick.parse(String(parts[0])),
-                  parts[0] != "0.0.0.0", !parts[0].hasPrefix("127.") else { continue }
-            if !ips.contains(parts[0]) { ips.append(String(parts[0])) }
-            domainsByIP[String(parts[0]), default: []].append(String(parts[1]))
+            let ipStr = parts.count >= 2 ? String(parts[0]) : ""
+            guard IPv4AddrQuick.parse(ipStr),
+                  ipStr != "0.0.0.0", !ipStr.hasPrefix("127.") else { continue }
+            if !ips.contains(ipStr) { ips.append(ipStr) }
+            domainsByIP[ipStr, default: []].append(String(parts[1]))
         }
         // Пробим параллельно (батчами по 8, чтобы не задушить сеть).
         var results: [String: ProbeResult] = [:]
