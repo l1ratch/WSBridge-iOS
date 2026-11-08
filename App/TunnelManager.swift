@@ -626,7 +626,7 @@ final class TunnelManager: ObservableObject {
         var seen = Set<String>()
         for (ip, doms) in domainsByIP {
             for d in doms {
-                let domain = d.lowercased().trimmingCharacters(in: ".")
+                let domain = d.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
                 guard !domain.isEmpty, !seen.contains(domain) else { continue }
                 seen.insert(domain)
                 if aliveIPs.contains(ip) { working.append(domain) }
