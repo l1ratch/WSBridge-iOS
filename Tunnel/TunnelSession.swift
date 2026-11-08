@@ -9,6 +9,13 @@ class TunnelSession {
     let connId: UInt32
     let dcIP: UInt32
     let workerDomain: String?
+    /// Прокси-режим: домен (fake-IP 198.18.1.x, восстановлен LRDNS)
+    /// ходит через SOCKS5/HTTP-прокси.
+    let proxyEndpoint: ProxyEndpoint?
+    /// Прокси-поток после хендшейка (буферизует до готовности).
+    private var proxyStream: ProxyStream?
+    /// Байты, пришедшие до готовности прокси-хендшейка.
+    private var proxyPending = Data()
     /// Override «DC → IP» из настроек: канонический DC-адрес → IP, который
     /// worker'у реально диалить. Пусто = как прилетело от Telegram.
     let dcOverride: [String: String]
@@ -29,13 +36,15 @@ class TunnelSession {
     private var dead = false
     private static var wfailLogged = 0
 
-    init(connId: UInt32, dcIP: UInt32, workerDomain: String?, dcOverride: [String: String], bridge: LWIPBridge, queue: DispatchQueue) {
+    init(connId: UInt32, dcIP: UInt32, workerDomain: String?, dcOverride: [String: String], bridge: LWIPBridge, queue: DispatchQueue,
+         proxyEndpoint: ProxyEndpoint? = nil) {
         self.connId = connId
         self.dcIP = dcIP
         self.workerDomain = workerDomain
         self.dcOverride = dcOverride
         self.bridge = bridge
         self.queue = queue
+        self.proxyEndpoint = proxyEndpoint
     }
 
     /// Данные от клиента (Telegram) через lwIP. Вызывается на lwipQueue.
@@ -45,6 +54,14 @@ class TunnelSession {
             upHeadLogged = true
             let head = data.prefix(96).map { String(format: "%02x", $0) }.joined()
             postEvent("uphead:c\(connId):\(data.count):\(head)")
+        }
+        // Прокси-режим: домен через SOCKS5/HTTP. Порт назначения неизвестен
+        // (lwIP accept даёт только адрес) — CONNECT на 443: HTTPS-домены
+        // составляют весь реальный трафик списков.
+        if let proxy = proxyEndpoint, let domain = workerDomain {
+            if proxyStream == nil { startProxy(proxy: proxy, domain: domain) }
+            sendToProxy(data)
+            return
         }
         // Pipe-режим: собственный CF worker пользователя. Без init-парсинга и
         // сплиттера — сырой поток в WS, worker домостит его до DC:443.
@@ -128,6 +145,82 @@ class TunnelSession {
             CFNotificationName(cfName),
             nil, nil, true
         )
+    }
+
+    // MARK: - Прокси-режим (SOCKS5 / HTTP CONNECT)
+
+    /// Хендшейк с прокси: CONNECT domain:443. Ответы от прокси мостятся
+    /// в lwIP как обычные данные сессии.
+    private func startProxy(proxy: ProxyEndpoint, domain: String) {
+        postEvent("proxy_try:c\(connId):\(domain)")
+        ProxyClient.connect(endpoint: proxy, domain: domain, port: 443) { [weak self] stream in
+            guard let self else { return }
+            self.queue.async {
+                guard !self.dead else { stream?.close(); return }
+                guard let stream else {
+                    self.postEvent("proxy_fail:c\(self.connId)")
+                    self.bridge.close(connId: self.connId)
+                    return
+                }
+                self.proxyStream = stream
+                self.postEvent("proxy_up:c\(self.connId)")
+                // Слив буфера, накопленного за хендшейк.
+                let buffered = self.proxyPending
+                self.proxyPending = Data()
+                if !buffered.isEmpty {
+                    stream.send(buffered) { [weak self] err in
+                        if err != nil {
+                            self?.queue.async { self?.handleProxyFailure() }
+                        }
+                    }
+                }
+                self.proxyReceiveLoop(stream)
+            }
+        }
+    }
+
+    /// Данные клиента → прокси (с буферизацией до готовности).
+    private func sendToProxy(_ data: Data) {
+        EventLog.upBytes += UInt64(data.count)
+        if let stream = proxyStream {
+            stream.send(data) { [weak self] err in
+                if err != nil {
+                    self?.queue.async { self?.handleProxyFailure() }
+                }
+            }
+        } else {
+            proxyPending.append(data)
+        }
+    }
+
+    /// Приём из прокси → lwIP → клиент.
+    private func proxyReceiveLoop(_ stream: ProxyStream) {
+        stream.receive(min: 1, max: 65536) { [weak self] data, err in
+            guard let self else { return }
+            self.queue.async {
+                guard !self.dead else { return }
+                if let data, !data.isEmpty {
+                    EventLog.wsDown += UInt64(data.count)
+                    _ = self.writeOrQueue(data)
+                    self.proxyReceiveLoop(stream)
+                    return
+                }
+                if err != nil || data == nil {
+                    self.handleProxyFailure()
+                } else {
+                    self.proxyReceiveLoop(stream)
+                }
+            }
+        }
+    }
+
+    /// Прокси умер: закрываем сессию (клиент переподключится).
+    private func handleProxyFailure() {
+        guard !dead else { return }
+        postEvent("proxy_close:c\(connId)")
+        proxyStream?.close()
+        proxyStream = nil
+        bridge.close(connId: connId)
     }
 
     private func forwardToWS(_ data: Data) {
@@ -241,6 +334,8 @@ class TunnelSession {
         ws?.close()
         ws = nil
         wsConnected = false
+        proxyStream?.close()
+        proxyStream = nil
     }
 
     // MARK: - «DC → IP» маппинг (как в десктопном tg-ws-proxy)

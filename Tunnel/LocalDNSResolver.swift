@@ -28,6 +28,12 @@ final class LocalDNSResolver {
     private var upstreamDoTHost: String?
     /// DoH-upstream: URL (nil = не DoH). Запросы POST/GET-типа wireformat.
     private var upstreamDoHURL: URL?
+    /// Прокси-домены: домен → fake-IP 198.18.1.x. Соединения на эти IP
+    /// туннель терминирует и гонит через SOCKS5/HTTP-прокси.
+    private var proxyByDomain: [String: UInt32] = [:]
+    /// Обратный маппинг: fake-IP → домен (для восстановления имени при
+    /// accept соединения).
+    private var domainByFakeIP: [UInt32: String] = [:]
     /// Страховочный UDP-листенер на 198.18.0.2:53: если ядро доставляет
     /// пакеты на TUN-адрес локально (а не через packetFlow), их ловит он.
     /// Оба пути валидны; ядро iOS выбирает один — сработает занятый.
@@ -111,6 +117,19 @@ final class LocalDNSResolver {
             statRewritten += 1
             return
         }
+        // Прокси-домен: fake-IP (приоритет над rewrites).
+        if qtype == 1, let fakeIP = proxyByDomain[name] {
+            var answer = Data()
+            answer.append(contentsOf: [0xC0, 0x0C])
+            answer.append(contentsOf: [0, 1])
+            answer.append(contentsOf: [0, 1])
+            answer.append(contentsOf: [0, 0, 0, 60])
+            answer.append(contentsOf: [0, 4])
+            answer.append(contentsOf: IPv4Addr.bytes(fakeIP))
+            replyToSocket(Self.buildReply(question: question, answer: answer, rcode: 0), to: src)
+            statRewritten += 1
+            return
+        }
         if qtype == 1, let ip = rewrites[name] {
             var answer = Data()
             answer.append(contentsOf: [0xC0, 0x0C])
@@ -189,8 +208,13 @@ final class LocalDNSResolver {
     ///   - upstreams: IP-адреса upstream DNS (UDP:53 или DoT-IP:853).
     ///   - doT: SNI-хост для TLS-upstream (nil = UDP:53).
     ///   - doHURL: URL DoH-upstream (альтернатива DoT; nil = не DoH).
+    ///   - proxyDomains: домены, ходящие через SOCKS5/HTTP-прокси. Каждому
+    ///     назначается fake-IP 198.18.1.x; туннель маршрутизирует
+    ///     198.18.1.0/24 и при accept коннектится к прокси с именем
+    ///     домена (SOCKS5 принимает имена напрямую).
     func configure(hostsText: String?, upstreams: [String],
-                   doT: String? = nil, doHURL: String? = nil) {
+                   doT: String? = nil, doHURL: String? = nil,
+                   proxyDomains: [String] = []) {
         self.upstreams = upstreams
         self.upstreamDoTHost = doT
         self.upstreamDoHURL = doHURL.flatMap { URL(string: $0) }
@@ -213,9 +237,32 @@ final class LocalDNSResolver {
             }
         }
         self.rewrites = table
+        // Прокси-домены → fake-IP. Пул 198.18.1.1...198.18.1.254 (254 шт):
+        // больше доменов, чем адресов — лишние игнорируем (список itdog
+        // Russia-outside ~5k имён, проксируем первый батч; этого хватает
+        // на реальный трафик — соцсети, AI, стриминг).
+        proxyByDomain = [:]
+        domainByFakeIP = [:]
+        var next: UInt32 = 1
+        for raw in proxyDomains {
+            let name = raw.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, next < 255 else { continue }
+            let fakeIP: UInt32 = (198 << 24) | (18 << 16) | (1 << 8) | next
+            proxyByDomain[name] = fakeIP
+            domainByFakeIP[fakeIP] = name
+            next += 1
+        }
     }
 
     var rewriteCount: Int { rewrites.count }
+    var proxyDomainCount: Int { proxyByDomain.count }
+
+    /// Домен по fake-IP (для PacketTunnelProvider при accept: соединение
+    /// на 198.18.1.x → проксируем через SOCKS5/HTTP с этим именем).
+    /// Вызывается на lwipQueue (из handleAccept).
+    func proxyDomain(forFakeIP ip: UInt32) -> String? {
+        domainByFakeIP[ip]
+    }
 
     // MARK: - Перехват из packetFlow
 
@@ -252,6 +299,21 @@ final class LocalDNSResolver {
         // клиент не должен ретраить IPv6 вечно.
         if qtype == 28 {
             reply(packet: packet, question: question, answer: Data(), rcode: 0)
+            statRewritten += 1
+            return true
+        }
+
+        // Прокси-домен: приоритет над rewrites — домен должен идти через
+        // прокси, даже если какой-то список прописал ему адрес.
+        if qtype == 1, qclass == 1, let fakeIP = proxyByDomain[name] {
+            var answer = Data()
+            answer.append(contentsOf: [0xC0, 0x0C])
+            answer.append(contentsOf: [0, 1])
+            answer.append(contentsOf: [0, 1])
+            answer.append(contentsOf: [0, 0, 0, 60])   // TTL 60
+            answer.append(contentsOf: [0, 4])
+            answer.append(contentsOf: IPv4Addr.bytes(fakeIP))
+            reply(packet: packet, question: question, answer: answer, rcode: 0)
             statRewritten += 1
             return true
         }

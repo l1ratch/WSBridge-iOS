@@ -528,6 +528,168 @@ final class TunnelManager: ObservableObject {
     /// Статус загрузки (для UI).
     @Published var localDNSUpdateMessage: String?
 
+    // MARK: - Прокси-домены (списки itdoginfo + свои) и прокси
+
+    /// Список прокси-доменов: пресеты (itdoginfo/allow-domains) + свои.
+    struct ProxyDomainList: Codable, Identifiable, Equatable {
+        var id: String
+        var name: String
+        /// URL файла с доменами (по одному в строке).
+        var url: String
+        var isPreset: Bool
+    }
+
+    /// Пресеты списков прокси-доменов (itdoginfo/allow-domains, raw-формат).
+    static let proxyListPresets: [ProxyDomainList] = [
+        ProxyDomainList(id: "geoblock", name: "Russia outside (заблокированы в РФ)",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/outside-raw.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "youtube", name: "YouTube",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/youtube.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "discord", name: "Discord",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/discord.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "meta", name: "Meta (Instagram, Facebook)",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/meta.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "twitter", name: "Twitter (X)",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/twitter.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "tiktok", name: "TikTok",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/tiktok.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "google-ai", name: "Google AI (Gemini)",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/google_ai.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "hdrezka", name: "HDRezka",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/hdrezka.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "telegram", name: "Telegram (домены)",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/telegram.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "google-play", name: "Google Play",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/google_play.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "cloudflare", name: "Cloudflare",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/cloudflare.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "roblox", name: "Roblox",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/roblox.lst",
+                        isPreset: true),
+    ]
+
+    /// Свои списки прокси-доменов.
+    @Published var customProxyLists: [ProxyDomainList] = {
+        guard let data = UserDefaults.standard.data(forKey: "customProxyLists"),
+              let lists = try? JSONDecoder().decode([ProxyDomainList].self, from: data) else { return [] }
+        return lists
+    }() {
+        didSet {
+            if let data = try? JSONEncoder().encode(customProxyLists) {
+                UserDefaults.standard.set(data, forKey: "customProxyLists")
+            }
+        }
+    }
+
+    var allProxyLists: [ProxyDomainList] { Self.proxyListPresets + customProxyLists }
+
+    /// Включённые списки прокси-доменов (ID). Пусто = проксирование
+    /// доменов выключено (прокси, однако, может остаться для теста).
+    @Published var enabledProxyListIds: [String] = UserDefaults.standard.stringArray(forKey: "enabledProxyListIds") ?? [] {
+        didSet { UserDefaults.standard.set(enabledProxyListIds, forKey: "enabledProxyListIds") }
+    }
+
+    /// Прокси: строки socks5://[user:pass@]host:port или http://...
+    @Published var proxyURLs: [String] = UserDefaults.standard.stringArray(forKey: "proxyURLs") ?? [] {
+        didSet { UserDefaults.standard.set(proxyURLs, forKey: "proxyURLs") }
+    }
+
+    /// Выбранный прокси (индекс в proxyURLs) или автовыбор (-1).
+    @Published var selectedProxyIndex: Int = UserDefaults.standard.object(forKey: "selectedProxyIndex") as? Int ?? -1 {
+        didSet { UserDefaults.standard.set(selectedProxyIndex, forKey: "selectedProxyIndex") }
+    }
+
+    /// Активный прокси: выбранный руками или лучший из живых (nil = нет).
+    var activeProxyURL: String? {
+        guard !proxyURLs.isEmpty else { return nil }
+        if selectedProxyIndex >= 0, selectedProxyIndex < proxyURLs.count {
+            return proxyURLs[selectedProxyIndex]
+        }
+        return proxyURLs.first
+    }
+
+    /// Загружает домены ВКЛЮЧЁННЫХ списков (параллельно). Возвращает
+    /// массив доменов (объединённый, дедуплицированный, ≤250: столько
+    /// fake-IP в пуле).
+    func loadProxyDomains() async -> [String] {
+        var domains: [String] = []
+        var seen = Set<String>()
+        await withTaskGroup(of: [String]?.self) { group in
+            for list in allProxyLists where enabledProxyListIds.contains(list.id) {
+                group.addTask {
+                    guard let url = URL(string: list.url) else { return nil }
+                    var request = URLRequest(url: url)
+                    request.timeoutInterval = 15
+                    request.cachePolicy = .reloadIgnoringLocalCacheData
+                    do {
+                        let (data, response) = try await URLSession.shared.data(for: request)
+                        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+                        let text = String(data: data, encoding: .utf8) ?? ""
+                        return text.split(separator: "\n")
+                            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                            .filter { !$0.isEmpty && !$0.hasPrefix("#") && $0.count <= 253 }
+                    } catch { return nil }
+                }
+            }
+            for await batch in group {
+                guard let batch else { continue }
+                for d in batch where !seen.contains(d) {
+                    seen.insert(d)
+                    domains.append(d)
+                }
+            }
+        }
+        return Array(domains.prefix(250))
+    }
+
+    // MARK: - Тест прокси
+
+    /// Результаты теста прокси: URL → (жив, мс).
+    @Published private(set) var proxyProbe: [String: Int?] = [:]
+    @Published private(set) var proxyProbeRunning = false
+
+    /// Пробит все прокси: полный SOCKS5/HTTP-хендшейк к example.com,
+    /// замер задержки.
+    func probeProxies() async {
+        guard !proxyProbeRunning else { return }
+        proxyProbeRunning = true
+        proxyProbe = [:]
+        defer { proxyProbeRunning = false }
+        await withTaskGroup(of: (String, Int?).self) { group in
+            for raw in proxyURLs {
+                guard let endpoint = ProxyEndpoint.parse(raw) else {
+                    proxyProbe[raw] = nil
+                    continue
+                }
+                group.addTask {
+                    let ms = await ProxyTester.probe(endpoint)
+                    return (raw, ms)
+                }
+            }
+            for await (url, ms) in group {
+                proxyProbe[url] = ms
+            }
+        }
+    }
+
+    /// Лучший живой прокси по последней пробе (для автовыбора).
+    var bestProxyURL: String? {
+        proxyProbe.filter { $0.value != nil }
+            .sorted { ($0.value ?? 0) < ($1.value ?? 0) }
+            .first?.key
+    }
+
     // MARK: - Пробы живости (выборщик DNS + тест списка LRDNS)
 
     /// Результаты пробы DNS-серверов выборщика: id конфига → результат.
@@ -1434,6 +1596,22 @@ final class TunnelManager: ObservableObject {
                 case .udp:
                     break // plain :53
                 }
+            }
+            // Прокси-домены: список доменов (fake-IP в резолвере) + один
+            // активный прокси. При автовыборе — лучший из пробитых.
+            let domainList = await loadProxyDomains()
+            let activeProxy: String?
+            if selectedProxyIndex >= 0, selectedProxyIndex < proxyURLs.count {
+                activeProxy = proxyURLs[selectedProxyIndex]
+            } else if let best = bestProxyURL {
+                activeProxy = best
+            } else {
+                activeProxy = proxyURLs.first
+            }
+            if !domainList.isEmpty, let activeProxy,
+               ProxyEndpoint.parse(activeProxy) != nil {
+                config["proxyDomains"] = domainList as NSArray
+                config["proxies"] = [activeProxy] as NSArray
             }
         }
         if !activeDNSServers.isEmpty {

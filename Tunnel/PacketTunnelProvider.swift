@@ -29,6 +29,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var workerRRIndex = 0
     /// «DC → IP» маппинг из настроек.
     private var dcOverride: [String: String] = [:]
+    /// Прокси для прокси-доменов (fake-IP 198.18.1.x): nil = нет прокси.
+    private var proxyEndpoint: ProxyEndpoint?
     /// ID нуджа «долго включен». Владелец — расширение (см. scheduleLongSessionNudge).
     private static let longSessionID = "wsbridge.longSession"
     // Смена сети: расширение — единственный живой процесс, пока туннель
@@ -58,6 +60,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // packetFlow, перехватываются readLoop'ом и обрабатываются
         // LocalDNSResolver'ом (rewrites → upstream → системный).
         let localDNSEnabled = (proto?.providerConfiguration?["localDNS"] as? Bool) == true
+        // Прокси-домены: LRDNS отвечает им fake-IP 198.18.1.x; маршрут
+        // 198.18.1.0/24 забирает их пакеты в туннель, соединения
+        // терминируются lwIP и уходят через SOCKS5/HTTP-прокси.
+        let proxyDomains = (proto?.providerConfiguration?["proxyDomains"] as? [String]) ?? []
+        let proxyURLs = (proto?.providerConfiguration?["proxies"] as? [String]) ?? []
+        if !proxyDomains.isEmpty, !proxyURLs.isEmpty {
+            ipv4.includedRoutes = TelegramDCs.includedRoutes + [
+                NEIPv4Route(destinationAddress: "198.18.1.0", subnetMask: "255.255.255.0"),
+            ]
+        }
         if localDNSEnabled {
             let local = NEDNSSettings(servers: ["198.18.0.2"])
             settings.dnsSettings = local
@@ -135,13 +147,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let upstreams = (proto?.providerConfiguration?["localDNSUpstream"] as? [String]) ?? []
                 let doT = proto?.providerConfiguration?["localDNSUpstreamDoT"] as? String
                 let doH = proto?.providerConfiguration?["localDNSUpstreamDoH"] as? String
+                // Прокси-домены и список прокси (автовыбор уже сделан
+                // приложением; сюда доезжает ОДИН рабочий endpoint).
+                let proxyDomains = (proto?.providerConfiguration?["proxyDomains"] as? [String]) ?? []
+                let proxyURLs = (proto?.providerConfiguration?["proxies"] as? [String]) ?? []
+                let proxyEndpoint = proxyURLs.compactMap { ProxyEndpoint.parse($0) }.first
                 resolver.configure(hostsText: hosts, upstreams: upstreams,
-                                   doT: doT, doHURL: doH)
+                                   doT: doT, doHURL: doH,
+                                   proxyDomains: proxyDomains)
                 // Страховочный листенер: если ядро доставляет DNS на
                 // TUN-адрес локально (не через packetFlow), ловит сокет.
                 resolver.startListener()
                 let transport = doT != nil ? "dot" : (doH != nil ? "doh" : "udp")
                 EventLog.append("cfg:localdns=on rules=\(resolver.rewriteCount) upstream=\(upstreams.first ?? "system"):\(transport)")
+                if let pe = proxyEndpoint {
+                    self?.proxyEndpoint = pe
+                    EventLog.append("cfg:proxy=\(pe.display) domains=\(resolver.proxyDomainCount)")
+                }
             } else {
                 resolver.configure(hostsText: nil, upstreams: [])
             }
@@ -213,6 +235,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func handleAccept(connId: UInt32, dcIP: UInt32) {
         NSLog("[WSBridge] accept conn \(connId) dc=\(dcIP)")
         postDarwinEvent("accept")
+        // Прокси-домен: dst в 198.18.1.0/24 → домен из fake-IP-мапы
+        // LRDNS, соединение через SOCKS5/HTTP-прокси ( порт исходного
+        // запроса восстановить нельзя — lwIP accept знает только адрес;
+        // для HTTPS-домена практически всегда 443).
+        if let proxy = proxyEndpoint,
+           (dcIP >> 24) == 198 && ((dcIP >> 16) & 0xFF) == 18 && ((dcIP >> 8) & 0xFF) == 1,
+           let domain = localDNS?.proxyDomain(forFakeIP: dcIP) {
+            EventLog.append("proxy:conn\(connId):\(domain)")
+            let session = TunnelSession(
+                connId: connId, dcIP: dcIP, workerDomain: domain,
+                dcOverride: [:], bridge: lwip, queue: lwipQueue,
+                proxyEndpoint: proxy)
+            sessions[connId] = session
+            return
+        }
         // Несколько worker'ов: распределяем соединения round-robin, чтобы
         // CF не троттлил один домен и было живое разнесение нагрузки.
         let domain: String?

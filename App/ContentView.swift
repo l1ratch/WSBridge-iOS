@@ -1032,6 +1032,14 @@ struct LocalDNSView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section {
+                NavigationLink {
+                    ProxyDomainsView(tunnel: tunnel)
+                } label: {
+                    Label("Прокси-домены", systemImage: "arrow.triangle.swap")
+                }
+            }
+
             Section("Список перезаписей") {
                 ForEach(tunnel.allHostsLists) { list in
                     Button {
