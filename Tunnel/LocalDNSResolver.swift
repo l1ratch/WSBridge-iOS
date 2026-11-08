@@ -1,8 +1,5 @@
 import Foundation
 import Darwin
-import Darwin.resolv
-/// res_query (системный DNS-путь) — из Darwin resolv.h; socket-API —
-/// из системных заголовков, доступных через Foundation/Darwin.
 
 /// Локальный DNS-резолвер туннеля: перехватывает UDP:53 запросы из
 /// packetFlow, применяет hosts-rewrite правила, непокрытые имена
@@ -390,20 +387,59 @@ final class LocalDNSResolver {
         return Data(buf[0..<received])
     }
 
-    /// Системный DNS через res_query: система шлёт запрос своим
-    /// резолвером (вне маршрутов туннеля). Возвращает полный DNS-ответ.
+    /// Системный DNS через getaddrinfo: система шлёт запрос своим
+    /// резолвером (вне маршрутов туннеля), мы получаем готовые адреса
+    /// и сами собираем DNS-ответ. Только A-запросы (getaddrinfo IPv4);
+    /// прочие типы — пустой NOERROR.
     private static func systemQuery(_ question: Data) -> Data? {
         guard let name = parseQName(question) else { return nil }
-        let qtype = (Int(question[question.count - 4]) << 8)
-                  | Int(question[question.count - 3])
-        var answer = [CChar](repeating: 0, count: 4096)
-        // res_query(имя, class IN, type, буфер, размер) — Darwin C API
-        // (bind9 resolv): ns_class_int = 1, ns_type как Int32.
-        let n = name.withCString { cName -> Int32 in
-            res_query(cName, 1, Int32(qtype), &answer, Int32(answer.count))
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        var res: UnsafeMutablePointer<addrinfo>?
+        let rc = name.withCString { cName in
+            getaddrinfo(cName, nil, &hints, &res)
         }
-        guard n > 12 else { return nil }
-        return Data(answer.prefix(Int(n)).map { UInt8(bitPattern: $0) })
+        guard rc == 0, res != nil else { return nil }
+        defer { freeaddrinfo(res) }
+        // Собираем A-записи из всех адресов (IPv4).
+        var ips: [[UInt8]] = []
+        var cur = res
+        while let ai = cur {
+            if ai.pointee.ai_family == AF_INET,
+               let sa = ai.pointee.ai_addr {
+                sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                    let addr = sin.pointee.sin_addr.s_addr
+                    // s_addr в памяти little-endian на байтовом порядке:
+                    // байты уже в сетевом порядке — берём как лежат.
+                    withUnsafeBytes(of: addr) { raw in
+                        var ip = [UInt8](repeating: 0, count: 4)
+                        for i in 0..<4 where i < raw.count { ip[i] = raw[i] }
+                        ips.append(ip)
+                    }
+                }
+            }
+            cur = ai.pointee.ai_next
+        }
+        guard !ips.isEmpty else { return nil }
+        // Ответ: заголовок + вопрос + N A-записей.
+        var dns = Data(question.prefix(12))
+        dns[2] = (question[2] & 0x01) | 0x80   // QR=1, rcode 0
+        dns[3] = 0
+        let ancount = UInt16(min(ips.count, 255))
+        dns[6] = UInt8((ancount >> 8) & 0xFF)
+        dns[7] = UInt8(ancount & 0xFF)
+        dns[8] = 0; dns[9] = 0
+        dns[10] = 0; dns[11] = 0
+        dns.append(question.suffix(from: 12))
+        for ip in ips.prefix(255) {
+            dns.append(contentsOf: [0xC0, 0x0C])   // name: ptr на вопрос
+            dns.append(contentsOf: [0, 1])          // type A
+            dns.append(contentsOf: [0, 1])          // class IN
+            dns.append(contentsOf: [0, 0, 0, 60])   // TTL 60
+            dns.append(contentsOf: [0, 4])          // rdlength
+            dns.append(contentsOf: ip)
+        }
+        return dns
     }
 
     // MARK: - Парсинг DNS
