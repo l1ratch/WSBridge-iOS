@@ -124,18 +124,27 @@ final class LocalDNSResolver {
     // MARK: - Перехват из packetFlow
 
     /// Проверяет, является ли пакет DNS-запросом к нашему локальному
-    /// серверу (UDP, dst = TUN-адрес 198.18.0.2, порт 53). Возвращает
-    /// true, если пакет потреблён резолвером. Вызывается на lwipQueue.
+    /// серверу (UDP, dst = 198.18.0.3, порт 53). Возвращает true, если
+    /// пакет потреблён резолвером. Вызывается на lwipQueue.
+    /// НЕ-наши DNS-пакеты (dst другой) логируются для диагностики —
+    /// система может слать DNS не туда, куда мы объявили.
     func tryHandle(_ packet: Data) -> Bool {
         // Минимум: IP(20) + UDP(8) + DNS-заголовок(12)
         guard packet.count >= 40 else { return false }
         guard packet[9] == 17 else { return false }   // proto = UDP
         let ihl = Int(packet[0] & 0x0F) * 4
         guard ihl >= 20, ihl == 20, packet.count > ihl + 8 else { return false }
+        let dstPort = (Int(packet[ihl + 2]) << 8) | Int(packet[ihl + 3])
+        // Диагностика: любой UDP:53, прилетевший в packetFlow, — в журнал
+        // (dst и src). Системные DNS-запросы должны прилетать на 0.3.
+        if dstPort == 53 {
+            let dst = "\(packet[16]).\(packet[17]).\(packet[18]).\(packet[19])"
+            let src = "\(packet[12]).\(packet[13]).\(packet[14]).\(packet[15])"
+            EventLog.append("dnspkt:dst=\(dst):src=\(src):\(packet.count)B")
+        }
         // dst IP = 198.18.0.3 (DNS-адрес туннеля, см. доккоммент класса)
         guard packet[16] == 198, packet[17] == 18,
               packet[18] == 0, packet[19] == 3 else { return false }
-        let dstPort = (Int(packet[ihl + 2]) << 8) | Int(packet[ihl + 3])
         guard dstPort == 53 else { return false }
 
         let dnsStart = ihl + 8
