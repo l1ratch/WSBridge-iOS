@@ -3,13 +3,16 @@ import Darwin
 import Network
 
 /// Локальный DNS-резолвер туннеля: перехватывает UDP:53 запросы из
-/// packetFlow, применяет hosts-rewrite правила, непокрытые имена
-/// гонит на upstream (выбранный DNS из настроек или системный).
+/// packetFlow, применяет hosts-rewrite правила и прокси-домены,
+/// непокрытые имена гонит на upstream (выбранный DNS или системный).
 ///
-/// Схема: dnsSettings туннеля указывает на адрес TUN-интерфейса
-/// (198.18.0.2) — система направляет DNS-запросы в туннель, они
-/// прилетают в readLoop как UDP-пакеты. Здесь парсим вопрос, матЧИМ
-/// по таблице rewrites, отвечаем сами или форвардим на upstream.
+/// Схема: dnsSettings туннеля указывает на 198.18.0.3 — адрес ИЗ
+/// маршрутизируемого пула туннеля, но НЕ присвоенный интерфейсу
+/// (интерфейсу принадлежит 198.18.0.2). Пакеты на собственный адрес
+/// интерфейса ядро доставляет локально (bind из extension даёт EPERM
+/// — проверено на устройстве, journal: localdns:listen:bind=-1), а
+/// на соседний адрес 198.18.0.3 с маршрутом /32 через TUN — честно
+/// кладёт в packetFlow. Оттуда их ловит readLoop → tryHandle.
 ///
 /// Дисциплина потоков: tryHandle вызывается на lwipQueue; upstream-
 /// сокеты работают на global-очереди, ответы доставляются через
@@ -34,155 +37,9 @@ final class LocalDNSResolver {
     /// Обратный маппинг: fake-IP → домен (для восстановления имени при
     /// accept соединения).
     private var domainByFakeIP: [UInt32: String] = [:]
-    /// Страховочный UDP-листенер на 198.18.0.2:53: если ядро доставляет
-    /// пакеты на TUN-адрес локально (а не через packetFlow), их ловит он.
-    /// Оба пути валидны; ядро iOS выбирает один — сработает занятый.
-    private var listenSock: Int32 = -1
-    /// Очередь листенера.
-    private let listenQueue = DispatchQueue(label: "com.l1ratch.WSBridge.localdns")
 
     init(writePacket: @escaping (Data) -> Void) {
         self.writePacket = writePacket
-    }
-
-    /// Поднимает страховочный UDP-сокет на 198.18.0.2:53. Вызывается из
-    /// startTunnel. Пакеты, пришедшие в сокет, — это чистый DNS (без
-    /// IP/UDP-обвязки): обрабатываем и отвечаем напрямую в сокет.
-    func startListener() {
-        let sock = socket(AF_INET, SOCK_DGRAM, 0)
-        guard sock >= 0 else {
-            EventLog.append("localdns:listen:socket=-1")
-            return
-        }
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(53).bigEndian
-        addr.sin_addr = in_addr(s_addr: 0xC6120002)  // 198.18.0.2 big-endian
-        let bindResult = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                bind(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bindResult == 0 else {
-            EventLog.append("localdns:listen:bind=\(bindResult)")
-            close(sock)
-            return
-        }
-        listenSock = sock
-        EventLog.append("localdns:listen=ok")
-        receiveLoop()
-    }
-
-    /// Останавливает листенер (stopTunnel).
-    func stopListener() {
-        if listenSock >= 0 {
-            close(listenSock)
-            listenSock = -1
-        }
-    }
-
-    /// Приём из страховочного сокета: чистый DNS-запрос (без IP/UDP).
-    private func receiveLoop() {
-        let sock = listenSock
-        guard sock >= 0 else { return }
-        listenQueue.async { [weak self] in
-            guard let self else { return }
-            var buf = [UInt8](repeating: 0, count: 4096)
-            var srcAddr = sockaddr_in()
-            var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let n = withUnsafeMutablePointer(to: &srcAddr) { ptr in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    recvfrom(sock, &buf, buf.count, 0, sa, &addrLen)
-                }
-            }
-            guard n > 12 else { return }
-            let query = Data(buf[0..<n])
-            self.handleSocketQuery(query, from: srcAddr)
-            // Следующий приём только если сокет ещё жив.
-            if self.listenSock == sock {
-                self.receiveLoop()
-            }
-        }
-    }
-
-    /// Обработка запроса из сокета: тот же путь rewrites → upstream,
-    /// ответ уходит напрямую в сокет (не в packetFlow).
-    private func handleSocketQuery(_ question: Data, from src: sockaddr_in) {
-        guard let qname = Self.parseQName(question) else { return }
-        let name = qname.lowercased()
-        let qtype = (Int(question[question.count - 4]) << 8)
-                  | Int(question[question.count - 3])
-        if qtype == 28 {
-            replyToSocket(Self.buildReply(question: question, answer: Data(), rcode: 0), to: src)
-            statRewritten += 1
-            return
-        }
-        // Прокси-домен: fake-IP (приоритет над rewrites).
-        if qtype == 1, let fakeIP = proxyByDomain[name] {
-            var answer = Data()
-            answer.append(contentsOf: [0xC0, 0x0C])
-            answer.append(contentsOf: [0, 1])
-            answer.append(contentsOf: [0, 1])
-            answer.append(contentsOf: [0, 0, 0, 60])
-            answer.append(contentsOf: [0, 4])
-            answer.append(contentsOf: IPv4Addr.bytes(fakeIP))
-            replyToSocket(Self.buildReply(question: question, answer: answer, rcode: 0), to: src)
-            statRewritten += 1
-            return
-        }
-        if qtype == 1, let ip = rewrites[name] {
-            var answer = Data()
-            answer.append(contentsOf: [0xC0, 0x0C])
-            answer.append(contentsOf: [0, 1])
-            answer.append(contentsOf: [0, 1])
-            answer.append(contentsOf: [0, 0, 0, 60])
-            answer.append(contentsOf: [0, 4])
-            answer.append(contentsOf: IPv4Addr.bytes(ip))
-            replyToSocket(Self.buildReply(question: question, answer: answer, rcode: 0), to: src)
-            statRewritten += 1
-            return
-        }
-        // Форвард: ответ придёт по адресу источника.
-        statForwarded += 1
-        if upstreams.isEmpty {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self else { return }
-                if let answer = Self.systemQuery(question) {
-                    self.replyToSocket(answer, to: src)
-                } else {
-                    self.statFailed += 1
-                }
-            }
-        } else {
-            let servers = upstreams
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self else { return }
-                for server in servers {
-                    if let answer = Self.udpQuery(question, server: server) {
-                        self.replyToSocket(answer, to: src)
-                        return
-                    }
-                }
-                self.statFailed += 1
-            }
-        }
-    }
-
-    /// Ответ в сокет по адресу источника.
-    private func replyToSocket(_ dns: Data, to src: sockaddr_in) {
-        guard listenSock >= 0 else { return }
-        var addr = src
-        let sent = dns.withUnsafeBytes { ptr in
-            withUnsafePointer(to: &addr) { aPtr in
-                aPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    sendto(listenSock, ptr.baseAddress, dns.count, 0, sa,
-                           socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-        }
-        if sent != dns.count {
-            statFailed += 1
-        }
     }
 
     /// Сборка DNS-ответа из вопроса (заголовок + вопрос + answer).
@@ -275,9 +132,9 @@ final class LocalDNSResolver {
         guard packet[9] == 17 else { return false }   // proto = UDP
         let ihl = Int(packet[0] & 0x0F) * 4
         guard ihl >= 20, ihl == 20, packet.count > ihl + 8 else { return false }
-        // dst IP = 198.18.0.2 (наш TUN-адрес)
+        // dst IP = 198.18.0.3 (DNS-адрес туннеля, см. доккоммент класса)
         guard packet[16] == 198, packet[17] == 18,
-              packet[18] == 0, packet[19] == 2 else { return false }
+              packet[18] == 0, packet[19] == 3 else { return false }
         let dstPort = (Int(packet[ihl + 2]) << 8) | Int(packet[ihl + 3])
         guard dstPort == 53 else { return false }
 

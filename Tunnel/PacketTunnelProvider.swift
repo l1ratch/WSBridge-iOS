@@ -63,15 +63,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // Прокси-домены: LRDNS отвечает им fake-IP 198.18.1.x; маршрут
         // 198.18.1.0/24 забирает их пакеты в туннель, соединения
         // терминируются lwIP и уходят через SOCKS5/HTTP-прокси.
+        // DNS-адрес 198.18.0.3 — соседний с интерфейсным (0.2): маршрут
+        // /32 уводит DNS-пакеты в packetFlow (см. LocalDNSResolver док).
         let proxyDomains = (proto?.providerConfiguration?["proxyDomains"] as? [String]) ?? []
         let proxyURLs = (proto?.providerConfiguration?["proxies"] as? [String]) ?? []
-        if !proxyDomains.isEmpty, !proxyURLs.isEmpty {
-            ipv4.includedRoutes = TelegramDCs.includedRoutes + [
-                NEIPv4Route(destinationAddress: "198.18.1.0", subnetMask: "255.255.255.0"),
-            ]
-        }
+        var routes = TelegramDCs.includedRoutes
         if localDNSEnabled {
-            let local = NEDNSSettings(servers: ["198.18.0.2"])
+            routes.append(NEIPv4Route(destinationAddress: "198.18.0.3", subnetMask: "255.255.255.255"))
+        }
+        if !proxyDomains.isEmpty, !proxyURLs.isEmpty {
+            routes.append(NEIPv4Route(destinationAddress: "198.18.1.0", subnetMask: "255.255.255.0"))
+        }
+        ipv4.includedRoutes = routes
+        if localDNSEnabled {
+            let local = NEDNSSettings(servers: ["198.18.0.3"])
             settings.dnsSettings = local
             NSLog("[WSBridge] DNS: local resolver (rewrites)")
         } else if let dnsList, !dnsList.isEmpty {
@@ -155,9 +160,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 resolver.configure(hostsText: hosts, upstreams: upstreams,
                                    doT: doT, doHURL: doH,
                                    proxyDomains: proxyDomains)
-                // Страховочный листенер: если ядро доставляет DNS на
-                // TUN-адрес локально (не через packetFlow), ловит сокет.
-                resolver.startListener()
                 let transport = doT != nil ? "dot" : (doH != nil ? "doh" : "udp")
                 EventLog.append("cfg:localdns=on rules=\(resolver.rewriteCount) upstream=\(upstreams.first ?? "system"):\(transport)")
                 if let pe = proxyEndpoint {
@@ -357,7 +359,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // кода приложения, которое к этому моменту может быть уже убито.
         cancelLongSessionNudge()
         journalServer.stop()
-        localDNS?.stopListener()
         pathMonitor?.cancel(); pathMonitor = nil
         pollTimer?.cancel(); pollTimer = nil
         ioTimer?.cancel(); ioTimer = nil
