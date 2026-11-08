@@ -774,6 +774,7 @@ struct DNSView: View {
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
+                            HealthBadge(result: tunnel.dnsProbes[config.id])
                             if tunnel.selectedDNSId == config.id {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundStyle(.green)
@@ -794,10 +795,56 @@ struct DNSView: View {
         }
         .navigationTitle("DNS")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            // При открытии выборщика — прогон живости серверов.
+            await tunnel.probeDNSConfigs()
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Готово") { dismiss() }
             }
+        }
+    }
+}
+
+/// Бейдж живости: капсула с заливкой и мигающей точкой цвета.
+/// Зелёный — жив, оранжевый — высокая задержка, красный — недоступен.
+struct HealthBadge: View {
+    let result: ProbeResult?
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(dotColor)
+                .frame(width: 7, height: 7)
+            if let ms = result?.ms {
+                Text("\(ms) мс")
+                    .font(.caption2.weight(.semibold).monospacedDigit())
+            } else if result != nil {
+                Text("нет")
+                    .font(.caption2.weight(.semibold))
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(badgeColor.opacity(0.18)))
+        .overlay(Capsule().strokeBorder(badgeColor.opacity(0.35)))
+        .opacity(result == nil ? 0.35 : 1)
+    }
+
+    private var badgeColor: Color {
+        switch result {
+        case .none: return Color(.systemGray3)
+        case .dead: return .red
+        case .slow: return .orange
+        case .alive: return Color(hex: 0x17A05E)
+        }
+    }
+
+    private var dotColor: Color {
+        switch result {
+        case .alive, .slow: return badgeColor
+        default: return badgeColor
         }
     }
 }
@@ -1011,13 +1058,45 @@ struct LocalDNSView: View {
                 }
             }
 
-            // Обновление списка + статус — как у фронтов.
+            // Обновление списка + тест живости + статус.
             Section {
                 Button {
                     Task { await tunnel.updateLocalDNSHosts() }
                 } label: {
                     Label("Загрузить список заново", systemImage: "arrow.triangle.2.circlepath")
                         .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Button {
+                    Task { await tunnel.probeHostsList() }
+                } label: {
+                    HStack {
+                        Label("Протестировать список", systemImage: "stethoscope")
+                        if tunnel.hostsListProbeRunning {
+                            Spacer()
+                            ProgressView()
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .disabled(tunnel.hostsListProbeRunning || tunnel.localDNSHostsText == nil)
+                if let summary = tunnel.hostsListProbeSummary {
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !tunnel.hostsListProbe.isEmpty {
+                    // Топ адресов по живости: детали пробы.
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(tunnel.hostsListProbe.sorted(by: { ($0.value.ms ?? 9999) < ($1.value.ms ?? 9999) })).prefix(12), id: \.key) { ip, r in
+                            HStack {
+                                Text(ip)
+                                    .font(.caption.monospaced())
+                                Spacer()
+                                HealthBadge(result: r)
+                            }
+                        }
+                    }
                 }
                 if tunnel.localDNSUpdateMessage != nil || tunnel.localDNSHostsUpdatedAt != nil {
                     VStack(alignment: .leading, spacing: 2) {

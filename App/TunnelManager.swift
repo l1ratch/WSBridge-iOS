@@ -64,9 +64,139 @@ private final class JournalReader {
     }
 }
 
+/// Быстрая проверка «строка — IPv4» для разбора hosts-списков в app-слое.
+enum IPv4AddrQuick {
+    static func parse(_ str: String) -> Bool {
+        let parts = str.split(separator: ".")
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { UInt32($0) != nil && UInt32($0)! <= 255 }
+    }
+}
+
 // ponytail: глобальная ссылка для C-callback Darwin notifications
 private var tunnelManagerRef: TunnelManager?
 private let darwinEventNames = ["pkts", "accept", "init", "ws_sent", "ws_try", "ws_up", "ws_data", "ws_recv", "ws_close", "ws_fail"]
+
+// MARK: - Пробы живости DNS и адресов списков
+
+/// Результат пробы: доступность + задержка в мс.
+/// - dead: соединение не установлено
+/// - slow: слишком высокая задержка (нестабильно/почти недоступно)
+/// - alive: жив и стабилен
+enum ProbeResult: Equatable {
+    case dead
+    case slow(ms: Int)
+    case alive(ms: Int)
+
+    var ms: Int? {
+        switch self {
+        case .dead: return nil
+        case .slow(let ms), .alive(let ms): return ms
+        }
+    }
+}
+
+/// Движок пробы адресов. TCP-коннект + замер времени (для DNS —
+/// по порту транспорта: 853 DoT / 443 DoH / 53 UDP-обёртка TCP:53
+/// эмулируем коннектом — честный UDP-пинг требует полного DNS-запроса,
+/// поэтому для :53 делаем настоящий DNS-запрос и меряем круг).
+/// Nonisolated: колбэки приходят с очередей NWConnection.
+enum DNSProbe {
+    /// Пороги: > 1000 мс — медленный (оранжевый).
+    static let slowThresholdMS = 1000
+
+    /// TCP-коннект к server:port с замером. Таймаут 4 с.
+    static func tcp(_ server: String, port: UInt16) async -> ProbeResult {
+        let start = DispatchTime.now()
+        let ok = await withCheckedContinuation { cont in
+            let conn = NWConnection(host: NWEndpoint.Host(server),
+                                    port: NWEndpoint.Port(rawValue: port)!,
+                                    using: .tcp)
+            var resumed = false
+            let lock = NSLock()
+            func resumeOnce(_ v: Bool) {
+                lock.lock(); defer { lock.unlock() }
+                guard !resumed else { return }
+                resumed = true
+                conn.cancel()
+                cont.resume(returning: v)
+            }
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready: resumeOnce(true)
+                case .failed, .cancelled: resumeOnce(false)
+                default: break
+                }
+            }
+            conn.start(queue: .global(qos: .userInitiated))
+            DispatchQueue.global().asyncAfter(deadline: .now() + 4) { resumeOnce(false) }
+        }
+        guard ok else { return .dead }
+        let ms = Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
+        return ms > slowThresholdMS ? .slow(ms: ms) : .alive(ms: ms)
+    }
+
+    /// Проба DNS-конфига по его транспорту: DoT — 853, DoH — 443,
+    /// UDP — полный DNS-запрос на :53 (честная задержка резолва).
+    static func dns(_ config: TunnelManager.DNSConfig, mode: TunnelManager.DNSMode) async -> ProbeResult {
+        guard let server = config.servers.first else { return .dead }
+        switch mode {
+        case .dot:
+            return await tcp(server, port: 853)
+        case .doh:
+            return await tcp(server, port: 443)
+        case .udp:
+            return await udpResolve(server)
+        }
+    }
+
+    /// Полный DNS-запрос через UDP: меряем круг запрос-ответ.
+    static func udpResolve(_ server: String) async -> ProbeResult {
+        let start = DispatchTime.now()
+        // Минимальный DNS-запрос A для "example.com" (стандартный байтовый
+        // шаблон, ID произвольный).
+        var query = Data()
+        query.append(contentsOf: [0x12, 0x34])              // ID
+        query.append(contentsOf: [0x01, 0x00])              // RD=1
+        query.append(contentsOf: [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        query.append(contentsOf: [0x07])                     // "example"
+        query.append(Data("example".utf8))
+        query.append(contentsOf: [0x03])                     // "com"
+        query.append(Data("com".utf8))
+        query.append(contentsOf: [0x00])                     // конец имени
+        query.append(contentsOf: [0x00, 0x01, 0x00, 0x01])  // A, IN
+        let ok: Bool = await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let sock = socket(AF_INET, SOCK_DGRAM, 0)
+                guard sock >= 0 else { cont.resume(returning: false); return }
+                defer { close(sock) }
+                var tv = timeval(tv_sec: 4, tv_usec: 0)
+                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+                var addr = sockaddr_in()
+                addr.sin_family = sa_family_t(AF_INET)
+                addr.sin_port = in_port_t(53).bigEndian
+                guard inet_pton(AF_INET, server, &addr.sin_addr) == 1 else {
+                    cont.resume(returning: false); return
+                }
+                let sent = query.withUnsafeBytes { ptr in
+                    withUnsafePointer(to: &addr) { aPtr in
+                        aPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                            sendto(sock, ptr.baseAddress, query.count, 0, saPtr,
+                                   socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                }
+                guard sent == query.count else { cont.resume(returning: false); return }
+                var buf = [UInt8](repeating: 0, count: 512)
+                let received = recvfrom(sock, &buf, buf.count, 0, nil, nil)
+                cont.resume(returning: received > 12)
+            }
+        }
+        guard ok else { return .dead }
+        let ms = Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
+        return ms > slowThresholdMS ? .slow(ms: ms) : .alive(ms: ms)
+    }
+}
 
 private extension Array {
     subscript(safe index: Int) -> Element? {
@@ -296,13 +426,13 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// ID выбранного DNS ("lrdns" по умолчанию при первой установке —
-    /// локальный резолвер с rewrites; "system" — DNS устройства, туннель
-    /// его не трогает). Спец-ID:
+    /// ID выбранного DNS ("system" по умолчанию при первой установке —
+    /// ничего не отваливается без ведома пользователя; LRDNS включается
+    /// выбором «Локальный» руками). Спец-ID:
     ///   "lrdns"  — локальный DNS (LRDNS): обработка в туннеле;
     ///   "system" — не выставляет dnsSettings вовсе.
     /// Реальные резолверы — остальными ID из allDNS.
-    @Published var selectedDNSId: String = UserDefaults.standard.string(forKey: "selectedDNSId") ?? "lrdns" {
+    @Published var selectedDNSId: String = UserDefaults.standard.string(forKey: "selectedDNSId") ?? "system" {
         didSet { UserDefaults.standard.set(selectedDNSId, forKey: "selectedDNSId") }
     }
 
@@ -397,6 +527,123 @@ final class TunnelManager: ObservableObject {
 
     /// Статус загрузки (для UI).
     @Published var localDNSUpdateMessage: String?
+
+    // MARK: - Пробы живости (выборщик DNS + тест списка LRDNS)
+
+    /// Результаты пробы DNS-серверов выборщика: id конфига → результат.
+    /// Прогоняется при открытии DNSView.
+    @Published private(set) var dnsProbes: [String: ProbeResult] = [:]
+
+    /// Идет ли прогон проб выборщика.
+    @Published private(set) var dnsProbesRunning = false
+
+    /// Прогоняет пробы всех конфигов с серверами (выборщик DNS).
+    /// Параллельно, результаты капают по мере готовности.
+    func probeDNSConfigs() async {
+        guard !dnsProbesRunning else { return }
+        dnsProbesRunning = true
+        dnsProbes = [:]
+        defer { dnsProbesRunning = false }
+        await withTaskGroup(of: (String, ProbeResult).self) { group in
+            for config in allDNS where !config.servers.isEmpty {
+                group.addTask {
+                    let r = await DNSProbe.dns(config, mode: .udp)
+                    return (config.id, r)
+                }
+            }
+            for await (id, result) in group {
+                dnsProbes[id] = result
+            }
+        }
+    }
+
+    // MARK: - Тест выбранного списка LRDNS
+
+    /// Результаты теста списка: уникальные IP → живость+мс.
+    @Published private(set) var hostsListProbe: [String: ProbeResult] = [:]
+
+    /// Домены-примеры для «что доступно» в отчёте теста списка.
+    @Published private(set) var hostsListProbeSummary: String?
+
+    /// Идет ли тест списка.
+    @Published private(set) var hostsListProbeRunning = false
+
+    /// Тестирует выбранный список: TCP:443-проба всех уникальных IP
+    /// (параллельно) + выборка популярных доменов из списка с их
+    /// живостью. Результат — в hostsListProbe и текстовая сводка.
+    func probeHostsList() async {
+        guard !hostsListProbeRunning,
+              let list = selectedHostsList,
+              let text = localDNSHostsText else {
+            hostsListProbeSummary = "Список не загружен"
+            return
+        }
+        hostsListProbeRunning = true
+        hostsListProbe = [:]
+        hostsListProbeSummary = nil
+        defer { hostsListProbeRunning = false }
+        // Уникальные IP из списка (без 0.0.0.0/127.*).
+        var ips: [String] = []
+        var domainsByIP: [String: [String]] = [:]
+        for rawLine in text.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            guard parts.count >= 2,
+                  let ip = IPv4AddrQuick.parse(String(parts[0])),
+                  parts[0] != "0.0.0.0", !parts[0].hasPrefix("127.") else { continue }
+            if !ips.contains(parts[0]) { ips.append(String(parts[0])) }
+            domainsByIP[String(parts[0]), default: []].append(String(parts[1]))
+        }
+        // Пробим параллельно (батчами по 8, чтобы не задушить сеть).
+        var results: [String: ProbeResult] = [:]
+        for batch in stride(from: 0, to: ips.count, by: 8).map({ Array(ips[$0..<min($0+8, ips.count)]) }) {
+            await withTaskGroup(of: (String, ProbeResult).self) { group in
+                for ip in batch {
+                    group.addTask {
+                        let r = await DNSProbe.tcp(ip, port: 443)
+                        return (ip, r)
+                    }
+                }
+                for await (ip, result) in group {
+                    results[ip] = result
+                    hostsListProbe[ip] = result
+                }
+            }
+        }
+        // Сводка: живые/мёртвые IP + примеры доменов.
+        let alive = results.filter { if case .alive = $0.value { true } else { false } }.count
+        let slow = results.filter { if case .slow = $0.value { true } else { false } }.count
+        let dead = results.count - alive - slow
+        // Топ-домены на живых IP.
+        var examples: [String] = []
+        for (ip, r) in results.sorted(by: { ($0.value.ms ?? 9999) < ($1.value.ms ?? 9999) }) {
+            if case .alive = r, let doms = domainsByIP[ip] {
+                let sample = doms.prefix(2).joined(separator: ", ")
+                if !sample.isEmpty { examples.append(sample) }
+            }
+            if examples.count >= 4 { break }
+        }
+        var deadExamples: [String] = []
+        for (ip, r) in results where {
+            if case .dead = r { true } else { false }
+        }() {
+            if let doms = domainsByIP[ip] {
+                let sample = doms.prefix(2).joined(separator: ", ")
+                if !sample.isEmpty { deadExamples.append(sample) }
+            }
+            if deadExamples.count >= 3 { break }
+        }
+        var lines: [String] = []
+        lines.append("Адресов: \(results.count) · живых: \(alive) · медленных: \(slow) · мёртвых: \(dead)")
+        if !examples.isEmpty {
+            lines.append("Доступны (примеры): " + examples.joined(separator: "; "))
+        }
+        if !deadExamples.isEmpty {
+            lines.append("Недоступны (примеры): " + deadExamples.joined(separator: "; "))
+        }
+        hostsListProbeSummary = lines.joined(separator: "\n")
+    }
 
     /// Загружает контент выбранного списка rewrites. Валидация: в файле
     /// должно быть ≥3 строк «IP имя» (см. updateFronts для аналога).
