@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 /// res_query (системный DNS-путь) — из Darwin resolv.h; socket-API —
 /// из системных заголовков, доступных через Foundation/Darwin.
 
@@ -194,7 +195,7 @@ final class LocalDNSResolver {
                 // Только IPv4: наш стек v4-only.
                 guard let ip = IPv4Addr.parse(String(parts[0])) else { continue }
                 for namePart in parts.dropFirst() {
-                    let name = namePart.lowercased().trimmingCharacters(in: ".")
+                    let name = namePart.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
                     guard !name.isEmpty, name.count <= 253 else { continue }
                     table[name] = ip
                 }
