@@ -17,6 +17,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let startedAt = Date()
     private let lwipQueue = DispatchQueue(label: "com.l1ratch.WSBridge.lwip")
     private let journalServer = JournalServer()
+    /// Локальный DNS-резолвер: rewrites + upstream. Пишет ответы напрямую
+    /// в packetFlow (обходя lwIP — UDP в стеке выключен). Создаётся в
+    /// startTunnel: колбэк writePacket требует self.
+    private var localDNS: LocalDNSResolver?
     private var pollTimer: DispatchSourceTimer?
     private var ioTimer: DispatchSourceTimer?
     private var workerDomain: String?
@@ -49,7 +53,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let dnsList = proto?.providerConfiguration?["dns"] as? [String]
         let dohURL = proto?.providerConfiguration?["doh"] as? String
         let dotHost = proto?.providerConfiguration?["dot"] as? String
-        if let dnsList, !dnsList.isEmpty {
+        // Локальный DNS: резолвер в туннеле с hosts-rewrite списком.
+        // dnsSettings указывает на наш TUN-адрес — запросы прилетают в
+        // packetFlow, перехватываются readLoop'ом и обрабатываются
+        // LocalDNSResolver'ом (rewrites → upstream → системный).
+        let localDNSEnabled = (proto?.providerConfiguration?["localDNS"] as? Bool) == true
+        if localDNSEnabled {
+            let local = NEDNSSettings(servers: ["198.18.0.2"])
+            settings.dnsSettings = local
+            NSLog("[WSBridge] DNS: local resolver (rewrites)")
+        } else if let dnsList, !dnsList.isEmpty {
             if let dotHost, !dotHost.isEmpty {
                 // Приоритет 1: DNS-over-TLS. Коннект напрямую к IP:853 с SNI —
                 // резолв имени сервера НЕ нужен. Под VPN бутстрап-резолв
@@ -108,6 +121,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             EventLog.append("fronts_health:\(FrontHealthRegistry.summary())")
             let ver = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
             EventLog.append("tunnel_start v\(ver)")
+            // Локальный DNS: таблица rewrites + upstream. Резолвер создан
+            // ДО конфигурации: writePacket требует self.
+            let resolver = LocalDNSResolver { [weak self] data in
+                self?.writePacket(data)
+            }
+            self?.localDNS = resolver
+            if (proto?.providerConfiguration?["localDNS"] as? Bool) == true {
+                let hosts = proto?.providerConfiguration?["localDNSHosts"] as? String
+                // Upstream: IP выбранного DNS (пусто = системный). DoT/DoH
+                // сюда не передаются — upstream локального резолвера всегда
+                // plain UDP:53 (шифрование остаётся за системным выбором).
+                let upstreams = (proto?.providerConfiguration?["localDNSUpstream"] as? [String]) ?? []
+                resolver.configure(hostsText: hosts, upstreams: upstreams)
+                // Страховочный листенер: если ядро доставляет DNS на
+                // TUN-адрес локально (не через packetFlow), ловит сокет.
+                resolver.startListener()
+                EventLog.append("cfg:localdns=on rules=\(resolver.rewriteCount) upstream=\(upstreams.first ?? "system")")
+            } else {
+                resolver.configure(hostsText: nil, upstreams: [])
+            }
             self?.journalServer.start()
             self?.setupLWIP()
             self?.startTimers()
@@ -159,6 +192,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         io.setEventHandler { [weak self] in
             guard let self else { return }
             EventLog.append("io:in=\(self.packetCount) out=\(EventLog.outPkts) v6=\(EventLog.inV6) oth=\(EventLog.inOther) wd=\(EventLog.wsDown) wf=\(EventLog.writeFails) up=\(EventLog.upBytes) rx=\(EventLog.rxBytes) pend=\(EventLog.pendCur) sent=\(EventLog.sentCb) inmem=\(lwip_bridge_inmem_drops()) mem=\(String(format: "%.1f", self.memFootprintMB()))MB conns=\(self.sessions.count)")
+            if let ldns = self.localDNS, ldns.rewriteCount > 0 || ldns.statForwarded > 0 {
+                EventLog.append("ldns:rw=\(ldns.statRewritten) fwd=\(ldns.statForwarded) fail=\(ldns.statFailed) rules=\(ldns.rewriteCount)")
+            }
             for (id, _) in self.sessions.sorted(by: { $0.key < $1.key }).prefix(2) {
                 var st: UInt32 = 0, un: UInt32 = 0
                 lwip_bridge_conn_stats(id, &st, &un)
@@ -212,7 +248,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         EventLog.inV6 += 1
                         continue
                     }
-                    // Только TCP в lwIP; UDP (DNS, QUIC) роняем.
+                    // Локальный DNS-резолвер: запросы к 198.18.0.2:53
+                    // потребляет он (rewrites → upstream → системный),
+                    // в lwIP они не идут (UDP в стеке выключен).
+                    if let resolver = self.localDNS, resolver.tryHandle(packet) {
+                        continue
+                    }
+                    // Только TCP в lwIP; остальной UDP (QUIC и пр.) роняем.
                     guard packet.count > 9, packet[9] == 6 else {
                         EventLog.inOther += 1
                         continue
@@ -274,6 +316,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // кода приложения, которое к этому моменту может быть уже убито.
         cancelLongSessionNudge()
         journalServer.stop()
+        localDNS?.stopListener()
         pathMonitor?.cancel(); pathMonitor = nil
         pollTimer?.cancel(); pollTimer = nil
         ioTimer?.cancel(); ioTimer = nil

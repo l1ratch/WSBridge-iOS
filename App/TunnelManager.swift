@@ -293,6 +293,118 @@ final class TunnelManager: ObservableObject {
     /// IP-адреса для туннеля (пусто = системный).
     var activeDNSServers: [String] { selectedDNS.servers }
 
+    // MARK: - Локальный DNS (rewrites + upstream)
+
+    /// Список rewrites для локального резолвера: встроенные пресеты +
+    /// свои (URL). Встроенные — статичные URL, обновляются вручную.
+    struct HostsList: Codable, Identifiable, Equatable {
+        var id: String
+        var name: String
+        /// URL hosts-файла. nil у встроенных? Нет: встроенные тоже URL —
+        /// их контент скачивается и кешируется при включении.
+        var url: String
+        var isPreset: Bool
+    }
+
+    /// Встроенные списки rewrites (обсуждаемо расширяемые).
+    static let hostsListPresets: [HostsList] = [
+        HostsList(id: "malw", name: "dns.malw.link",
+                  url: "https://raw.githubusercontent.com/ImMALWARE/dns.malw.link/master/hosts",
+                  isPreset: true),
+        HostsList(id: "geohide", name: "GeoHide",
+                  url: "https://raw.githubusercontent.com/Internet-Helper/GeoHideDNS/refs/heads/main/hosts/hosts",
+                  isPreset: true),
+    ]
+
+    /// Свои списки rewrites (URL на hosts-файл).
+    @Published var customHostsLists: [HostsList] = {
+        guard let data = UserDefaults.standard.data(forKey: "customHostsLists"),
+              let lists = try? JSONDecoder().decode([HostsList].self, from: data) else { return [] }
+        return lists
+    }() {
+        didSet {
+            if let data = try? JSONEncoder().encode(customHostsLists) {
+                UserDefaults.standard.set(data, forKey: "customHostsLists")
+            }
+        }
+    }
+
+    var allHostsLists: [HostsList] { Self.hostsListPresets + customHostsLists }
+
+    /// Выбранный список rewrites. nil = локальный DNS без списка
+    /// (только upstream-проксирование).
+    @Published var selectedHostsListId: String? = UserDefaults.standard.string(forKey: "selectedHostsListId") {
+        didSet { UserDefaults.standard.set(selectedHostsListId, forKey: "selectedHostsListId") }
+    }
+
+    /// Upstream для локального DNS: ID DNS-конфига из общего списка или
+    /// "system". "system" = резолвер спрашивает системный DNS.
+    @Published var localDNSUpstreamId: String = UserDefaults.standard.string(forKey: "localDNSUpstreamId") ?? "system" {
+        didSet { UserDefaults.standard.set(localDNSUpstreamId, forKey: "localDNSUpstreamId") }
+    }
+
+    /// Локальный DNS включён.
+    @Published var localDNSEnabled: Bool = UserDefaults.standard.bool(forKey: "localDNSEnabled") {
+        didSet { UserDefaults.standard.set(localDNSEnabled, forKey: "localDNSEnabled") }
+    }
+
+    /// Кеш контента выбранного списка (текст hosts-файла).
+    @Published private(set) var localDNSHostsText: String? = UserDefaults.standard.string(forKey: "localDNSHostsText") {
+        didSet { UserDefaults.standard.set(localDNSHostsText, forKey: "localDNSHostsText") }
+    }
+
+    /// Дата последней загрузки списка.
+    @Published private(set) var localDNSHostsUpdatedAt: Date? {
+        didSet { UserDefaults.standard.set(localDNSHostsUpdatedAt, forKey: "localDNSHostsUpdatedAt") }
+    }
+
+    /// Статус загрузки (для UI).
+    @Published var localDNSUpdateMessage: String?
+
+    /// Загружает контент выбранного списка rewrites. Валидация: в файле
+    /// должно быть ≥3 строк «IP имя» (см. updateFronts для аналога).
+    @discardableResult
+    func updateLocalDNSHosts() async -> Bool {
+        guard localDNSEnabled else { return false }
+        guard let list = selectedHostsList else {
+            localDNSUpdateMessage = "Список не выбран"
+            return false
+        }
+        localDNSUpdateMessage = "Загрузка…"
+        var request = URLRequest(url: URL(string: list.url)!)
+        request.timeoutInterval = 15
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                localDNSUpdateMessage = "Источник ответил \( (response as? HTTPURLResponse)?.statusCode ?? -1)"
+                return false
+            }
+            let text = String(data: data, encoding: .utf8) ?? ""
+            // Валидация: считаем строки-правила (не комментарии).
+            let ruleLines = text.split(separator: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && !$0.hasPrefix("#") && $0.split(whereSeparator: { $0 == " " || $0 == "\t" }).count >= 2 }
+            guard ruleLines.count >= 3 else {
+                localDNSUpdateMessage = "Битый файл (\(ruleLines.count) правил)"
+                return false
+            }
+            localDNSHostsText = text
+            localDNSHostsUpdatedAt = Date()
+            localDNSUpdateMessage = "Загружено: \(ruleLines.count) правил"
+            return true
+        } catch {
+            localDNSUpdateMessage = "Ошибка: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    /// Выбранный список rewrites.
+    var selectedHostsList: HostsList? {
+        guard let id = selectedHostsListId else { return nil }
+        return allHostsLists.first { $0.id == id }
+    }
+
     // MARK: - Фронты (hot-обновление без пересборки)
 
     /// Актуальный список фронтов (базовые домены, без kws{dc}. префикса).
@@ -1020,6 +1132,22 @@ final class TunnelManager: ObservableObject {
             .filter { !$0.isEmpty }
         if !dcLines.isEmpty { config["dcMap"] = dcLines as NSArray }
         if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
+        // Локальный DNS: резолвер туннеля с hosts-rewrite списком.
+        // Таблица передаётся текстом hosts-файла, upstream — IP серверов
+        // конфига, выбранного НА СТРАНИЦЕ локального DNS (не глобального
+        // selectedDNSId!).
+        if localDNSEnabled {
+            config["localDNS"] = true as NSNumber
+            if let hosts = localDNSHostsText, !hosts.isEmpty {
+                config["localDNSHosts"] = hosts as NSString
+            }
+            let upstreamServers: [String] = localDNSUpstreamId == "system"
+                ? []
+                : (allDNS.first { $0.id == localDNSUpstreamId }?.servers ?? [])
+            if !upstreamServers.isEmpty {
+                config["localDNSUpstream"] = upstreamServers as NSArray
+            }
+        }
         if !activeDNSServers.isEmpty {
             config["dns"] = activeDNSServers as NSArray
             // Транспорт выбирает пользователь (свитчер). Передаём РОВНО

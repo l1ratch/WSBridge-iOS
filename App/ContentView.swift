@@ -742,6 +742,11 @@ struct DNSView: View {
                 } label: {
                     Label("Настройки DNS", systemImage: "gearshape")
                 }
+                NavigationLink {
+                    LocalDNSView(tunnel: tunnel)
+                } label: {
+                    Label("Локальный DNS", systemImage: "server.rack")
+                }
             }
         }
         .navigationTitle("DNS")
@@ -850,6 +855,218 @@ struct DNSManageView: View {
                 DNSDetailView(config: config)
             }
         }
+    }
+}
+
+/// Локальный DNS: резолвер туннеля с hosts-rewrite списком и upstream.
+struct LocalDNSView: View {
+    @ObservedObject var tunnel: TunnelManager
+    @State private var showAddList = false
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle(isOn: $tunnel.localDNSEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Локальный DNS")
+                        Text("Запросы обрабатывает туннель: имена из списка получают адреса из списка, остальные идут на сервер ниже.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if tunnel.localDNSEnabled {
+                Section("DNS после списков") {
+                    // Upstream: «Системный» + все конфиги с IP.
+                    Button {
+                        tunnel.localDNSUpstreamId = "system"
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Системный")
+                                Text("DNS устройства, туннель его не трогает")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if tunnel.localDNSUpstreamId == "system" {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    ForEach(tunnel.allDNS.filter { !$0.servers.isEmpty }) { config in
+                        Button {
+                            tunnel.localDNSUpstreamId = config.id
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(config.name)
+                                    Text(config.servers.joined(separator: ", "))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                                if tunnel.localDNSUpstreamId == config.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(.green)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Text("Upstream всегда по UDP:53 — шифрование остаётся за системным DNS. Для DoT/DoH выбирайте «Системный» + системный VPN-профиль.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Список rewrites") {
+                    // nil = без списка (только проксирование).
+                    Button {
+                        tunnel.selectedHostsListId = nil
+                    } label: {
+                        HStack {
+                            Text("Без списка")
+                            Spacer()
+                            if tunnel.selectedHostsListId == nil {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    ForEach(tunnel.allHostsLists) { list in
+                        Button {
+                            tunnel.selectedHostsListId = list.id
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(list.name)
+                                    Text(list.url)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                Spacer()
+                                if tunnel.selectedHostsListId == list.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(.green)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        if !list.isPreset {
+                            Button(role: .destructive) {
+                                tunnel.customHostsLists.removeAll { $0.id == list.id }
+                                if tunnel.selectedHostsListId == list.id {
+                                    tunnel.selectedHostsListId = nil
+                                }
+                            } label: {
+                                Label("Удалить «\(list.name)»", systemImage: "trash")
+                                    .font(.caption)
+                            }
+                        }
+                    }
+                    Button {
+                        showAddList = true
+                    } label: {
+                        Label("Добавить список", systemImage: "plus.circle")
+                    }
+                }
+
+                // Обновление списка + статус — как у фронтов.
+                Section {
+                    Button {
+                        Task { await tunnel.updateLocalDNSHosts() }
+                    } label: {
+                        Label("Загрузить список заново", systemImage: "arrow.triangle.2.circlepath")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if tunnel.localDNSUpdateMessage != nil || tunnel.localDNSHostsUpdatedAt != nil {
+                        VStack(alignment: .leading, spacing: 2) {
+                            if let msg = tunnel.localDNSUpdateMessage {
+                                Text(msg)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let updated = tunnel.localDNSHostsUpdatedAt {
+                                Text("Список загружен: \(updated.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                Section {
+                    Text("Изменения применятся при следующем включении туннеля. Список кешируется: без сети работает последний загруженный.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .navigationTitle("Локальный DNS")
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showAddList) {
+            NavigationStack {
+                HostsListEditorView(tunnel: tunnel)
+            }
+        }
+        .task {
+            // При открытии страницы: если включено, список выбран, но кеш
+            // пустой или старше 30 дней — обновим тихо.
+            if tunnel.localDNSEnabled, tunnel.selectedHostsListId != nil,
+               (tunnel.localDNSHostsUpdatedAt?.timeIntervalSinceNow ?? -720 * 3600) < -(30 * 24 * 3600) {
+                _ = await tunnel.updateLocalDNSHosts()
+            }
+        }
+    }
+}
+
+/// Конструктор своего списка rewrites (URL hosts-файла).
+struct HostsListEditorView: View {
+    @ObservedObject var tunnel: TunnelManager
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var url = ""
+
+    var body: some View {
+        Form {
+            Section("Название") {
+                TextField("Например: Мой список", text: $name)
+            }
+            Section("URL hosts-файла") {
+                TextField("https://…/hosts", text: $url)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                Text("Формат — hosts: «IP имя» в каждой строке, # — комментарий.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                Button("Сохранить") {
+                    let cleanName = name.trimmingCharacters(in: .whitespaces)
+                    let cleanURL = url.trimmingCharacters(in: .whitespaces)
+                    guard !cleanName.isEmpty, URL(string: cleanURL)?.scheme?.hasPrefix("http") == true else { return }
+                    let list = TunnelManager.HostsList(
+                        id: "custom-\(UUID().uuidString.prefix(8))",
+                        name: cleanName, url: cleanURL, isPreset: false)
+                    tunnel.customHostsLists.append(list)
+                    tunnel.selectedHostsListId = list.id
+                    Task { await tunnel.updateLocalDNSHosts() }
+                    dismiss()
+                }
+                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty ||
+                          URL(string: url.trimmingCharacters(in: .whitespaces))?.scheme?.hasPrefix("http") != true)
+            }
+        }
+        .navigationTitle("Новый список")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
