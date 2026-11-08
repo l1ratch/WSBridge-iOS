@@ -52,7 +52,7 @@ enum ProxyClient {
 
     /// Тест прокси: коннект к example.com:80 через прокси. Возвращает
     /// задержку хендшейка в мс или nil.
-    static func probe(_ endpoint: Endpoint) async -> Int? {
+    static func probe(_ endpoint: ProxyEndpoint) async -> Int? {
         let start = DispatchTime.now()
         let ok: Bool = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             connect(endpoint: endpoint, domain: "example.com", port: 80) { stream in
@@ -67,7 +67,7 @@ enum ProxyClient {
     // MARK: - SOCKS5
 
     /// Двухфазный хендшейк: метод-согласование → CONNECT.
-    private static func socks5Handshake(conn: NWConnection, endpoint: Endpoint,
+    private static func socks5Handshake(conn: NWConnection, endpoint: ProxyEndpoint,
                                          domain: String, port: UInt16,
                                          done: @escaping (ProxyStream?) -> Void) {
         let hasAuth = endpoint.user != nil
@@ -112,7 +112,7 @@ enum ProxyClient {
     }
 
     /// CONNECT по имени (ATYP 0x03): VER CMD RSV ATYP LEN NAME PORT.
-    private static func socks5Connect(conn: NWConnection, endpoint: Endpoint,
+    private static func socks5Connect(conn: NWConnection, endpoint: ProxyEndpoint,
                                       domain: String, port: UInt16,
                                       done: @escaping (ProxyStream?) -> Void) {
         let name = Data(domain.utf8)
@@ -157,7 +157,7 @@ enum ProxyClient {
     // MARK: - HTTP CONNECT
 
     /// CONNECT domain:port HTTP/1.1 + базовая авторизация (если задана).
-    private static func httpConnect(conn: NWConnection, endpoint: Endpoint,
+    private static func httpConnect(conn: NWConnection, endpoint: ProxyEndpoint,
                                     domain: String, port: UInt16,
                                     done: @escaping (ProxyStream?) -> Void) {
         var req = "CONNECT \(domain):\(port) HTTP/1.1\r\nHost: \(domain):\(port)\r\n"

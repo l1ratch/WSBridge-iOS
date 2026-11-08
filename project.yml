@@ -75,6 +75,10 @@ targets:
       # тоже читает UserDefaults (статистика фронтов, журнал событий).
       - path: Shared/PrivacyInfo.xcprivacy
         buildPhase: resources
+      # Общий тип прокси (парсинг URL) — нужен extension'у (коннект)
+      # и app'у (настройки/тест). Тестер в extension не линкуем: он
+      # только для UI.
+      - path: Shared/ProxyEndpoint.swift
     info:
       path: Tunnel/Info.plist
       properties:
