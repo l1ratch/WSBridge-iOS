@@ -76,6 +76,7 @@ static void nat_remove(uint32_t client_ip, uint16_t client_port) {
 typedef struct {
     struct tcp_pcb *pcb;
     uint32_t dc_ip;
+    uint16_t dc_port;
     uint32_t client_ip;
     uint16_t client_port;
     int active;
@@ -220,6 +221,9 @@ static err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
 
     g_conns[slot].pcb = newpcb;
     g_conns[slot].dc_ip = dc_ip;
+    // Порт, на который реально стучался клиент. lwIP слушает 443/80/5222
+    // и пайпит всё в DC:443, но для DIRECT-выпуска по SNI нужен исходный.
+    g_conns[slot].dc_port = newpcb->local_port;
     g_conns[slot].client_ip = client_ip;
     g_conns[slot].client_port = client_port;
     g_conns[slot].active = 1;
@@ -429,6 +433,12 @@ uint32_t lwip_bridge_get_dst_ip(uint32_t conn_id) {
     conn_t *c = conn_of_id(conn_id);
     if (!c) return 0;
     return c->dc_ip;
+}
+
+uint16_t lwip_bridge_get_dst_port(uint32_t conn_id) {
+    conn_t *c = conn_of_id(conn_id);
+    if (!c) return 0;
+    return c->dc_port;
 }
 
 // --- Состояние TCP-сессии для диагностики: unacked = snd_nxt - lastack ---

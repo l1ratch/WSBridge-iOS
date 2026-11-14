@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 /// Оркестратор одного соединения: lwIP TCP ↔ WS к kws-гейтвею.
 /// Парсит init, коннектится к kws{dc}, мостит байты через MsgSplitter.
@@ -12,6 +13,16 @@ class TunnelSession {
     /// Прокси-режим: домен (fake-IP 198.18.1.x, восстановлен LRDNS)
     /// ходит через SOCKS5/HTTP-прокси.
     let proxyEndpoint: ProxyEndpoint?
+    /// Прокси для SNI-фолбэка (общий с FakeIP-режимом).
+    let sniProxyEndpoint: ProxyEndpoint?
+    /// Исходный порт назначения (из C-моста), нужен для DIRECT и CONNECT.
+    let dstPort: UInt16
+    /// Решение по SNI уже принято (чтобы не парсить каждый пакет).
+    private var sniResolved = false
+    /// Байты, накопленные до решения по SNI. Уйдут следом без потерь.
+    private var sniPending = Data()
+    /// Прямой исходящий поток, когда SNI НЕ в списке прокси.
+    private var directStream: DirectStream?
     /// Прокси-поток после хендшейка (буферизует до готовности).
     private var proxyStream: ProxyStream?
     /// Байты, пришедшие до готовности прокси-хендшейка.
@@ -37,7 +48,10 @@ class TunnelSession {
     private static var wfailLogged = 0
 
     init(connId: UInt32, dcIP: UInt32, workerDomain: String?, dcOverride: [String: String], bridge: LWIPBridge, queue: DispatchQueue,
-         proxyEndpoint: ProxyEndpoint? = nil) {
+         proxyEndpoint: ProxyEndpoint? = nil,
+         proxyDomainMatcher: ((String) -> Bool)? = nil,
+         sniProxyEndpoint: ProxyEndpoint? = nil,
+         dstPort: UInt16 = 443) {
         self.connId = connId
         self.dcIP = dcIP
         self.workerDomain = workerDomain
@@ -45,7 +59,16 @@ class TunnelSession {
         self.bridge = bridge
         self.queue = queue
         self.proxyEndpoint = proxyEndpoint
+        self.sniProxyEndpoint = sniProxyEndpoint
+        self.dstPort = dstPort == 0 ? 443 : dstPort
+        // FakeIP-сессия уже знает домен — SNI-парсер ей не нужен.
+        // Для real-IP сессий matcher != nil включает разбор ClientHello.
+        self.sniResolved = (proxyDomainMatcher == nil)
+        self.sniMatcher = proxyDomainMatcher
     }
+
+    /// nil = сессия не real-IP (FakeIP/Telegram) — SNI не парсим.
+    private let sniMatcher: ((String) -> Bool)?
 
     /// Данные от клиента (Telegram) через lwIP. Вызывается на lwipQueue.
     func handleData(_ data: Data) {
@@ -55,11 +78,45 @@ class TunnelSession {
             let head = data.prefix(96).map { String(format: "%02x", $0) }.joined()
             postEvent("uphead:c\(connId):\(data.count):\(head)")
         }
-        // Прокси-режим: домен через SOCKS5/HTTP. Порт назначения неизвестен
-        // (lwIP accept даёт только адрес) — CONNECT на 443: HTTPS-домены
-        // составляют весь реальный трафик списков.
+        // SNI-фолбэк: сессия пришла на РЕАЛЬНЫЙ IP (приложение обошло наш
+        // DNS через свой DoH/DoT). Проверяем первый TCP-пакет: если это
+        // ClientHello с доменом из списка — уводим ВСЁ соединение в прокси.
+        // Буфер уходит следом, поэтому ClientHello не теряется.
+        if let matcher = sniMatcher, !sniResolved {
+            sniPending.append(data)
+            if let domain = TLSSNI.extract(from: sniPending) {
+                sniResolved = true
+                let buffered = sniPending
+                sniPending = Data()
+                if matcher(domain), let proxy = sniProxyEndpoint {
+                    postEvent("sni_proxy:c\(connId):\(domain)")
+                    startProxy(proxy: proxy, domain: domain, port: dstPort)
+                    sendToProxy(buffered)
+                    return
+                }
+                // Домен не в списке: выпускаем DIRECT на исходный IP:порт.
+                postEvent("sni_direct:c\(connId):\(domain)")
+                startDirect(firstData: buffered)
+                return
+            }
+            // ClientHello может прийти несколькими сегментами. Ждём, но
+            // не бесконечно: 2 КБ более чем достаточно для хендшейка.
+            if sniPending.count < 2048 { return }
+            sniResolved = true
+            let buffered = sniPending
+            sniPending = Data()
+            startDirect(firstData: buffered)
+            return
+        }
+        // DIRECT-поток уже установлен — остальные байты идут туда же.
+        if let stream = directStream {
+            stream.send(data)
+            return
+        }
+        // Прокси-режим FakeIP: домен через SOCKS5/HTTP. Порт берём из
+        // C-моста (lwip_bridge_get_dst_port), по умолчанию 443.
         if let proxy = proxyEndpoint, let domain = workerDomain {
-            if proxyStream == nil { startProxy(proxy: proxy, domain: domain) }
+            if proxyStream == nil { startProxy(proxy: proxy, domain: domain, port: dstPort) }
             sendToProxy(data)
             return
         }
@@ -151,9 +208,9 @@ class TunnelSession {
 
     /// Хендшейк с прокси: CONNECT domain:443. Ответы от прокси мостятся
     /// в lwIP как обычные данные сессии.
-    private func startProxy(proxy: ProxyEndpoint, domain: String) {
-        postEvent("proxy_try:c\(connId):\(domain)")
-        ProxyClient.connect(endpoint: proxy, domain: domain, port: 443) { [weak self] stream in
+    private func startProxy(proxy: ProxyEndpoint, domain: String, port: UInt16 = 443) {
+        postEvent("proxy_try:c\(connId):\(domain):\(port)")
+        ProxyClient.connect(endpoint: proxy, domain: domain, port: port) { [weak self] stream in
             guard let self else { return }
             self.queue.async {
                 guard !self.dead else { stream?.close(); return }
@@ -336,6 +393,40 @@ class TunnelSession {
         wsConnected = false
         proxyStream?.close()
         proxyStream = nil
+        directStream?.close()
+        directStream = nil
+    }
+
+    // MARK: - DIRECT по SNI (обычный сайт на том же IP)
+
+    /// Выпускаем поток напрямую к исходному IP:порту. Обязательно
+    /// привязываем сокет к ФИЗИЧЕСКОМУ интерфейсу: иначе при добавлении
+    /// CIDR в includedRoutes исходящий пакет снова уедет в utun и
+    /// закольцуется.
+    private func startDirect(firstData: Data) {
+        let ip = String(format: "%d.%d.%d.%d",
+                        (dcIP >> 24) & 255, (dcIP >> 16) & 255,
+                        (dcIP >> 8) & 255, dcIP & 255)
+        guard NWEndpoint.Port(rawValue: dstPort) != nil else {
+            bridge.close(connId: connId)
+            return
+        }
+        let stream = DirectStream(host: ip, port: dstPort)
+        directStream = stream
+        stream.start(firstData: firstData) { [weak self] data in
+            guard let self else { return }
+            self.queue.async {
+                guard !self.dead, !data.isEmpty else { return }
+                EventLog.wsDown += UInt64(data.count)
+                _ = self.writeOrQueue(data)
+            }
+        } onClose: { [weak self] in
+            guard let self else { return }
+            self.queue.async {
+                guard !self.dead else { return }
+                self.bridge.close(connId: self.connId)
+            }
+        }
     }
 
     // MARK: - «DC → IP» маппинг (как в десктопном tg-ws-proxy)
@@ -373,5 +464,91 @@ class TunnelSession {
             map[canon] = ip
         }
         return map
+    }
+}
+
+/// Прямой TCP-поток к реальному IP:порту. Используется, когда SNI НЕ
+/// совпал со списком прокси: пакет попал в туннель по CIDR, но должен
+/// уйти в интернет без проксирования.
+///
+/// ВАЖНО: requiredInterfaceType = .wifi / .cellular исключает utun и
+/// предотвращает routing loop. NWParameters.prohibitConstrainedPaths
+/// отключён — туннель не должен считаться «ограниченным» путём.
+final class DirectStream {
+    private let conn: NWConnection
+    private var closed = false
+    private var ready = false
+    private var pending = Data()
+    private let lock = NSLock()
+
+    init(host: String, port: UInt16) {
+        let params = NWParameters.tcp
+        // Явно уводим исходящий сокет МИМО utun. NWConnection внутри
+        // NEPacketTunnelProvider по умолчанию уже идёт через физический
+        // интерфейс (не через packetFlow); prohibitConstrainedPaths=false
+        // не даёт системе пометить туннель как «ограниченный» путь.
+        // НЕ выставляем requiredInterfaceType: жёсткая привязка к .wifi
+        // убьёт трафик на сотовой сети.
+        params.prohibitConstrainedPaths = false
+        conn = NWConnection(host: NWEndpoint.Host(host),
+                            port: NWEndpoint.Port(rawValue: port)!,
+                            using: params)
+    }
+
+    func start(firstData: Data,
+               onData: @escaping (Data) -> Void,
+               onClose: @escaping () -> Void) {
+        pending = firstData
+        conn.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.lock.lock()
+                self.ready = true
+                let buffered = self.pending
+                self.pending = Data()
+                self.lock.unlock()
+                if !buffered.isEmpty {
+                    self.conn.send(content: buffered, completion: .contentProcessed { err in
+                        if err != nil { onClose(); return }
+                        self.receiveLoop(onData: onData, onClose: onClose)
+                    })
+                } else {
+                    self.receiveLoop(onData: onData, onClose: onClose)
+                }
+            case .failed, .cancelled:
+                onClose()
+            default:
+                break
+            }
+        }
+        conn.start(queue: .global(qos: .userInitiated))
+    }
+
+    func send(_ data: Data) {
+        lock.lock()
+        let isReady = ready
+        if !isReady { pending.append(data) }
+        lock.unlock()
+        guard !closed, isReady else { return }
+        conn.send(content: data, completion: .contentProcessed { _ in })
+    }
+
+    private func receiveLoop(onData: @escaping (Data) -> Void,
+                             onClose: @escaping () -> Void) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, err in
+            guard let self else { return }
+            if let data, !data.isEmpty { onData(data) }
+            if err != nil || isComplete || data == nil {
+                onClose()
+            } else {
+                self.receiveLoop(onData: onData, onClose: onClose)
+            }
+        }
+    }
+
+    func close() {
+        closed = true
+        conn.cancel()
     }
 }

@@ -77,6 +77,11 @@ final class LWIPBridge {
         }
     }
 
+    /// Исходный порт назначения соединения (до remap на listen-порт lwIP).
+    func dstPort(connId: UInt32) -> UInt16 {
+        lwip_bridge_get_dst_port(connId)
+    }
+
     func poll() {
         lwip_bridge_poll()
     }

@@ -30,15 +30,16 @@ jobs:
 
       - name: Check tag matches version
         run: |
-          # Тег обязан совпадать с версией из project.yml: "<WSB_VERSION>.<WSB_BUILD>"
-          # (v0.3.0), иначе собранный IPA уедет с версией, отличной от тега.
+          # Стабильный релиз — ТОЛЬКО по тегу vX.Y.N, который вручную
+          # создаёт разработчик. Тег обязан совпадать с project.yml:
+          # "<WSB_VERSION>.<WSB_BUILD>". CI превью теги НЕ создаёт.
           BUILD=$(grep -m1 'WSB_BUILD:' project.yml | sed -E 's/.*"([0-9]+)".*/\1/')
           BLOCK=$(grep -m1 'WSB_VERSION:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
           EXPECTED="v$BLOCK.$BUILD"
           TAG="${{ github.ref_name }}"
           if [ "$TAG" != "$EXPECTED" ]; then
             echo "::error::Тег $TAG не совпадает с версией $BLOCK.$BUILD (ожидался $EXPECTED)."
-            echo "Сначала подними WSB_BUILD/WSB_VERSION в project.yml и запушь в main, потом тегни."
+            echo "Релиз выкладывается только по явной команде: подними X/Y (и при желании N) в project.yml, запушь в main, потом создай тег $EXPECTED."
             exit 1
           fi
           echo "Тег $TAG совпадает с версией $BLOCK.$BUILD"

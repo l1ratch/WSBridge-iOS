@@ -22,6 +22,11 @@ final class LocalDNSResolver {
     private var rewrites: [String: UInt32] = [:]
     /// Upstream-серверы (IP). Пусто = системный DNS.
     private var upstreams: [String] = []
+    /// Разрешён ли откат на системный резолвер (getaddrinfo). В режиме
+    /// «весь трафик» системный резолвер — это мы же: getaddrinfo уйдёт
+    /// обратно в туннель и завертит петлю. Там откат выключается, и
+    /// непокрытые имена получают SERVFAIL вместо бесконечного цикла.
+    private var systemFallbackEnabled = true
     private static let upstreamTimeout: TimeInterval = 3
     private let writePacket: (Data) -> Void
     private(set) var statRewritten: UInt64 = 0
@@ -31,12 +36,16 @@ final class LocalDNSResolver {
     private var upstreamDoTHost: String?
     /// DoH-upstream: URL (nil = не DoH). Запросы POST/GET-типа wireformat.
     private var upstreamDoHURL: URL?
-    /// Прокси-домены: домен → fake-IP 198.18.1.x. Соединения на эти IP
-    /// туннель терминирует и гонит через SOCKS5/HTTP-прокси.
-    private var proxyByDomain: [String: UInt32] = [:]
-    /// Обратный маппинг: fake-IP → домен (для восстановления имени при
-    /// accept соединения).
+    /// Прокси-ДОМЕНЫ (правила из списков). Хранятся отдельно от выданных
+    /// адресов: правил могут быть десятки тысяч, а одновременно живых
+    /// соединений — единицы. FakeIP выделяется лениво, при первом запросе.
+    private var proxyRules: Set<String> = []
+    /// Выданные fake-IP: домен → адрес и обратно. Пул 198.18.1.1...254.
+    private var fakeIPByDomain: [String: UInt32] = [:]
     private var domainByFakeIP: [UInt32: String] = [:]
+    /// LRU: первым — самый давно не использованный (его и вытесняем).
+    private var fakeIPLRU: [UInt32] = []
+    private var nextFakeIP: UInt32 = 1
 
     init(writePacket: @escaping (Data) -> Void) {
         self.writePacket = writePacket
@@ -71,8 +80,10 @@ final class LocalDNSResolver {
     ///     домена (SOCKS5 принимает имена напрямую).
     func configure(hostsText: String?, upstreams: [String],
                    doT: String? = nil, doHURL: String? = nil,
-                   proxyDomains: [String] = []) {
+                   proxyDomains: [String] = [],
+                   systemFallback: Bool = true) {
         self.upstreams = upstreams
+        self.systemFallbackEnabled = systemFallback
         self.upstreamDoTHost = doT
         self.upstreamDoHURL = doHURL.flatMap { URL(string: $0) }
         var table: [String: UInt32] = [:]
@@ -94,31 +105,84 @@ final class LocalDNSResolver {
             }
         }
         self.rewrites = table
-        // Прокси-домены → fake-IP. Пул 198.18.1.1...198.18.1.254 (254 шт):
-        // больше доменов, чем адресов — лишние игнорируем (список itdog
-        // Russia-outside ~5k имён, проксируем первый батч; этого хватает
-        // на реальный трафик — соцсети, AI, стриминг).
-        proxyByDomain = [:]
-        domainByFakeIP = [:]
-        var next: UInt32 = 1
+        // Домены из списков (могут быть и «example.com», и «.example.com»,
+        // и «*.example.com»). Нормализуем в суффикс: без ведущей точки
+        // и без ведущей звёздочки. Храним ТОЛЬКО правила — память туннеля
+        // не зависит от числа выданных адресов.
+        var rules = Set<String>()
         for raw in proxyDomains {
             let name = raw.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !name.isEmpty, next < 255 else { continue }
-            let fakeIP: UInt32 = (198 << 24) | (18 << 16) | (1 << 8) | next
-            proxyByDomain[name] = fakeIP
-            domainByFakeIP[fakeIP] = name
-            next += 1
+            guard !name.isEmpty else { continue }
+            var suffix = name
+            if suffix.hasPrefix("*.") { suffix = String(suffix.dropFirst(2)) }
+            suffix = suffix.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            guard !suffix.isEmpty, suffix.count <= 253 else { continue }
+            rules.insert(suffix)
         }
+        self.proxyRules = rules
+        fakeIPByDomain = [:]
+        domainByFakeIP = [:]
+        fakeIPLRU = []
+        nextFakeIP = 1
     }
 
     var rewriteCount: Int { rewrites.count }
-    var proxyDomainCount: Int { proxyByDomain.count }
+    var proxyDomainCount: Int { proxyRules.count }
+
+    /// Принадлежит ли домен проксируемому списку. Точное совпадение либо
+    /// поддомен: «api.chatgpt.com» матчится правилом «chatgpt.com».
+    /// Вызывается на lwipQueue (из tryHandle и из SNI-фолбэка).
+    func isProxyDomain(_ name: String) -> Bool {
+        let n = name.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        guard !n.isEmpty else { return false }
+        if proxyRules.contains(n) { return true }
+        var rest = n
+        while let dot = rest.firstIndex(of: ".") {
+            rest = String(rest[rest.index(after: dot)...])
+            if rest.isEmpty { break }
+            if proxyRules.contains(rest) { return true }
+        }
+        return false
+    }
+
+    /// Выдаёт (или переиспользует) fake-IP для домена. Пул 254 адреса;
+    /// при исчерпании вытесняется самый давно не использованный — живые
+    /// соединения на нём уже завершились (LRU обновляется на каждый A-запрос).
+    func fakeIP(forDomain name: String) -> UInt32? {
+        let key = name.lowercased()
+        if let ip = fakeIPByDomain[key] {
+            touch(ip)
+            return ip
+        }
+        let ip: UInt32
+        if nextFakeIP < 255 {
+            ip = (198 << 24) | (18 << 16) | (1 << 8) | nextFakeIP
+            nextFakeIP += 1
+        } else {
+            guard let evict = fakeIPLRU.first else { return nil }
+            if let old = domainByFakeIP.removeValue(forKey: evict) {
+                fakeIPByDomain.removeValue(forKey: old)
+            }
+            fakeIPLRU.removeFirst()
+            ip = evict
+        }
+        fakeIPByDomain[key] = ip
+        domainByFakeIP[ip] = key
+        touch(ip)
+        return ip
+    }
+
+    private func touch(_ ip: UInt32) {
+        fakeIPLRU.removeAll { $0 == ip }
+        fakeIPLRU.append(ip)
+    }
 
     /// Домен по fake-IP (для PacketTunnelProvider при accept: соединение
     /// на 198.18.1.x → проксируем через SOCKS5/HTTP с этим именем).
     /// Вызывается на lwipQueue (из handleAccept).
     func proxyDomain(forFakeIP ip: UInt32) -> String? {
-        domainByFakeIP[ip]
+        if let d = domainByFakeIP[ip] { touch(ip) }
+        return domainByFakeIP[ip]
     }
 
     // MARK: - Перехват из packetFlow
@@ -157,9 +221,13 @@ final class LocalDNSResolver {
         let qclass = (Int(question[question.count - 2]) << 8)
                    | Int(question[question.count - 1])
 
-        // AAAA (28): стек v4-only, отвечаем NOERROR без записей —
-        // клиент не должен ретраить IPv6 вечно.
-        if qtype == 28 {
+        // КРИТИЧНО для нативных iOS-приложений (ChatGPT, Claude, Gemini):
+        // AAAA (28), SVCB (64) и HTTPS (65) для проксируемых имён отвечаем
+        // ПУСТЫМ NOERROR, не форвардим. Иначе upstream приносит HTTPS RR
+        // с ipv4hint/ipv6hint (реальные IP Cloudflare) и NWConnection идёт
+        // мимо FakeIP напрямую — ровно «браузер работает, приложение нет».
+        // Пустой NOERROR заставляет стек откатиться на классическую A-запись.
+        if qtype == 28 || qtype == 64 || qtype == 65 {
             reply(packet: packet, question: question, answer: Data(), rcode: 0)
             statRewritten += 1
             return true
@@ -167,7 +235,10 @@ final class LocalDNSResolver {
 
         // Прокси-домен: приоритет над rewrites — домен должен идти через
         // прокси, даже если какой-то список прописал ему адрес.
-        if qtype == 1, qclass == 1, let fakeIP = proxyByDomain[name] {
+        // FakeIP выделяется лениво: правил может быть тысячи, одновременно
+        // живых соединений — единицы.
+        if qtype == 1, qclass == 1, isProxyDomain(name),
+           let fakeIP = fakeIP(forDomain: name) {
             var answer = Data()
             answer.append(contentsOf: [0xC0, 0x0C])
             answer.append(contentsOf: [0, 1])
@@ -265,6 +336,14 @@ final class LocalDNSResolver {
     /// Пересылает вопрос на upstream (UDP:53) или системный резолвер.
     private func forward(question: Data, originalPacket: Data, name: String) {
         if upstreams.isEmpty {
+            guard systemFallbackEnabled else {
+                // Режим 0/0: системный резолвер — мы сами, откат замкнул
+                // бы петлю. Отвечаем SERVFAIL сразу.
+                reply(packet: originalPacket, question: question,
+                      answer: Data(), rcode: 2)
+                statFailed += 1
+                return
+            }
             // Системный upstream: пересылаем на res_query — система
             // использует свой DNS-путь, туннель его не маршрутизирует.
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -528,5 +607,9 @@ enum IPv4Addr {
     static func bytes(_ v: UInt32) -> [UInt8] {
         [UInt8((v >> 24) & 0xFF), UInt8((v >> 16) & 0xFF),
          UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF)]
+    }
+
+    static func dotted(_ v: UInt32) -> String {
+        "\(Int((v >> 24) & 0xFF)).\(Int((v >> 16) & 0xFF)).\(Int((v >> 8) & 0xFF)).\(Int(v & 0xFF))"
     }
 }

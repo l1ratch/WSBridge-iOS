@@ -220,6 +220,11 @@ struct MenuView: View {
                     } label: {
                         Label("Статистика", systemImage: "chart.bar")
                     }
+                    NavigationLink {
+                        DNSProbeView(tunnel: tunnel)
+                    } label: {
+                        Label("Тест DNS", systemImage: "stethoscope")
+                    }
                 }
                 Section("Настройки") {
                     Toggle(isOn: $tunnel.liveActivityEnabled) {
@@ -641,6 +646,108 @@ struct StatsView: View {
         out.dateFormat = "d MMM"
         out.locale = Locale(identifier: "ru_RU")
         return out.string(from: d)
+    }
+}
+
+/// Тест DNS: три способа объявить резолвер системе, чтобы раз и навсегда
+/// выяснить, доходят ли DNS-запросы до туннеля в split-режиме.
+/// Гипотеза проверяется журналом: строка dnsprobe с счётчиками.
+struct DNSProbeView: View {
+    @ObservedObject var tunnel: TunnelManager
+
+    private var tunnelUp: Bool {
+        tunnel.status == .connected || tunnel.status == .connecting || tunnel.status == .reasserting
+    }
+
+    /// nil и "matchall" для UI — одно и то же: рабочий режим по умолчанию.
+    private var currentMode: String { tunnel.dnsProbeMode ?? "matchall" }
+
+    var body: some View {
+        Form {
+            Section {
+                Text("Проверяет один вопрос: применяет ли iOS объявленный резолвер, когда туннель забирает не весь трафик. Три режима — три гипотезы, по одному прогону на каждую.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Режим проверки") {
+                ForEach(TunnelManager.dnsProbeTitles, id: \.id) { item in
+                    Button {
+                        tunnel.dnsProbeMode = item.id
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.title)
+                                    .foregroundStyle(.primary)
+                                Text(item.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer()
+                            if currentMode == item.id {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(tunnelUp)
+                }
+                if tunnelUp {
+                    Text("Выключите туннель, чтобы сменить режим.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            Section("Условия теста") {
+                Text("1. Выберите DNS «Локальный (LRDNS)» на главном экране.")
+                    .font(.caption)
+                Text("2. Выберите режим выше, включите туннель.")
+                    .font(.caption)
+                Text("3. Откройте Safari и зайдите на 2-3 сайта, которых раньше не открывали — DNS-кеш переживает перезапуск туннеля.")
+                    .font(.caption)
+                Text("4. Через минуту откройте «Журнал туннеля» и найдите строку dnsprobe.")
+                    .font(.caption)
+            }
+
+            Section("Как читать результат") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("udp53 больше нуля")
+                        .font(.caption.weight(.semibold))
+                    Text("DNS-пакеты доходят до туннеля. Тогда смотрим done: если done тоже растёт — перехват работает, hosts и прокси по домену возможны.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("udp53 = 0, udpOth больше нуля")
+                        .font(.caption.weight(.semibold))
+                    Text("В туннель идёт UDP, но не DNS — система резолвит мимо нас. В поле dst видно, куда именно она шлёт запросы.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Всё по нулям")
+                        .font(.caption.weight(.semibold))
+                    Text("В туннель не попадает вообще ничего. Значит резолвер не применён в этом режиме.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section {
+                NavigationLink {
+                    JournalView(tunnel: tunnel)
+                } label: {
+                    Label("Открыть журнал", systemImage: "doc.text")
+                }
+            } footer: {
+                Text("Режим запоминается и уходит в конфигурацию при следующем включении туннеля. После теста верните «Split (как сейчас)».")
+            }
+        }
+        .navigationTitle("Тест DNS")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 

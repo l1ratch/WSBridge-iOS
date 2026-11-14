@@ -527,6 +527,31 @@ final class TunnelManager: ObservableObject {
         didSet { UserDefaults.standard.set(proxyDomainsEnabled, forKey: "proxyDomainsEnabled") }
     }
 
+    // MARK: - Диагностика DNS (страница «Тест DNS»)
+
+    /// Как объявлять резолвер системе. Три варианта одной гипотезы:
+    /// split (как сейчас), matchall (+matchDomains), default (0/0 маршрут).
+    /// nil = диагностика выключена, работает обычная логика.
+    @Published var dnsProbeMode: String? = UserDefaults.standard.string(forKey: "dnsProbeMode") {
+        didSet { UserDefaults.standard.set(dnsProbeMode, forKey: "dnsProbeMode") }
+    }
+
+    /// Подписи режимов для UI.
+    struct DNSProbeModeInfo: Identifiable {
+        let id: String
+        let title: String
+        let detail: String
+    }
+
+    static let dnsProbeTitles: [DNSProbeModeInfo] = [
+        DNSProbeModeInfo(id: "split", title: "Split (как сейчас)",
+         detail: "Узкие маршруты Telegram + /32 на адрес резолвера. Базлайн: проверяем, приходят ли DNS-пакеты в туннель."),
+        DNSProbeModeInfo(id: "matchall", title: "Split + matchDomains",
+         detail: "То же, но резолвер объявлен для всех имён (matchDomains = [\"\"]). Гипотеза: без этого iOS игнорирует dnsSettings."),
+        DNSProbeModeInfo(id: "default", title: "Весь трафик (0.0.0.0/0)",
+         detail: "Туннель забирает всё. Если DNS появится только здесь — split его не отдаёт в принципе. Интернет на время теста не работает."),
+    ]
+
     /// Кеш контента выбранного списка (текст hosts-файла).
     @Published private(set) var localDNSHostsText: String? = UserDefaults.standard.string(forKey: "localDNSHostsText") {
         didSet { UserDefaults.standard.set(localDNSHostsText, forKey: "localDNSHostsText") }
@@ -664,6 +689,20 @@ final class TunnelManager: ObservableObject {
         }
         return Array(domains.prefix(250))
     }
+
+    /// Подсети для real-IP / SNI-фолбэка. Не «весь Cloudflare», а точечные
+    /// блоки основных AI-сервисов: чем меньше маршрутов, тем меньше трафика
+    /// вообще заходит в utun и тем ниже расход батареи. Списки itdoginfo:
+    /// https://github.com/itdoginfo/allow-domains/tree/main/Subnets/IPv4
+    static let sniCIDRs: [String] = [
+        "104.18.0.0/16",     // Cloudflare (OpenAI/Claude/Perplexity)
+        "172.67.0.0/16",     // Cloudflare
+        "104.16.0.0/13",     // Cloudflare
+        "142.250.0.0/15",    // Google (Gemini)
+        "34.64.0.0/10",      // Google Cloud
+        "151.101.0.0/16",    // Fastly
+        "140.82.112.0/20",   // GitHub / Cursor
+    ]
 
     // MARK: - Тест прокси
 
@@ -1594,6 +1633,11 @@ final class TunnelManager: ObservableObject {
         // странице LRDNS). «Системный» = пустой upstream.
         if localDNSEnabled {
             config["localDNS"] = true as NSNumber
+            // Диагностический режим объявления резолвера: расширение само
+            // решает, какие маршруты объявить и что положить в dnsSettings.
+            if let probe = dnsProbeMode, !probe.isEmpty {
+                config["dnsProbe"] = probe as NSString
+            }
             // Режим Hosts: таблица перезаписей (только при тумблере).
             if hostsRewritesEnabled, let hosts = localDNSHostsText, !hosts.isEmpty {
                 config["localDNSHosts"] = hosts as NSString
@@ -1615,6 +1659,11 @@ final class TunnelManager: ObservableObject {
             // — лучший из пробитых.
             if proxyDomainsEnabled {
                 let domainList = await loadProxyDomains()
+                // Подсети CDN, где сидят ИИ-сервисы: реальный IP (когда
+                // приложение обошло FakeIP через свой DoH) всё равно
+                // попадёт в туннель, и SNI решит проксировать или нет.
+                // RAW-списки itdoginfo/allow-domains/Subnets/IPv4/*.lst.
+                config["sniCIDRs"] = Self.sniCIDRs as NSArray
                 let activeProxy: String?
                 if selectedProxyIndex >= 0, selectedProxyIndex < proxyURLs.count {
                     activeProxy = proxyURLs[selectedProxyIndex]

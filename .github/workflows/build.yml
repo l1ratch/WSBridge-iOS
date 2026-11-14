@@ -1,4 +1,15 @@
-name: Build Unsigned IPA
+name: Build Preview IPA
+
+# ── Версионирование X.Y.N ────────────────────────────────────────────
+# X, Y поднимаются ВРУЧНУЮ в project.yml, только по явной команде
+# «выложи релизную версию». CI их НЕ трогает.
+# N поднимает САМ CI: каждая успешная сборка в превью публикует
+# X.Y.N и оставляет в project.yml N+1 для следующей сборки.
+#
+# Превью: пуш в main → ОДИН обновляемый prerelease «preview»
+#         + gh-pages. Теги v* НЕ создаются.
+# Релиз:  только по явной команде — вручную поднять X/Y (и, если надо,
+#         N) в project.yml, запушить тег vX.Y.N → release.yml.
 
 on:
   push:
@@ -8,19 +19,32 @@ on:
 permissions:
   contents: write
 
+# Сборки идут строго по очереди: две параллельные не должны прочитать
+# один и тот же N и оба записать N+1.
+concurrency:
+  group: preview-build
+  cancel-in-progress: false
+
 jobs:
   build_ipa:
-    name: Build iOS Unsigned IPA
+    name: Build iOS Preview IPA
+    # Пуш бампа делается GITHUB_TOKEN от лица бота: GitHub не запускает
+    # workflow на такие пуши. Плюс [skip ci] в сообщении коммита.
+    # Эта проверка — третий уровень защиты от рекурсии.
+    if: github.actor != 'github-actions[bot]'
     runs-on: macos-26
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          fetch-depth: 1
+          # persist-credentials по умолчанию true: oauth-токен остаётся
+          # в .git/config, финальному git push не нужен отдельный секрет.
 
       - name: Install XcodeGen
         run: brew install xcodegen
 
       - name: Set Xcode Version
         run: |
-          # Prefer Xcode 26 (iOS 26 SDK: настоящий Liquid Glass). Фолбэк - 16.x.
           ls /Applications/ | grep -i xcode
           XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
           sudo xcode-select -s "$XC/Contents/Developer"
@@ -29,14 +53,13 @@ jobs:
       - name: Read version
         id: ver
         run: |
-          # Источник правды — project.yml: WSB_VERSION (блок) и
-          # WSB_BUILD (сборка внутри блока). Версия = "<VERSION>.<BUILD>",
-          # ровно то, что видит пользователь: 0.3.0.
+          # project.yml — единственный источник правды. N здесь — это
+          # номер ТЕКУЩЕЙ сборки; после публикации CI запишет N+1.
           BUILD=$(grep -m1 'WSB_BUILD:' project.yml | sed -E 's/.*"([0-9]+)".*/\1/')
           BLOCK=$(grep -m1 'WSB_VERSION:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
           echo "version=$BLOCK.$BUILD" >> "$GITHUB_OUTPUT"
-          echo "WSB build=$BUILD version=$BLOCK.$BUILD"
+          echo "WSB preview build=$BLOCK.$BUILD"
         shell: bash
 
       - name: Generate Xcode Project
@@ -57,7 +80,6 @@ jobs:
         shell: bash
 
       # Лог ошибок компиляции — артефактом, не коммитом в main.
-      # Коммит-бот загрязнял историю и рекурсивно триггерил новый билд.
       - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
@@ -68,10 +90,6 @@ jobs:
 
       - name: Verify version in built app
         run: |
-          # Страховка от нераскрывшейся подстановки: WSB_MARKETING_VERSION
-          # ссылается на WSB_BUILD, и если xcodegen/Xcode не раскроет
-          # вложенную переменную, в plist уедет литерал "0.2.$(WSB_BUILD)".
-          # Ловим это здесь, а не глазами пользователя в GBox.
           APP_PLIST=$(find build -name "Info.plist" -path "*.app/*" | head -n 1)
           SHORT=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PLIST")
           BUNDLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PLIST")
@@ -79,10 +97,10 @@ jobs:
           EXPECT_SHORT="${{ steps.ver.outputs.version }}"
           EXPECT_BUILD="${{ steps.ver.outputs.build }}"
           if [ "$SHORT" != "$EXPECT_SHORT" ] || [ "$BUNDLE" != "$EXPECT_BUILD" ]; then
-            echo "::error::Версия в приложении ($SHORT / $BUNDLE) не совпадает с WSB_BUILD ($EXPECT_SHORT / $EXPECT_BUILD)."
+            echo "::error::Версия в приложении ($SHORT / $BUNDLE) не совпадает с project.yml ($EXPECT_SHORT / $EXPECT_BUILD)."
             exit 1
           fi
-          echo "Версия в приложении совпадает с WSB_BUILD"
+          echo "Версия в приложении совпадает с project.yml"
         shell: bash
 
       - name: Package Unsigned IPA
@@ -100,8 +118,42 @@ jobs:
           path: WSBridge.ipa
           if-no-files-found: error
 
-      # GBox-источник: IPA + манифест (AltStore-формат) в gh-pages,
-      # раздаётся через https://l1ratch.github.io/WSBridge-iOS/
+      # Готовим bump N ЛОКАЛЬНО (без пуша), пока HEAD ещё на main.
+      - name: Stage next build number
+        id: bump
+        run: |
+          set -e
+          CUR=$(grep -m1 'WSB_BUILD:' project.yml | sed -E 's/.*"([0-9]+)".*/\1/')
+          NEXT=$((CUR + 1))
+          # -i.bak работает и в BSD sed (macOS), и в GNU sed.
+          sed -i.bak -E "s/(WSB_BUILD: \")[0-9]+(\")/\1${NEXT}\2/" project.yml
+          rm -f project.yml.bak
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add project.yml
+          git commit -m "chore: next preview build ${NEXT} [skip ci]"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Следующая превью-сборка: $(grep -m1 'WSB_VERSION:' project.yml | sed -E 's/.*"([^"]+)".*/\1/').$NEXT"
+        shell: bash
+
+      # Пушим bump СРАЗУ, пока HEAD ещё на main: следующий шаг уводит HEAD
+      # в gh-pages, и пушить bump оттуда уже нельзя. [skip ci] + actor=bot
+      # не дают рекурсии (пуш от GITHUB_TOKEN не триггерит workflow).
+      - name: Push next build number
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -e
+          # concurrency: ХА сериализует сборки, поэтому гонки почти нет;
+          # на всякий случай один rebase-retry, если main ушёл вперёд.
+          if ! git push origin HEAD:refs/heads/main; then
+            git fetch origin main
+            git rebase origin/main
+            git push origin HEAD:refs/heads/main
+          fi
+          echo "project.yml: WSB_BUILD=${{ steps.bump.outputs.next }}"
+        shell: bash
+
+      # GBox-источник: IPA + манифест (AltStore-формат) в gh-pages.
       - name: Publish to gh-pages
         run: |
           set -e
@@ -122,7 +174,7 @@ jobs:
                 "developerName": "l1ratch",
                 "version": "$VERSION",
                 "versionDate": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-                "versionDescription": "build $VER",
+                "versionDescription": "preview build $VER",
                 "size": $SIZE,
                 "downloadURL": "https://l1ratch.github.io/WSBridge-iOS/wsb.ipa",
                 "localizedDescription": "IP-over-WebSocket relay для iOS. Неподписанный IPA — GBox подпишет при установке."
@@ -138,19 +190,27 @@ jobs:
           cp /tmp/wsb.ipa wsb.ipa
           cp /tmp/source.json source.json
           git add -f wsb.ipa source.json
-          git commit -m "publish build $VER" || echo "no changes"
+          git commit -m "publish preview $VERSION" || echo "no changes"
           git push -f origin gh-pages
+        shell: bash
 
-      # Каждый пуш в main обновляет prerelease "preview" с последним IPA.
-      # Стабильные релизы — через теги v* (release.yml).
-      - name: Update preview release
+      # ОДИН И ТОТ ЖЕ prerelease «preview»: обновляем in-place,
+      # а не удаляем/пересоздаём. Ассет заменяется через --clobber.
+      - name: Update preview release (in place)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete preview --yes 2>/dev/null || true
-          git push origin :refs/tags/preview 2>/dev/null || true
-          gh release create preview \
-            /tmp/preview.ipa \
-            --title "Preview (latest main)" \
-            --notes "Дев-сборка с последнего пуша в main. Для стабильных версий — Releases." \
-            --prerelease
+          set -e
+          VERSION="${{ steps.ver.outputs.version }}"
+          BUILD="${{ steps.ver.outputs.build }}"
+          NOTES="Превью-сборка $VERSION (build $BUILD) с последнего пуша в main. Стабильные релизы публикуются только по тегу vX.Y.N."
+          if gh release view preview >/dev/null 2>&1; then
+            gh release edit preview --title "Preview $VERSION" --notes "$NOTES"
+            gh release upload preview /tmp/preview.ipa --clobber
+          else
+            gh release create preview /tmp/preview.ipa \
+              --title "Preview $VERSION" \
+              --notes "$NOTES" \
+              --prerelease
+          fi
+        shell: bash
