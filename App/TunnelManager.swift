@@ -33,6 +33,17 @@ private final class JournalReader {
         }
     }
 
+    /// Отмена ридера, который ещё висит на таймауте/коннекте. Зовётся
+    /// перед созданием нового, чтобы старый не перетёр journalText и
+    /// статическую ссылку. onDone НЕ дёргаем — он обнулил бы нового.
+    func cancel() {
+        if finished { return }
+        finished = true
+        conn?.cancel()
+        conn = nil
+        onDone = nil
+    }
+
     private func readMore() {
         conn?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
@@ -1178,11 +1189,18 @@ final class TunnelManager: ObservableObject {
         // держит там NWListener (JournalServer). Loopback в туннель не попадает,
         // песочницы сокетам между процессами не мешают.
         journalText = "журнал: читаю…"
+        // Отменяем ПРЕДЫДУЩИЙ ридер: noteActive() дергается на каждом
+        // возврате в foreground, и без cancel() старый 5-секундный таймаут
+        // обнулял currentReader уже НОВОГО ридера — журнал зависал на
+        // «читаю…», а пачка Tasks подвешивала кнопку туннеля.
+        Self.currentReader?.cancel()
         let reader = JournalReader { [weak self] text in
             Task { @MainActor in self?.journalText = text }
         }
         Self.currentReader = reader
-        reader.run { Self.currentReader = nil }
+        reader.run { [weak reader] in
+            if Self.currentReader === reader { Self.currentReader = nil }
+        }
     }
 
     // MARK: - Глобальная статистика по дням
