@@ -65,6 +65,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         settings.ipv4Settings = ipv4
         // IPv6 НЕ анонсируем: lwIP у нас v4-only, анонсированный v6-маршрут
         // был чёрной дырой — Telegram ломился в v6 DC и висел до таймаута.
+        // НЕ экспериментируем с ipv6Settings: в v13 без него сайты работали,
+        // а любое изменение здесь рискует снова уронить весь интернет.
         settings.mtu = 1500
 
         let proto = protocolConfiguration as? NETunnelProviderProtocol
@@ -90,9 +92,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // даже если в UserDefaults телефона осталось старое значение.
         self.dnsProbeMode = probeMode == "default" ? "split" : probeMode
         var routes = TelegramDCs.includedRoutes
-        if localDNSEnabled {
-            routes.append(NEIPv4Route(destinationAddress: "198.18.0.3", subnetMask: "255.255.255.255"))
-        }
+        // Маршрут /32 на 198.18.0.3 больше НЕ нужен: dnsSettings снят,
+        // локальный резолвер не перехватывает системный DNS.
         if !proxyDomains.isEmpty, !proxyURLs.isEmpty {
             routes.append(NEIPv4Route(destinationAddress: "198.18.1.0", subnetMask: "255.255.255.0"))
         }
@@ -121,21 +122,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if !excluded.isEmpty { ipv4.excludedRoutes = excluded }
         ipv4.includedRoutes = routes
         if localDNSEnabled {
-            // matchDomains=[""] ОБЯЗАТЕЛЕН: без него iOS игнорирует наш
-            // dnsSettings и шлёт DNS на резолвер физической сети — в логе
-            // это udp53=0, FakeIP не выдаётся, Gemini уходит мимо прокси
-            // (в т.ч. по IPv6, который наш v4-only туннель не видит вовсе).
+            // НЕ объявляем dnsSettings ВООБЩЕ.
             //
-            // Побочные эффекты прошлой попытки (все сайты мёртвые) были НЕ
-            // от matchDomains, а от форварда посторонних имён на 1.1.1.1/DoH.
-            // Сейчас LocalDNSResolver резолвит их системным getaddrinfo,
-            // поэтому обычный интернет не ломается.
-            let local = NEDNSSettings(servers: ["198.18.0.3"])
-            local.matchDomains = [""]
-            local.matchDomainsNoSearch = true
-            settings.dnsSettings = local
-            NSLog("[WSBridge] DNS: local resolver (rewrites), matchDomains=all probe=%@", self.dnsProbeMode)
-            EventLog.append("cfg:dns=matchall probe=\(self.dnsProbeMode) snicidrs=\(resolvedCIDRs.count)")
+            // Проверено на устройстве (журнал 01:21…01:27): при matchDomains
+            // iOS считает 198.18.0.3 резолвером для ВСЕХ имён, но UDP:53
+            // обрабатывается mDNSResponder'ом выше tun — ответа нет, и все
+            // сайты «умирают». Без dnsSettings система резолвит сама (v13),
+            // интернет жив; маршрутизация идёт ТОЛЬКО по SNI на реальных IP.
+            //
+            // LocalDNSResolver и FakeIP оставляем как запасной путь: если
+            // на каком-то устройстве UDP:53 всё же доезжает — он сработает.
+            settings.dnsSettings = nil
+            NSLog("[WSBridge] DNS: system resolver, routing by SNI only, probe=%@", self.dnsProbeMode)
+            EventLog.append("cfg:dns=system sni_only cidrs=\(resolvedCIDRs.count) proxy=\(proxyEndpoint != nil ? 1 : 0)")
         } else if let dnsList, !dnsList.isEmpty {
             if let dotHost, !dotHost.isEmpty {
                 // Приоритет 1: DNS-over-TLS. Коннект напрямую к IP:853 с SNI —
