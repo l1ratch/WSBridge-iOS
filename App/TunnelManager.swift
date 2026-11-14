@@ -529,9 +529,11 @@ final class TunnelManager: ObservableObject {
 
     // MARK: - Диагностика DNS (страница «Тест DNS»)
 
-    /// Как объявлять резолвер системе. Три варианта одной гипотезы:
-    /// split (как сейчас), matchall (+matchDomains), default (0/0 маршрут).
-    /// nil = диагностика выключена, работает обычная логика.
+    /// Диагностический режим для страницы «Тест DNS». Оба варианта работают
+    /// ОДИНАКОВО по сети и отличаются только пометкой в журнале.
+    /// Раньше здесь был режим "default" (0.0.0.0/0) — он забирал весь
+    /// трафик, убивал сайты, loopback-журнал и слал ложные уведомления.
+    /// Удалён: рабочая конфигурация всегда узкая.
     @Published var dnsProbeMode: String? = UserDefaults.standard.string(forKey: "dnsProbeMode") {
         didSet { UserDefaults.standard.set(dnsProbeMode, forKey: "dnsProbeMode") }
     }
@@ -544,12 +546,10 @@ final class TunnelManager: ObservableObject {
     }
 
     static let dnsProbeTitles: [DNSProbeModeInfo] = [
-        DNSProbeModeInfo(id: "split", title: "Split (как сейчас)",
-         detail: "Узкие маршруты Telegram + /32 на адрес резолвера. Базлайн: проверяем, приходят ли DNS-пакеты в туннель."),
-        DNSProbeModeInfo(id: "matchall", title: "Split + matchDomains",
-         detail: "То же, но резолвер объявлен для всех имён (matchDomains = [\"\"]). Гипотеза: без этого iOS игнорирует dnsSettings."),
-        DNSProbeModeInfo(id: "default", title: "Весь трафик (0.0.0.0/0)",
-         detail: "Туннель забирает всё. Если DNS появится только здесь — split его не отдаёт в принципе. Интернет на время теста не работает."),
+        DNSProbeModeInfo(id: "split", title: "Обычный (рекомендуется)",
+         detail: "Узкие маршруты: Telegram + прокси-домены + CDN. Остальной трафик идёт мимо туннеля. DNS перехватывается маршрутом /32."),
+        DNSProbeModeInfo(id: "matchall", title: "Обычный + расширенный журнал",
+         detail: "То же самое по сети, отличается только пометка в журнале. Ничего не ломает."),
     ]
 
     /// Кеш контента выбранного списка (текст hosts-файла).

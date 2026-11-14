@@ -221,12 +221,19 @@ final class LocalDNSResolver {
         let qclass = (Int(question[question.count - 2]) << 8)
                    | Int(question[question.count - 1])
 
-        // КРИТИЧНО для нативных iOS-приложений (ChatGPT, Claude, Gemini):
-        // AAAA (28), SVCB (64) и HTTPS (65) для проксируемых имён отвечаем
-        // ПУСТЫМ NOERROR, не форвардим. Иначе upstream приносит HTTPS RR
-        // с ipv4hint/ipv6hint (реальные IP Cloudflare) и NWConnection идёт
-        // мимо FakeIP напрямую — ровно «браузер работает, приложение нет».
-        // Пустой NOERROR заставляет стек откатиться на классическую A-запись.
+        // КРИТИЧНО: AAAA (28), SVCB (64) и HTTPS (65) отвечаем ПУСТЫМ
+        // NOERROR для ЛЮБОГО имени, не только проксируемого.
+        //
+        // Почему для любого: matchDomains=[""] направляет в туннель ВСЕ
+        // DNS-запросы телефона. Если такой запрос уйдёт на upstream, он
+        // принесёт HTTPS RR с ipv4hint/ipv6hint (реальные IP Cloudflare)
+        // — и нативное приложение уйдёт мимо FakeIP напрямую. Плюс
+        // 1.1.1.1/DoH в РФ часто тормозит: «некоторые сайты тупят» было
+        // именно от форварда посторонних имён на недоступный резолвер.
+        //
+        // Пустой NOERROR заставляет стек откатиться на классическую A.
+        // Для НЕ-проксируемых имён A всё равно уходит на системный/upstream
+        // резолвер ниже — нормальный интернет не ломается.
         if qtype == 28 || qtype == 64 || qtype == 65 {
             reply(packet: packet, question: question, answer: Data(), rcode: 0)
             statRewritten += 1
@@ -334,67 +341,46 @@ final class LocalDNSResolver {
     // MARK: - Форвард
 
     /// Пересылает вопрос на upstream (UDP:53) или системный резолвер.
+    ///
+    /// ВАЖНО: matchDomains=[""] направляет в туннель ВСЕ DNS-запросы
+    /// телефона. Если гнать их все на настроенный 1.1.1.1/DoH, в РФ
+    /// посторонние сайты «тупят» или не открываются вовсе. Поэтому для
+    /// НЕ-проксируемых имён сначала пробуем системный getaddrinfo (быстро,
+    /// через физическую сеть), и только при неудаче — внешний upstream.
     private func forward(question: Data, originalPacket: Data, name: String) {
-        if upstreams.isEmpty {
-            guard systemFallbackEnabled else {
-                // Режим 0/0: системный резолвер — мы сами, откат замкнул
-                // бы петлю. Отвечаем SERVFAIL сразу.
-                reply(packet: originalPacket, question: question,
-                      answer: Data(), rcode: 2)
-                statFailed += 1
-                return
-            }
-            // Системный upstream: пересылаем на res_query — система
-            // использует свой DNS-путь, туннель его не маршрутизирует.
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self else { return }
-                guard let answer = Self.systemQuery(question) else {
-                    self.reply(packet: originalPacket, question: question,
-                               answer: Data(), rcode: 2)  // SERVFAIL
-                    self.statFailed += 1
-                    return
-                }
-                self.replyFromUpstream(answer, question: question,
-                                       original: originalPacket)
-            }
-            return
-        }
-        // Конкретный upstream: транспорт по конфигурации (DoT/DoH/UDP).
+        let useSystemFirst = systemFallbackEnabled
         let servers = upstreams
         let doT = upstreamDoTHost
         let doH = upstreamDoHURL
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            // DoH: POST к URL, тело — wireformat-запрос.
+
+        func tryExternal() -> Data? {
             if let doH {
-                if let answer = Self.doHQuery(question, url: doH) {
-                    self.replyFromUpstream(answer, question: question,
-                                           original: originalPacket)
-                    return
-                }
+                if let answer = Self.doHQuery(question, url: doH) { return answer }
             } else if let doT {
-                // DoT: TLS к IP:853 с SNI; фрейминг — 2-байтовый length
-                // prefix (RFC 7858). Failover по IP.
                 for server in servers {
-                    if let answer = Self.doTQuery(question, server: server, sni: doT) {
-                        self.replyFromUpstream(answer, question: question,
-                                               original: originalPacket)
-                        return
-                    }
+                    if let answer = Self.doTQuery(question, server: server, sni: doT) { return answer }
                 }
             } else {
-                // UDP: сырой :53. Failover по списку.
                 for server in servers {
-                    if let answer = Self.udpQuery(question, server: server) {
-                        self.replyFromUpstream(answer, question: question,
-                                               original: originalPacket)
-                        return
-                    }
+                    if let answer = Self.udpQuery(question, server: server) { return answer }
                 }
             }
-            self.reply(packet: originalPacket, question: question,
-                       answer: Data(), rcode: 2)  // SERVFAIL
-            self.statFailed += 1
+            return nil
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            var answer: Data?
+            if useSystemFirst { answer = Self.systemQuery(question) }
+            if answer == nil { answer = tryExternal() }
+            guard let answer else {
+                self.reply(packet: originalPacket, question: question,
+                           answer: Data(), rcode: 2)  // SERVFAIL
+                self.statFailed += 1
+                return
+            }
+            self.replyFromUpstream(answer, question: question,
+                                   original: originalPacket)
         }
     }
 

@@ -21,14 +21,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// в packetFlow (обходя lwIP — UDP в стеке выключен). Создаётся в
     /// startTunnel: колбэк writePacket требует self.
     private var localDNS: LocalDNSResolver?
-    /// Диагностический режим DNS-конфигурации (страница «Тест DNS»):
-    ///   split    — базлайн: узкие маршруты + dnsSettings на 198.18.0.3;
-    ///   matchall — то же + matchDomains=[""] (резолвер объявлен для всех);
-    ///   default  — includedRoutes 0/0: проверяем, применится ли dnsSettings,
-    ///              когда туннель забирает весь трафик.
-    /// Рабочий режим по умолчанию — "matchall": split оставляем только
-    /// для страницы «Тест DNS» (сравнить, доходят ли пакеты без matchDomains).
-    private var dnsProbeMode: String = "matchall"
+    /// Режим остался только для диагностики в журнале ("split"/"matchall").
+    /// "default" (0.0.0.0/0) ОТКЛЮЧЁН: он забирал весь трафик, а readLoop
+    /// его ронял — сайты умирали, loopback-журнал пропадал, NWPathMonitor
+    /// слал ложные «смена сети». Рабочая конфигурация всегда узкая.
+    private var dnsProbeMode: String = "split"
     /// Счётчики диагностики перехвата. Пишутся только на lwipQueue.
     private var statUDP53: UInt64 = 0
     private var statUDPOther: UInt64 = 0
@@ -57,7 +54,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     // включен (приложение в фоне усыплено и NWPathMonitor там молчит).
     private var pathMonitor: NWPathMonitor?
     private var lastPathSig: String?
-    private var lastNetNotifAt = Date.distantPast
 
     override func startTunnel(
         options: [String: NSObject]?,
@@ -89,8 +85,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let proxyURLs = (proto?.providerConfiguration?["proxies"] as? [String]) ?? []
         // Диагностика (страница «Тест DNS»): какой из трёх вариантов
         // объявления резолвера проверяем в этом запуске.
-        let probeMode = (proto?.providerConfiguration?["dnsProbe"] as? String) ?? "matchall"
-        self.dnsProbeMode = probeMode
+        let probeMode = (proto?.providerConfiguration?["dnsProbe"] as? String) ?? "split"
+        // "default" больше не поддерживается: принудительно сужаем до split,
+        // даже если в UserDefaults телефона осталось старое значение.
+        self.dnsProbeMode = probeMode == "default" ? "split" : probeMode
         var routes = TelegramDCs.includedRoutes
         if localDNSEnabled {
             routes.append(NEIPv4Route(destinationAddress: "198.18.0.3", subnetMask: "255.255.255.255"))
@@ -121,41 +119,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         if !excluded.isEmpty { ipv4.excludedRoutes = excluded }
-        if probeMode == "default" {
-            // Единственный способ проверить, применяется ли dnsSettings
-            // вообще: забрать весь трафик. Интернет на время теста
-            // перестаёт работать — это ожидаемо, тест короткий.
-            routes.append(NEIPv4Route(destinationAddress: "0.0.0.0", subnetMask: "0.0.0.0"))
-            // Исключения обязательны: иначе собственный DoT/DoH-запрос
-            // резолвера к upstream'у тоже уедет в туннель, lwIP его
-            // терминирует и отправит в worker — резолвер не получит
-            // ответа никогда, и тест покажет ложный ноль.
-            var excluded = ipv4.excludedRoutes ?? []
-            let upstreamIPs = (proto?.providerConfiguration?["localDNSUpstream"] as? [String]) ?? []
-            for ip in upstreamIPs where IPv4Addr.parse(ip) != nil {
-                excluded.append(NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255"))
-            }
-            // Локальная сеть: шлюз и служебные адреса — иначе тест рвёт
-            // связь с роутером и Wi-Fi начинает «переподключаться».
-            excluded.append(NEIPv4Route(destinationAddress: "192.168.0.0", subnetMask: "255.255.0.0"))
-            excluded.append(NEIPv4Route(destinationAddress: "10.0.0.0", subnetMask: "255.0.0.0"))
-            excluded.append(NEIPv4Route(destinationAddress: "172.16.0.0", subnetMask: "255.240.0.0"))
-            ipv4.excludedRoutes = excluded
-        }
         ipv4.includedRoutes = routes
         if localDNSEnabled {
+            // matchDomains=[""] ОБЯЗАТЕЛЕН: без него iOS игнорирует наш
+            // dnsSettings и шлёт DNS на резолвер физической сети — в логе
+            // это udp53=0, FakeIP не выдаётся, Gemini уходит мимо прокси
+            // (в т.ч. по IPv6, который наш v4-only туннель не видит вовсе).
+            //
+            // Побочные эффекты прошлой попытки (все сайты мёртвые) были НЕ
+            // от matchDomains, а от форварда посторонних имён на 1.1.1.1/DoH.
+            // Сейчас LocalDNSResolver резолвит их системным getaddrinfo,
+            // поэтому обычный интернет не ломается.
             let local = NEDNSSettings(servers: ["198.18.0.3"])
-            // Резолвер объявлен для ВСЕХ имён. Без matchDomains в split-
-            // режиме iOS часто продолжает спрашивать DNS физической сети —
-            // тогда FakeIP не выдаётся и приложение уходит мимо прокси
-            // (ровно «браузер работает, ChatGPT нет»). Диагностический
-            // режим «split» оставляем для сравнения в «Тест DNS».
-            if probeMode != "split" {
-                local.matchDomains = [""]
-                local.matchDomainsNoSearch = true
-            }
+            local.matchDomains = [""]
+            local.matchDomainsNoSearch = true
             settings.dnsSettings = local
-            NSLog("[WSBridge] DNS: local resolver (rewrites), probe=%@ matchall=%@", probeMode, probeMode != "split" ? "yes" : "no")
+            NSLog("[WSBridge] DNS: local resolver (rewrites), matchDomains=all probe=%@", self.dnsProbeMode)
+            EventLog.append("cfg:dns=matchall probe=\(self.dnsProbeMode) snicidrs=\(resolvedCIDRs.count)")
         } else if let dnsList, !dnsList.isEmpty {
             if let dotHost, !dotHost.isEmpty {
                 // Приоритет 1: DNS-over-TLS. Коннект напрямую к IP:853 с SNI —
@@ -236,8 +216,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let proxyEndpoint = proxyURLs.compactMap { ProxyEndpoint.parse($0) }.first
                 resolver.configure(hostsText: hosts, upstreams: upstreams,
                                    doT: doT, doHURL: doH,
-                                   proxyDomains: proxyDomains,
-                                   systemFallback: self?.dnsProbeMode != "default")
+                                   proxyDomains: proxyDomains)
                 let transport = doT != nil ? "dot" : (doH != nil ? "doh" : "udp")
                 EventLog.append("cfg:localdns=on rules=\(resolver.rewriteCount) upstream=\(upstreams.first ?? "system"):\(transport)")
                 if let pe = proxyEndpoint {
@@ -326,8 +305,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func handleAccept(connId: UInt32, dcIP: UInt32) {
-        NSLog("[WSBridge] accept conn \(connId) dc=\(dcIP)")
+        let dotted = "\(Int((dcIP >> 24) & 255)).\(Int((dcIP >> 16) & 255)).\(Int((dcIP >> 8) & 255)).\(Int(dcIP & 255))"
+        NSLog("[WSBridge] accept conn \(connId) dc=\(dcIP) (\(dotted)) port=\(lwip.dstPort(connId: connId))")
         postDarwinEvent("accept")
+        EventLog.append("accept:c\(connId):\(dotted):p\(lwip.dstPort(connId: connId)):sni=\(isSNIInterceptCandidate(dcIP) ? 1 : 0):cidrs=\(sniCIDRs.count)")
         let dstPort = lwip.dstPort(connId: connId)
         // Прокси-домен: dst в 198.18.1.0/24 → домен из fake-IP-мапы
         // LRDNS, соединение через SOCKS5/HTTP-прокси.
@@ -438,17 +419,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         }
                         continue
                     }
-                    // Режим 0/0 забирает в туннель весь TCP устройства.
-                    // В lwIP его пускать нельзя: стек терминирует всё
-                    // подряд и упрётся в лимит PCB за секунды. Тесту
-                    // нужен только DNS, поэтому посторонний TCP режем.
-                    if self.dnsProbeMode == "default" {
-                        let dst = "\(packet[16]).\(packet[17]).\(packet[18]).\(packet[19])"
-                        if !Self.isTunnelOwned(dst) {
-                            EventLog.inOther += 1
-                            continue
-                        }
-                    }
                     self.packetCount += 1
                     self.byteCount += UInt64(packet.count)
                     self.lwip.input(packet)
@@ -529,23 +499,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return false
     }
 
-    /// Принадлежит ли адрес тому, что туннель умеет обслуживать:
-    /// диапазоны Telegram, fake-IP прокси-доменов и адрес резолвера.
-    /// Нужно только диагностическому режиму 0/0, чтобы не топить
-    /// посторонний TCP в lwIP.
-    private static func isTunnelOwned(_ dotted: String) -> Bool {
-        guard let v = IPv4Addr.parse(dotted) else { return false }
-        let o1 = (v >> 24) & 0xFF
-        let o2 = (v >> 16) & 0xFF
-        let o3 = (v >> 8) & 0xFF
-        if o1 == 149, o2 == 154 { return true }          // 149.154.0.0/16
-        if o1 == 91, o2 == 108 { return true }            // 91.108.0.0/16
-        if o1 == 91, o2 == 105, o3 == 192 { return true } // 91.105.192.0/24
-        if o1 == 198, o2 == 18, o3 == 1 { return true }   // fake-IP прокси
-        if o1 == 198, o2 == 18, o3 == 0 { return true }   // адреса резолвера
-        return false
-    }
-
     private func postDarwinEvent(_ name: String) {
         let cfName = "com.l1ratch.WSBridge.\(name)" as CFString
         CFNotificationCenterPostNotification(
@@ -608,10 +561,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// путь здесь (процесс жив, пока туннель включен) и nudg'им пользователя
     /// локальным уведомлением. Троттлинг 5 мин: флэпы Wi-Fi не спамлят.
     private func startPathMonitor() {
+        // Уведомления о смене сети отключены полностью. Причина: при
+        // включении/выключении ТУННЕЛЯ NWPathMonitor видит появление/
+        // исчезновение собственного utun (тип .other) и считает это
+        // «сменой сети» — пользователь получал ложный нудж на каждом
+        // старте/стопе, а статус-кнопка в приложении рассинхронизировалась.
+        // Оставляем монитор только для строки net_change в журнале.
         let m = NWPathMonitor()
         m.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
+            // Берём ТОЛЬКО физические интерфейсы: utun/loopback игнорируем.
             let ifaces = path.availableInterfaces
+                .filter { $0.type == .wifi || $0.type == .cellular || $0.type == .wiredEthernet }
                 .map { Self.ifaceName($0.type) }
                 .sorted()
                 .joined(separator: "+")
@@ -619,18 +580,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             defer { self.lastPathSig = sig }
             guard let prev = self.lastPathSig, prev != sig else { return }
             EventLog.append("net_change:\(prev)->\(sig)")
-            guard path.status == .satisfied else { return }
-            guard Date().timeIntervalSince(self.lastNetNotifAt) > 300 else { return }
-            self.lastNetNotifAt = Date()
-            let c = UNMutableNotificationContent()
-            c.title = "Сеть сменилась"
-            c.body = "Телефон переподключился к другой сети. Если интернет тормозит — перезапусти туннель в WSBridge."
-            let req = UNNotificationRequest(
-                identifier: "wsbridge.netChange", content: c,
-                trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false))
-            UNUserNotificationCenter.current().add(req) { err in
-                EventLog.append("notif_net:\(err?.localizedDescription ?? "ok")")
-            }
         }
         m.start(queue: DispatchQueue(label: "com.l1ratch.WSBridge.pathmon"))
         pathMonitor = m

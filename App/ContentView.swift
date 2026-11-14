@@ -659,8 +659,8 @@ struct DNSProbeView: View {
         tunnel.status == .connected || tunnel.status == .connecting || tunnel.status == .reasserting
     }
 
-    /// nil и "matchall" для UI — одно и то же: рабочий режим по умолчанию.
-    private var currentMode: String { tunnel.dnsProbeMode ?? "matchall" }
+    /// nil и "split" для UI — одно и то же: рабочий режим по умолчанию.
+    private var currentMode: String { tunnel.dnsProbeMode ?? "split" }
 
     var body: some View {
         Form {
