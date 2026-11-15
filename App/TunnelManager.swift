@@ -3,6 +3,7 @@ import Network
 import NetworkExtension
 import UserNotifications
 import ActivityKit
+import UIKit
 
 /// Читает журнал расширения loopback TCP (127.0.0.1:51001, JournalServer).
 /// Nonisolated: колбэки NWConnection приходят с произвольных потоков.
@@ -536,6 +537,119 @@ final class TunnelManager: ObservableObject {
     /// через прокси (прокси в настройках остаются, но не используются).
     @Published var proxyDomainsEnabled: Bool = UserDefaults.standard.object(forKey: "proxyDomainsEnabled") as? Bool ?? false {
         didSet { UserDefaults.standard.set(proxyDomainsEnabled, forKey: "proxyDomainsEnabled") }
+    }
+
+    // MARK: - Этап 2: проверка DoH-воркера (минимальная конфигурация)
+    //
+    // Полноценный UI (блок «Воркер», нередактируемое поле ID, кнопка
+    // «Копировать», «Тест воркера», инструкция) — этап 3. Здесь только
+    // то, что нужно, чтобы проверить на живом iPhone главный риск:
+    // доходит ли path /dns-query/<ID> и применяется ли matchDomains.
+
+    /// Результат ручной проверки воркера (кнопка «Тест воркера» этапа 2).
+    @Published var dohWorkerTestMessage: String?
+
+    /// Проверяет /diagnose воркера обычным URLSession (НЕ системным DoH).
+    /// Пишет, что воркер распознал, и его ошибки — чтобы до включения
+    /// туннеля убедиться, что код задеплоен и переменные заданы.
+    func testDoHWorker() async {
+        let host = dohWorkerHost
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "https://", with: "")
+            .replacingOccurrences(of: "http://", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !host.isEmpty else {
+            dohWorkerTestMessage = "Укажите адрес воркера"
+            return
+        }
+        guard let url = URL(string: "https://\(host)/diagnose") else {
+            dohWorkerTestMessage = "Невалидный адрес"
+            return
+        }
+        do {
+            let (data, resp) = try await URLSession.shared.data(from: url)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                dohWorkerTestMessage = "Воркер не ответил /diagnose"
+                return
+            }
+            let parsed = json["parsed"] as? [String: Any] ?? [:]
+            let config = json["config"] as? [String: Any] ?? [:]
+            let errors = json["errors"] as? [[String: Any]] ?? []
+            let mode = parsed["mode"] as? String ?? "?"
+            let fake = config["fakeIp"] as? String ?? "?"
+            let codes = errors.compactMap { $0["code"] as? String }.joined(separator: ", ")
+            dohWorkerTestMessage = "OK · mode=\(mode) · fakeIp=\(fake)" +
+                (codes.isEmpty ? "" : " · \(codes)")
+        } catch {
+            dohWorkerTestMessage = "Ошибка: \(error.localizedDescription)"
+        }
+    }
+
+    /// Голый адрес воркера. Дефолт — рабочий воркер для этапа 2; в этапе 3
+    /// станет редактируемым полем блока «Воркер». Пустая строка = тест
+    /// выключен, приложение работает ровно как до этапа 2.
+    @Published var dohWorkerHost: String = UserDefaults.standard.string(forKey: "dohWorkerHost")
+        ?? "spring-pond-b6cc.sm171105.workers.dev" {
+        didSet { UserDefaults.standard.set(dohWorkerHost, forKey: "dohWorkerHost") }
+    }
+
+    /// ID устройства = identifierForVendor. Стабилен между запусками,
+    /// меняется при удалении всех приложений этого вендора. НЕ редактируется
+    /// в UI (этап 3), здесь computed.
+    var deviceID: String { UIDevice.current.identifierForVendor?.uuidString ?? "unknown" }
+
+    /// Точные домены для matchDomains. Этап 2: жёстко заданный минимальный
+    /// набор для проверки (этап 3 заменит на загрузку из включённых .lst).
+    /// НИКАКОЙ агрегации до eTLD+1 — только точные имена.
+    static let stage2MatchDomains: [String] = [
+        "gemini.google.com",
+        "generativelanguage.googleapis.com",
+        "api.openai.com",
+        "chatgpt.com",
+    ]
+
+    /// URL системного DoH для этапа 2. Путь только с ID, без сегмента
+    /// списков: воркер работает в MODE="simple".
+    var dohEndpointURL: URL? {
+        let host = dohWorkerHost
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "https://", with: "")
+            .replacingOccurrences(of: "http://", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !host.isEmpty else { return nil }
+        return URL(string: "https://\(host)/dns-query/\(deviceID)")
+    }
+
+    /// IPv4-адреса хоста через getaddrinfo. Вызывается в Main App ДО
+    /// старта туннеля (RFC 8484 §10 forbids bootstrapping the DoH server
+    /// through itself). Пустой массив → расширение оставит `servers`
+    /// пустым и залогирует ошибку, но не уронит туннель.
+    static func resolveIPv4(_ host: String) -> [String] {
+        guard !host.isEmpty else { return [] }
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_STREAM
+        var res: UnsafeMutablePointer<addrinfo>?
+        guard host.withCString({ getaddrinfo($0, nil, &hints, &res) }) == 0,
+              let res else { return [] }
+        defer { freeaddrinfo(res) }
+        var out: [String] = []
+        var cur = res
+        while let ai = cur {
+            if ai.pointee.ai_family == AF_INET, let sa = ai.pointee.ai_addr {
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                    var addr = sin.pointee.sin_addr
+                    if inet_ntop(AF_INET, &addr, &buf, socklen_t(buf.count)) != nil {
+                        let ip = String(cString: buf)
+                        if !out.contains(ip) { out.append(ip) }
+                    }
+                }
+            }
+            cur = ai.pointee.ai_next
+        }
+        return out
     }
 
     // MARK: - Диагностика DNS (страница «Тест DNS»)
@@ -1711,6 +1825,21 @@ final class TunnelManager: ObservableObject {
             case nil:
                 break // ни DoT, ни DoH — plain :53
             }
+        }
+        // ── Этап 2: DoH-воркер (Вариант Б) ──────────────────────────
+        // Включается ТОЛЬКО если задан адрес воркера. Иначе приложение
+        // работает ровно как раньше (системный DNS / обычный выборщик).
+        // Это позволяет выключить тест одним удалением адреса, не пересобирая.
+        if let url = dohEndpointURL {
+            config["dohWorkerURL"] = url.absoluteString as NSString
+            config["dohMatchDomains"] = Self.stage2MatchDomains as NSArray
+            // RFC 8484 §10: IP воркера резолвим ДО включения туннеля,
+            // чтобы не было петли «резолвим воркер через сам воркер».
+            let host = url.host ?? ""
+            let ips = Self.resolveIPv4(host)
+            config["dohWorkerIPs"] = ips as NSArray
+            NSLog("[WSBridge] stage2 DoH: url=%@ match=%d ips=%d",
+                  url.absoluteString, Self.stage2MatchDomains.count, ips.count)
         }
         proto.providerConfiguration = config.isEmpty ? nil : config
         m.protocolConfiguration = proto

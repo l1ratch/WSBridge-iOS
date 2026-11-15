@@ -85,6 +85,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // /32 уводит DNS-пакеты в packetFlow (см. LocalDNSResolver док).
         let proxyDomains = (proto?.providerConfiguration?["proxyDomains"] as? [String]) ?? []
         let proxyURLs = (proto?.providerConfiguration?["proxies"] as? [String]) ?? []
+        // ── Этап 2: DoH-воркер (Вариант Б) ──────────────────────────
+        // Приложение передаёт готовый serverURL, точные matchDomains и
+        // заранее резолвленные IP воркера. Включается ТОЛЬКО при наличии
+        // ключа — иначе всё работает как раньше.
+        let dohWorkerURL = (proto?.providerConfiguration?["dohWorkerURL"] as? String)
+            .flatMap { URL(string: $0) }
+        let dohMatchDomains = (proto?.providerConfiguration?["dohMatchDomains"] as? [String]) ?? []
+        let dohWorkerIPs = (proto?.providerConfiguration?["dohWorkerIPs"] as? [String]) ?? []
         // Диагностика (страница «Тест DNS»): какой из трёх вариантов
         // объявления резолвера проверяем в этом запуске.
         let probeMode = (proto?.providerConfiguration?["dnsProbe"] as? String) ?? "split"
@@ -119,9 +127,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                                             subnetMask: "255.255.255.255"))
             }
         }
+        // IP воркера выводим из туннеля: иначе системный DoH-коннект
+        // к нему уедет в utun и закольцуется.
+        for ipStr in dohWorkerIPs where IPv4Addr.parse(ipStr) != nil {
+            excluded.append(NEIPv4Route(destinationAddress: ipStr,
+                                        subnetMask: "255.255.255.255"))
+        }
         if !excluded.isEmpty { ipv4.excludedRoutes = excluded }
         ipv4.includedRoutes = routes
-        if localDNSEnabled {
+        if let dohWorkerURL {
+            // ── Вариант Б: NEDNSOverHTTPSSettings + matchDomains ──────
+            // Весь остальной DNS резолвится системой (обычный выборщик).
+            // Воркер видит ТОЛЬКО точные домены из matchDomains.
+            // НЕ используем [""] — он в 0.3.14 убивал сайты.
+            let doh = NEDNSOverHTTPSSettings(servers: dohWorkerIPs)
+            doh.serverURL = dohWorkerURL
+            doh.matchDomains = dohMatchDomains
+            doh.matchDomainsNoSearch = true
+            settings.dnsSettings = doh
+            NSLog("[WSBridge] DNS: DoH worker %@ match=%d ips=%d",
+                  dohWorkerURL.absoluteString, dohMatchDomains.count, dohWorkerIPs.count)
+            EventLog.append("cfg:doh=worker match=\(dohMatchDomains.count) ips=\(dohWorkerIPs.count) url=\(dohWorkerURL.absoluteString)")
+        } else if localDNSEnabled {
             // НЕ объявляем dnsSettings ВООБЩЕ.
             //
             // Проверено на устройстве (журнал 01:21…01:27): при matchDomains

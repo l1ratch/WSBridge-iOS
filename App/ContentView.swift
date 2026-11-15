@@ -664,6 +664,42 @@ struct DNSProbeView: View {
 
     var body: some View {
         Form {
+            // ── Этап 2: минимальная проверка DoH-воркера ──────────────
+            // Полноценный блок «Воркер» (с инструкцией, тестом, Edit) —
+            // этап 3. Здесь ровно то, что нужно для проверки path/matchDomains.
+            Section("DoH-воркер (этап 2)") {
+                TextField("spring-pond-b6cc.sm171105.workers.dev", text: $tunnel.dohWorkerHost)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                    .font(.callout.monospaced())
+                    .disabled(tunnelUp)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("ID устройства").font(.caption).foregroundStyle(.secondary)
+                    Text(tunnel.deviceID)
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                        .textSelection(.enabled)
+                }
+                Button {
+                    UIPasteboard.general.string = tunnel.deviceID
+                } label: {
+                    Label("Копировать ID", systemImage: "doc.on.doc")
+                }
+                Button {
+                    Task { await tunnel.testDoHWorker() }
+                } label: {
+                    Label("Тест воркера", systemImage: "bolt.horizontal")
+                }
+                .disabled(tunnel.dohWorkerHost.trimmingCharacters(in: .whitespaces).isEmpty)
+                if let msg = tunnel.dohWorkerTestMessage {
+                    Text(msg).font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Включите туннель и откройте gemini.google.com. В журнале должна появиться строка cfg:doh=worker, а в логах воркера — /dns-query/<ID>.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section {
                 Text("Проверяет один вопрос: применяет ли iOS объявленный резолвер, когда туннель забирает не весь трафик. Три режима — три гипотезы, по одному прогону на каждую.")
                     .font(.caption)
