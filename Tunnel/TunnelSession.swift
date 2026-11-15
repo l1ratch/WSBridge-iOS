@@ -51,7 +51,8 @@ class TunnelSession {
          proxyEndpoint: ProxyEndpoint? = nil,
          proxyDomainMatcher: ((String) -> Bool)? = nil,
          sniProxyEndpoint: ProxyEndpoint? = nil,
-         dstPort: UInt16 = 443) {
+         dstPort: UInt16 = 443,
+         sniProxyUnconditional: Bool = false) {
         self.connId = connId
         self.dcIP = dcIP
         self.workerDomain = workerDomain
@@ -61,14 +62,19 @@ class TunnelSession {
         self.proxyEndpoint = proxyEndpoint
         self.sniProxyEndpoint = sniProxyEndpoint
         self.dstPort = dstPort == 0 ? 443 : dstPort
+        self.sniProxyUnconditional = sniProxyUnconditional
         // FakeIP-сессия уже знает домен — SNI-парсер ей не нужен.
-        // Для real-IP сессий matcher != nil включает разбор ClientHello.
-        self.sniResolved = (proxyDomainMatcher == nil)
+        // Исключение: режим воркера (sniProxyUnconditional) — там SNI нужен,
+        // чтобы достать имя для CONNECT.
+        self.sniResolved = (proxyDomainMatcher == nil) && !sniProxyUnconditional
         self.sniMatcher = proxyDomainMatcher
     }
 
     /// nil = сессия не real-IP (FakeIP/Telegram) — SNI не парсим.
     private let sniMatcher: ((String) -> Bool)?
+    /// true = воркер уже отфильтровал домены через matchDomains: SNI нужен
+    /// только чтобы достать ИМЯ для CONNECT, проверять его не надо.
+    private let sniProxyUnconditional: Bool
 
     /// Данные от клиента (Telegram) через lwIP. Вызывается на lwipQueue.
     func handleData(_ data: Data) {
@@ -78,17 +84,21 @@ class TunnelSession {
             let head = data.prefix(96).map { String(format: "%02x", $0) }.joined()
             postEvent("uphead:c\(connId):\(data.count):\(head)")
         }
-        // SNI-фолбэк: сессия пришла на РЕАЛЬНЫЙ IP (приложение обошло наш
-        // DNS через свой DoH/DoT). Проверяем первый TCP-пакет: если это
-        // ClientHello с доменом из списка — уводим ВСЁ соединение в прокси.
+        // SNI-фолбэк. Два режима:
+        //  • sniMatcher != nil — real-IP, проверяем домен по спискам,
+        //    не подошёл → DIRECT;
+        //  • sniProxyUnconditional — метка от DoH-воркера: домены уже
+        //    отфильтрованы matchDomains, SNI нужен только как ИМЯ для
+        //    CONNECT, проверять нечего.
         // Буфер уходит следом, поэтому ClientHello не теряется.
-        if let matcher = sniMatcher, !sniResolved {
+        if !sniResolved, sniMatcher != nil || sniProxyUnconditional {
             sniPending.append(data)
             if let domain = TLSSNI.extract(from: sniPending) {
                 sniResolved = true
                 let buffered = sniPending
                 sniPending = Data()
-                if matcher(domain), let proxy = sniProxyEndpoint {
+                let match = sniProxyUnconditional || (sniMatcher?(domain) ?? false)
+                if match, let proxy = sniProxyEndpoint {
                     postEvent("sni_proxy:c\(connId):\(domain)")
                     startProxy(proxy: proxy, domain: domain, port: dstPort)
                     sendToProxy(buffered)
@@ -105,7 +115,14 @@ class TunnelSession {
             sniResolved = true
             let buffered = sniPending
             sniPending = Data()
-            startDirect(firstData: buffered)
+            if sniProxyUnconditional, let proxy = sniProxyEndpoint {
+                // SNI не распознан (не TLS / ECH) — всё равно пробуем в
+                // прокси по IP-метке, чтобы не ронять соединение молча.
+                startProxy(proxy: proxy, domain: IPv4Addr.dotted(dcIP), port: dstPort)
+                sendToProxy(buffered)
+            } else {
+                startDirect(firstData: buffered)
+            }
             return
         }
         // DIRECT-поток уже установлен — остальные байты идут туда же.

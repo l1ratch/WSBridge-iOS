@@ -42,6 +42,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var dcOverride: [String: String] = [:]
     /// Прокси для прокси-доменов (fake-IP 198.18.1.x): nil = нет прокси.
     private var proxyEndpoint: ProxyEndpoint?
+    /// При включённом DoH-воркере 198.18.1.x — не мапа, а метка: домен
+    /// достаём из TLS SNI, а не из localDNS.proxyDomain(forFakeIP:).
+    private var dohWorkerActive = false
     /// Матчер доменов для SNI-фолбэка (замыкание на LocalDNSResolver).
     private var proxyDomainMatcher: ((String) -> Bool)?
     /// CIDR, добавленные в includedRoutes для real-IP перехвата. По ним
@@ -135,6 +138,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if !excluded.isEmpty { ipv4.excludedRoutes = excluded }
         ipv4.includedRoutes = routes
         if let dohWorkerURL {
+            self.dohWorkerActive = true
             // ── Вариант Б: NEDNSOverHTTPSSettings + matchDomains ──────
             // Весь остальной DNS резолвится системой (обычный выборщик).
             // Воркер видит ТОЛЬКО точные домены из matchDomains.
@@ -335,6 +339,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         postDarwinEvent("accept")
         EventLog.append("accept:c\(connId):\(dotted):p\(lwip.dstPort(connId: connId)):sni=\(isSNIInterceptCandidate(dcIP) ? 1 : 0):cidrs=\(sniCIDRs.count)")
         let dstPort = lwip.dstPort(connId: connId)
+        // ── DoH-воркер: 198.18.1.x — МЕТКА, не мапа ─────────────────
+        // Воркер вернул один и тот же FakeIP на все домены из matchDomains.
+        // localDNS.proxyDomain(forFakeIP:) пуста (DNS в packetFlow не
+        // приходит), поэтому старый путь глух. Домен достаём из TLS SNI
+        // первого пакета и сразу идём в прокси по ИМЕНИ.
+        // Это и есть роутинг пакета (этап 4), сделанный минимально.
+        if dohWorkerActive, let proxy = proxyEndpoint,
+           (dcIP >> 24) == 198 && ((dcIP >> 16) & 0xFF) == 18 && ((dcIP >> 8) & 0xFF) == 1 {
+            EventLog.append("doh_proxy:conn\(connId):p\(dstPort)")
+            let session = TunnelSession(
+                connId: connId, dcIP: dcIP, workerDomain: nil,
+                dcOverride: [:], bridge: lwip, queue: lwipQueue,
+                proxyDomainMatcher: nil,       // не проверяем: воркер уже отфильтровал
+                sniProxyEndpoint: proxy,
+                dstPort: dstPort,
+                sniProxyUnconditional: true)
+            sessions[connId] = session
+            return
+        }
         // Прокси-домен: dst в 198.18.1.0/24 → домен из fake-IP-мапы
         // LRDNS, соединение через SOCKS5/HTTP-прокси.
         if let proxy = proxyEndpoint,
