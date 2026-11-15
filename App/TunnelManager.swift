@@ -1791,11 +1791,14 @@ final class TunnelManager: ObservableObject {
             // — лучший из пробитых.
             if proxyDomainsEnabled {
                 let domainList = await loadProxyDomains()
-                // Подсети CDN, где сидят ИИ-сервисы: реальный IP (когда
-                // приложение обошло FakeIP через свой DoH) всё равно
-                // попадёт в туннель, и SNI решит проксировать или нет.
-                // RAW-списки itdoginfo/allow-domains/Subnets/IPv4/*.lst.
-                config["sniCIDRs"] = Self.sniCIDRs as NSArray
+                // sniCIDRs НЕ передаём при включённом DoH-воркере: IP самого
+                // воркера (Cloudflare 104.21.x / 172.67.x) попадали в эти
+                // includedRoutes и системный DoH-коннект не устанавливался.
+                // По новой архитектуре для роутинга достаточно 198.18.1.0/24.
+                // CIDR оставляем только когда воркер выключен (старый путь).
+                if dohEndpointURL == nil {
+                    config["sniCIDRs"] = Self.sniCIDRs as NSArray
+                }
                 let activeProxy: String?
                 if selectedProxyIndex >= 0, selectedProxyIndex < proxyURLs.count {
                     activeProxy = proxyURLs[selectedProxyIndex]

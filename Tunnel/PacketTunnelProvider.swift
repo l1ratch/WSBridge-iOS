@@ -127,12 +127,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                                             subnetMask: "255.255.255.255"))
             }
         }
-        // IP воркера выводим из туннеля: иначе системный DoH-коннект
-        // к нему уедет в utun и закольцуется.
-        for ipStr in dohWorkerIPs where IPv4Addr.parse(ipStr) != nil {
-            excluded.append(NEIPv4Route(destinationAddress: ipStr,
-                                        subnetMask: "255.255.255.255"))
-        }
+        // IP воркера НЕ добавляем в excludedRoutes: системный DoH идёт
+        // мимо packetFlow (не через utun), а sniCIDRs при включённом
+        // воркере не передаются, так что пересечения маршрутов нет.
+        // Лишний excluded /32 на адрес самого резолвера мешал iOS
+        // установить TLS к нему (этап 2: 0 вызовов от телефона).
         if !excluded.isEmpty { ipv4.excludedRoutes = excluded }
         ipv4.includedRoutes = routes
         if let dohWorkerURL {
