@@ -635,7 +635,7 @@ final class TunnelManager: ObservableObject {
               let res else { return [] }
         defer { freeaddrinfo(res) }
         var out: [String] = []
-        var cur = res
+        var cur: UnsafeMutablePointer<addrinfo>? = res
         while let ai = cur {
             if ai.pointee.ai_family == AF_INET, let sa = ai.pointee.ai_addr {
                 var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
