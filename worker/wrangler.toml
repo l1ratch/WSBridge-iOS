@@ -1,0 +1,27 @@
+name = "wsbridge-doh"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# ── Основной режим (этап 1) ──────────────────────────────────────────
+# Воркер отвечает A = FAKE_IP на ЛЮБОЙ валидный DoH-запрос.
+# Фильтрация по доменам живёт на iOS в NEDNSOverHTTPSSettings.matchDomains,
+# поэтому списки/апстрим/кэш здесь НЕ нужны.
+[vars]
+MODE = "simple"        # "simple" | "lists" (расширение, см. README.md)
+REQUIRE_ID = "true"    # false = ОТКЛЮЧИТЬ защиту по ID (для отладки/доверенной сети)
+TRUSTED_IDS = ""       # ID устройств через запятую, напр. "9F3CA71-…,D4E5F6-…"
+FAKE_IP = "198.18.1.1"
+
+# ── Только для MODE = "lists" (расширение / резерв Варианта А) ───────
+# Раскомментируй и заполни, если включаешь MODE = "lists".
+# UPSTREAM_DOH = "https://cloudflare-dns.com/dns-query"  # DoH-URL, НЕ голый IP
+# DEFAULT_SETS = "google-ai"
+# DENY_SETS = "telegram"
+# CACHE_TTL = "21600"
+# LISTS = '''
+# {
+#   "google-ai": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/google_ai.lst",
+#   "youtube": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/youtube.lst",
+#   "discord": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/discord.lst"
+# }
+# '''

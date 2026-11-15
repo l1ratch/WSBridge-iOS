@@ -1,0 +1,47 @@
+{
+  "_comment": "Заготовка для MODE=\"lists\". В простом режиме воркер этот файл НЕ читает. Контракт id -> name -> URL; прессеты приложения (TunnelManager.proxyListPresets) сверяются с ним.",
+  "google-ai": {
+    "name": "Google AI (Gemini)",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/google_ai.lst"
+  },
+  "youtube": {
+    "name": "YouTube",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/youtube.lst"
+  },
+  "discord": {
+    "name": "Discord",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/discord.lst"
+  },
+  "meta": {
+    "name": "Meta (Instagram, Facebook)",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/meta.lst"
+  },
+  "twitter": {
+    "name": "Twitter (X)",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/twitter.lst"
+  },
+  "tiktok": {
+    "name": "TikTok",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/tiktok.lst"
+  },
+  "geoblock": {
+    "name": "Russia outside (заблокированы в РФ)",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/outside-raw.lst"
+  },
+  "hdrezka": {
+    "name": "HDRezka",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/hdrezka.lst"
+  },
+  "google-play": {
+    "name": "Google Play",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/google_play.lst"
+  },
+  "cloudflare": {
+    "name": "Cloudflare",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/cloudflare.lst"
+  },
+  "roblox": {
+    "name": "Roblox",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/roblox.lst"
+  }
+}
