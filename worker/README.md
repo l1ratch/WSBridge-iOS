@@ -15,7 +15,7 @@
    `matchDomains` = точные домены из включённых в приложении списков.
 2. На воркер уходят **только** запросы по этим доменам; весь остальной DNS
    телефона резолвится системой как обычно.
-3. Воркер (**основной режим `MODE="simple"`**) отвечает `A = 198.51.100.1`
+3. Воркер (**основной режим `MODE="simple"`**) отвечает `A = 198.18.0.3`
    на любой дошедший валидный запрос. Это метка: пакет уходит в узкий
    маршрут туннеля, `TLSSNI` достаёт домен из ClientHello, `ProxyClient`
    идёт в ваш SOCKS5/HTTP-прокси по имени.
@@ -49,7 +49,7 @@ WSBridge → «Прокси по доменам» → блок «Воркер» 
 MODE = "simple"
 REQUIRE_ID = "true"
 TRUSTED_IDS = "9F3CA71-XXXX-XXXX-XXXX-XXXXXXXXXXXX"   # ваш ID из приложения
-FAKE_IP = "198.51.100.1"
+FAKE_IP = "198.18.0.3"
 ```
 
 Несколько устройств — через запятую.
@@ -76,7 +76,7 @@ WSBridge → «Прокси по доменам» → **«Адрес ворке�
 ### 5. Проверьте вручную (по желанию)
 
 ```bash
-# Валидный ID → A = 198.51.100.1
+# Валидный ID → A = 198.18.0.3
 curl -s -o /dev/null -w '%{http_code}\n' \
   -H 'Content-Type: application/dns-message' \
   --data-binary @query.bin \
@@ -116,13 +116,13 @@ application/dns-message`, даже для REFUSED/SERVFAIL (RFC 8484 §4.2.1).
     "method": "GET",
     "qname": null,
     "qtype": null,
-    "wouldAnswer": "198.51.100.1"
+    "wouldAnswer": "198.18.0.3"
   },
   "config": {
     "mode": "simple",
     "requireId": true,
     "trustedIds": 1,
-    "fakeIp": "198.51.100.1",
+    "fakeIp": "198.18.0.3",
     "upstream": null,
     "listsConfigured": 11,
     "listsLoaded": 0,

@@ -1,4 +1,4 @@
-// WSBridge DoH worker — MODE="simple" (основной) / MODE="lists" (расширение)
+﻿// WSBridge DoH worker — MODE="simple" (основной) / MODE="lists" (расширение)
 // Документация: worker/README.md · Концепция: docs/DoH-Routing.ru.md (ветка main)
 //
 // Простой режим: TYPE A → A = FAKE_IP; остальные типы (AAAA/SVCB/HTTPS) →
@@ -12,7 +12,7 @@ const DEFAULTS = {
   MODE: "simple",
   REQUIRE_ID: "true",
   TRUSTED_IDS: "",
-  FAKE_IP: "198.51.100.1",
+  FAKE_IP: "198.18.0.3",
   UPSTREAM_DOH: "",
   DEFAULT_SETS: "",
   DENY_SETS: "telegram",

@@ -9,7 +9,7 @@ const ENV = {
   MODE: "simple",
   REQUIRE_ID: "true",
   TRUSTED_IDS: "ID-OK-1,ID-OK-2",
-  FAKE_IP: "198.51.100.1",
+  FAKE_IP: "198.18.0.3",
   LISTS: "{}",
 };
 const CTX = { waitUntil() {} };
@@ -76,9 +76,9 @@ function ok(label) { passed++; console.log("  ✓ " + label); }
   assert.equal(a.qr, true);
   assert.equal(a.rcode, 0);
   assert.equal(a.ancount, 1);
-  assert.equal(a.ip, "198.51.100.1");
+  assert.equal(a.ip, "198.18.0.3");
   assert.equal(a.id, 0x1234, "ID запроса сохранён");
-  ok("POST /dns-query/<валидный ID> → A 198.51.100.1, rcode=NOERROR, id сохранён");
+  ok("POST /dns-query/<валидный ID> → A 198.18.0.3, rcode=NOERROR, id сохранён");
 }
 
 // ---------- 2. Любой домен получает FakeIP (воркер не фильтрует) ----------
@@ -86,7 +86,7 @@ function ok(label) { passed++; console.log("  ✓ " + label); }
   const q = dnsQuery("example.com");
   const r = await call("/dns-query/ID-OK-1", q);
   const a = parseAnswer(await r.arrayBuffer());
-  assert.equal(a.ip, "198.51.100.1");
+  assert.equal(a.ip, "198.18.0.3");
   ok("простой режим отвечает FakeIP на ЛЮБОЙ домен (фильтр только в matchDomains на iOS)");
 }
 
@@ -127,7 +127,7 @@ function ok(label) { passed++; console.log("  ✓ " + label); }
   const q = dnsQuery("gemini.google.com");
   const r = await call("/dns-query/ID-BAD", q, { ...ENV, REQUIRE_ID: "false" });
   const a = parseAnswer(await r.arrayBuffer());
-  assert.equal(a.ip, "198.51.100.1");
+  assert.equal(a.ip, "198.18.0.3");
   ok("REQUIRE_ID=false отключает защиту: FakeIP даже без доверенного ID");
 }
 
@@ -138,7 +138,7 @@ function ok(label) { passed++; console.log("  ✓ " + label); }
   const r = await call("/dns-query/ID-OK-1?dns=" + b64, null, ENV, "GET");
   assert.equal(r.status, 200);
   const a = parseAnswer(await r.arrayBuffer());
-  assert.equal(a.ip, "198.51.100.1");
+  assert.equal(a.ip, "198.18.0.3");
   ok("GET ?dns=<base64url> работает (RFC 8484 §4.1)");
 }
 
@@ -157,7 +157,7 @@ function ok(label) { passed++; console.log("  ✓ " + label); }
   const j = JSON.parse(await r.text());
   assert.equal(j.parsed.mode, "simple");
   assert.equal(j.parsed.requireId, true);
-  assert.equal(j.config.fakeIp, "198.51.100.1");
+  assert.equal(j.config.fakeIp, "198.18.0.3");
   assert.equal(j.errors.length, 0);
   ok("GET /diagnose → JSON с mode/requireId/fakeIp, без ошибок");
 }
@@ -186,7 +186,7 @@ function ok(label) { passed++; console.log("  ✓ " + label); }
   const j = JSON.parse(await r.text());
   assert.equal(j.parsed.qname, "gemini.google.com");
   assert.equal(j.parsed.qtype, 1);
-  assert.equal(j.parsed.wouldAnswer, "198.51.100.1");
+  assert.equal(j.parsed.wouldAnswer, "198.18.0.3");
   ok("/diagnose с POST-телом распознаёт qname/qtype/wouldAnswer");
 }
 

@@ -1,4 +1,4 @@
-name = "wsbridge-doh"
+﻿name = "wsbridge-doh"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
 
@@ -10,8 +10,8 @@ compatibility_date = "2026-01-01"
 MODE = "simple"        # "simple" | "lists" (расширение, см. README.md)
 REQUIRE_ID = "true"    # false = ОТКЛЮЧИТЬ защиту по ID (для отладки/доверенной сети)
 TRUSTED_IDS = ""       # ID устройств через запятую, напр. "9F3CA71-…,D4E5F6-…"
-FAKE_IP = "198.51.100.1"   # TEST-NET-2 (RFC 5737): публичный, НЕ bogon.
-                            # 198.18.0.0/15 (RFC 2544) iOS отвергала.
+FAKE_IP = "198.18.0.3"   # соседний с интерфейсом 198.18.0.2, НЕ принадлежащий ему.
+                            # /24-пул (198.18.1.0) ядро не клало в packetFlow.
 
 # ── Только для MODE = "lists" (расширение / резерв Варианта А) ───────
 # Раскомментируй и заполни, если включаешь MODE = "lists".
