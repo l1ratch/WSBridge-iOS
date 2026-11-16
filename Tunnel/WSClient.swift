@@ -18,18 +18,12 @@ final class WSClient {
         return URLSession(configuration: config, delegate: GatewayTrust(), delegateQueue: nil)
     }()
 
-    /// Прямые IP датацентров — DC_DEFAULT_IPS из proxy/utils.py офф
-    /// tg-ws-proxy. Это TCP-фолбэк (method='tcp' в do_fallback): сырой
-    /// MTProto на :443 без WS. Раньше здесь были ответы DNS kws-гейтвеев
-    /// (.220/.205/.99/.174.100), которые в РФ не отвечают — каскад умирал.
-    /// Ключ — по номеру DC, как в офф-версии.
-    private static let dcFallbackIPs: [Int: String] = [
-        1: "149.154.175.50",
-        2: "149.154.167.51",
-        3: "149.154.175.100",
-        4: "149.154.167.91",
-        5: "149.154.171.5",
-        203: "91.105.192.100",
+    /// Прямые IP kws-гейтвеев — РАБОЧИЙ список, на котором Telegram
+    /// стабильно поднимался до всех экспериментов. Не трогать: попытка
+    /// заменить на DC_DEFAULT_IPS из офф tg-ws-proxy (.167.51 и др.)
+    /// вместе с «проверкой живости фронтов» сломала каскад на сотовой.
+    private static let gatewayIPs = [
+        "149.154.167.220", "149.154.175.205", "149.154.167.99", "149.154.174.100",
     ]
 
     /// TLS-валидация для соединений по IP: сертификат гейтвея выписан для
@@ -142,15 +136,10 @@ final class WSClient {
             rotated = ordered
         }
 
-        // Каскад офф tg-ws-proxy: cf_worker → cf (ротационные kws{dc}.)
-        // → tcp (сырой MTProto на IP датацентра). Никаких «DNS-ответов
-        // kws-гейтвеев»: .220/.205/.99 в РФ молчат и съедали весь каскад.
         var endpoints: [(host: String, hostHeader: String?)] =
             rotated.prefix(6).map { ($0, nil as String?) }
+        endpoints += Self.gatewayIPs.map { ($0, gwHost as String?) }
         endpoints.append((gwHost, nil))
-        if let ip = Self.dcFallbackIPs[dc] {
-            endpoints.append((ip, gwHost as String?))
-        }
 
         let healthy = Self.aliveOnly(endpoints)
         tryConnect(endpoints: healthy.isEmpty ? endpoints : healthy, path: path, index: 0, onMessage: onMessage, onClose: onClose)

@@ -113,27 +113,6 @@ enum FrontHealthRegistry {
         return (ordered, excluded)
     }
 
-    /// Сбрасывает ТОЛЬКО счётчики фейлов при каждом запуске туннеля,
-    /// сохраняя lastSuccess (приоритет свежих успехов). Офф tg-ws-proxy
-    /// перебирает домены заново на каждом старте — у него нет «вечно
-    /// мёртвых» фронтов. Без этого реестр за время тестов помечал все
-    /// 20 фронтов как failCount>=3 и каскад их не пробовал (health_excl:19).
-    static func resetFailures() {
-        lock.lock(); defer { lock.unlock() }
-        var reg = loadLocked()
-        for key in reg.keys { reg[key]?.failCount = 0 }
-        cache = reg
-        flushLocked(immediate: true)
-    }
-
-    /// Полный сброс реестра.
-    static func resetAll() {
-        lock.lock(); defer { lock.unlock() }
-        cache = [:]
-        UserDefaults.standard.removeObject(forKey: key)
-        lastFlush = Date.distantPast
-    }
-
     /// Эвикция протухших: мёртвые >7 дней, которых нет в свежем списке апстрима.
     /// Вызывается при обновлении списка фронтов (startTunnel).
     static func evict(absentFrom current: Set<String>) {

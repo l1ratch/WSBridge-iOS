@@ -757,66 +757,15 @@ final class TunnelManager: ObservableObject {
         return out + ".co.uk"
     }
 
-    /// Настоящая проверка живости фронта по механике офф tg-ws-proxy
-    /// (proxy/raw_websocket.py: RawWebSocket.connect). НЕ getaddrinfo —
-    /// у базового домена нет A-записи, живой только kws{dc}.<base>, и
-    /// «живой» означает именно WS-хендшейк с ответом 101, а не просто
-    /// DNS-резолв. Возвращает true, если фронт ответил 101.
-    private static func probeFront(_ base: String) async -> Bool {
-        let host = "kws2." + base
-        // Рукописный GET /apiws поверх TCP+TLS, без URLSession: нам важен
-        // сам факт 101 Switching Protocols, а не установленная сессия.
-        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-            let queue = DispatchQueue.global(qos: .userInitiated)
-            let conn = NWConnection(host: NWEndpoint.Host(host),
-                                    port: NWEndpoint.Port(rawValue: 443)!, using: .tls)
-            var done = false
-            func finish(_ ok: Bool) {
-                if done { return }
-                done = true
-                conn.cancel()
-                cont.resume(returning: ok)
-            }
-            conn.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    let key = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
-                        .base64EncodedString()
-                    let req = "GET /apiws HTTP/1.1\r\n"
-                        + "Host: \(host)\r\n"
-                        + "Upgrade: websocket\r\n"
-                        + "Connection: Upgrade\r\n"
-                        + "Sec-WebSocket-Key: \(key)\r\n"
-                        + "Sec-WebSocket-Version: 13\r\n"
-                        + "Sec-WebSocket-Protocol: binary\r\n\r\n"
-                    conn.send(content: Data(req.utf8), completion: .contentProcessed { err in
-                        if err != nil { finish(false); return }
-                        conn.receive(minimumIncompleteLength: 12, maximumLength: 512) { data, _, _, err in
-                            guard err == nil, let d = data,
-                                  let s = String(data: d, encoding: .utf8) else {
-                                finish(false); return
-                            }
-                            // 101 Switching Protocols = фронт живой.
-                            finish(s.hasPrefix("HTTP/1.1 101") || s.hasPrefix("HTTP/1.0 101"))
-                        }
-                    })
-                case .failed: finish(false)
-                case .cancelled: finish(false)
-                default: break
-                }
-            }
-            conn.start(queue: queue)
-            queue.asyncAfter(deadline: .now() + 6) { finish(false) }
-        }
-    }
-
-    /// Скачивает свежий список фронтов, РАСШИФРОВЫВАЕТ (_dd) и проверяет
-    /// каждый настоящим WS-хендшейком. Сохраняет только живые, сбрасывает
-    /// реестр здоровья. Вызывается кнопкой «Обновить», при первом запуске
-    /// и в фоне при каждом старте туннеля.
+    /// Обновляет список фронтов: скачивает шифротекст апстрима и
+    /// расшифровывает его (_dd). НИКАКИХ сетевых проб и параллельных
+    /// TLS-соединений: «0 из 20» никогда не мешало Telegram (он работал
+    /// и с ним), а пачка probeFront() на старте убивала исходящие
+    /// соединения расширения на сотовой сети. Проверку живости делает
+    /// сам WS-каскад при подключении, как в рабочей версии 0.3.x.
     @discardableResult
     func updateFronts() async -> Bool {
-        frontsUpdateMessage = "Обновление и проверка…"
+        frontsUpdateMessage = "Обновление…"
         var rejection: String?
         for urlString in Self.frontListURLs {
             guard let url = URL(string: urlString) else { continue }
@@ -827,7 +776,6 @@ final class TunnelManager: ObservableObject {
                 let (data, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { continue }
                 let text = String(data: data, encoding: .utf8) ?? ""
-                // Апстрим хранит ШИФРОТЕКСТ (_CFPROXY_ENC из config.py).
                 let encoded = text
                     .split(separator: "\n")
                     .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
@@ -840,26 +788,9 @@ final class TunnelManager: ObservableObject {
                 guard decoded.count >= 3 else {
                     rejection = "не удалось расшифровать"; continue
                 }
-                let unique = Array(Set(decoded))
-                // Живость = WS-хендшейк к kws2.<base>, параллельно, как
-                // офф-версия перебирает balancer.get_domains_for_dc().
-                let alive = await withTaskGroup(of: String?.self) { group in
-                    for d in unique {
-                        group.addTask { await Self.probeFront(d) ? d : nil }
-                    }
-                    var out: [String] = []
-                    for await r in group { if let d = r { out.append(d) } }
-                    return out
-                }
-                guard alive.count >= 3 else {
-                    rejection = "живых \(alive.count) из \(unique.count)"; continue
-                }
-                frontBases = alive
+                frontBases = Array(Set(decoded)).sorted()
                 frontsUpdatedAt = Date()
-                // Новый список = новая попытка: обнуляем реестр фейлов в
-                // расширении (иначе все фронты остаются «мёртвыми»).
-                UserDefaults.standard.set(true, forKey: "frontsResetPending")
-                frontsUpdateMessage = "Обновлено: \(alive.count) живых (из \(unique.count))"
+                frontsUpdateMessage = "Обновлено: \(frontBases.count) доменов"
                 return true
             } catch { continue }
         }
@@ -869,15 +800,6 @@ final class TunnelManager: ObservableObject {
             frontsUpdateMessage = "Не удалось обновить (нет сети или источники недоступны)"
         }
         return false
-    }
-
-    /// Тихий фоновый прогон: при первом запуске и при каждом старте
-    /// туннеля. Не трогает UI-сообщение, если список уже свежий.
-    func refreshFrontsInBackground() {
-        Task.detached(priority: .utility) { [weak self] in
-            guard let self else { return }
-            await self.updateFronts()
-        }
     }
 
     // ── Смена сети: догонялка через журнал ──────────────────────
@@ -1000,9 +922,6 @@ final class TunnelManager: ObservableObject {
         }
         UNUserNotificationCenter.current().delegate = Self.bannerPresenter
         Task { await reload() }
-        // Первый запуск: сразу расшифровать + проверить живость фронтов,
-        // чтобы к первому включению туннеля список был актуальным.
-        refreshFrontsInBackground()
     }
 
     /// ponytail: Darwin notifications — единственный IPC без entitlements.
@@ -1556,11 +1475,6 @@ final class TunnelManager: ObservableObject {
             .filter { !$0.isEmpty }
         if !dcLines.isEmpty { config["dcMap"] = dcLines as NSArray }
         if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
-        // Одноразовый флаг: extension сбросит реестр здоровья фронтов.
-        if UserDefaults.standard.bool(forKey: "frontsResetPending") {
-            config["frontsReset"] = true as NSNumber
-            UserDefaults.standard.set(false, forKey: "frontsResetPending")
-        }
         // ── Вариант B: прокси по доменам через реальные IP + SNI ──────
         // DNS системы НЕ трогаем: сайты и Telegram резолвятся как обычно.
         // Домены включённых списков резолвим здесь, в Main App, и кладём
@@ -1614,9 +1528,6 @@ final class TunnelManager: ObservableObject {
         manager = m
         try m.connection.startVPNTunnel()
         status = m.connection.status
-        // Каждый старт туннеля: тихий прогон расшифровки + проверки
-        // живости фронтов (как в офф tg-ws-proxy при запуске).
-        refreshFrontsInBackground()
         // Сторож: статус не сдвинулся за 20 с — расширение умерло молча.
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 20_000_000_000)
