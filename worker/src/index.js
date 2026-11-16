@@ -12,7 +12,7 @@ const DEFAULTS = {
   MODE: "simple",
   REQUIRE_ID: "true",
   TRUSTED_IDS: "",
-  FAKE_IP: "198.18.1.1",
+  FAKE_IP: "198.51.100.1",
   UPSTREAM_DOH: "",
   DEFAULT_SETS: "",
   DENY_SETS: "telegram",
