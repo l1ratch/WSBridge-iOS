@@ -17,26 +17,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let startedAt = Date()
     private let lwipQueue = DispatchQueue(label: "com.l1ratch.WSBridge.lwip")
     private let journalServer = JournalServer()
-    /// Локальный DNS-резолвер: rewrites + upstream. Пишет ответы напрямую
-    /// в packetFlow (обходя lwIP — UDP в стеке выключен). Создаётся в
-    /// startTunnel: колбэк writePacket требует self.
-    private var localDNS: LocalDNSResolver?
+    /// Прокси для прокси-доменов (метка 198.18.0.3): nil = нет прокси.
+    private var proxyEndpoint: ProxyEndpoint?
+    /// При включённом DoH-воркере 198.18.0.3 — не мапа, а метка: домен
+    /// достаём из TLS SNI, а не из таблицы адресов.
+    private var dohWorkerActive = false
     /// Режим остался только для диагностики в журнале ("split"/"matchall").
     /// "default" (0.0.0.0/0) ОТКЛЮЧЁН: он забирал весь трафик, а readLoop
     /// его ронял — сайты умирали, loopback-журнал пропадал, NWPathMonitor
     /// слал ложные «смена сети». Рабочая конфигурация всегда узкая.
     private var dnsProbeMode: String = "split"
-    /// Счётчики диагностики перехвата. Пишутся только на lwipQueue.
+    /// Диагностика этапа 2/4: все уникальные dst IP, пришедшие в packetFlow.
+    /// Показывает, дошёл ли пакет на метку 198.18.0.3 до расширения.
+    private var dstSeen: Set<String> = []
+    private var statFakeIPPkts: UInt64 = 0
+    /// Счётчики UDP-пакетов (только для журнала, на рабочий путь не влияют).
     private var statUDP53: UInt64 = 0
     private var statUDPOther: UInt64 = 0
     private var statDNSHandled: UInt64 = 0
-    /// Первые N адресов назначения UDP:53 — куда система шлёт DNS.
     private var dnsDstSample: [String] = []
-    /// Диагностика этапа 2/4: все уникальные dst IP, пришедшие в packetFlow.
-    /// Отвечает на вопрос «послала ли iOS пакет на 198.18.1.1 или ушла на
-    /// реальный IP Google» — раньше гадали по отсутствию accept:.
-    private var dstSeen: Set<String> = []
-    private var statFakeIPPkts: UInt64 = 0
     private var pollTimer: DispatchSourceTimer?
     private var ioTimer: DispatchSourceTimer?
     private var workerDomain: String?
@@ -45,16 +44,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var workerRRIndex = 0
     /// «DC → IP» маппинг из настроек.
     private var dcOverride: [String: String] = [:]
-    /// Прокси для прокси-доменов (fake-IP 198.18.1.x): nil = нет прокси.
-    private var proxyEndpoint: ProxyEndpoint?
-    /// При включённом DoH-воркере 198.18.1.x — не мапа, а метка: домен
-    /// достаём из TLS SNI, а не из localDNS.proxyDomain(forFakeIP:).
-    private var dohWorkerActive = false
-    /// Матчер доменов для SNI-фолбэка (замыкание на LocalDNSResolver).
-    private var proxyDomainMatcher: ((String) -> Bool)?
-    /// CIDR, добавленные в includedRoutes для real-IP перехвата. По ним
-    /// же в handleAccept решаем, что трафик НЕ Telegram и его можно
-    /// проверять на SNI. Пусто = SNI-фолбэк выключен.
+    /// CIDR, добавленные в includedRoutes для real-IP перехвата (старый
+    /// путь; при DoH-воркере не используются).
     private var sniCIDRs: [(UInt32, UInt32)] = []
     /// ID нуджа «долго включен». Владелец — расширение (см. scheduleLongSessionNudge).
     private static let longSessionID = "wsbridge.longSession"
@@ -108,16 +99,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // даже если в UserDefaults телефона осталось старое значение.
         self.dnsProbeMode = probeMode == "default" ? "split" : probeMode
         var routes = TelegramDCs.includedRoutes
-        // Маршрут /32 на 198.18.0.3 больше НЕ нужен: dnsSettings снят,
-        // локальный резолвер не перехватывает системный DNS.
-        // При включённом DoH-воркере пул FakeIP нужен ВСЕГДА.
-        // 198.51.100.0/24 = TEST-NET-2 (RFC 5737): публичный, НЕ bogon,
-        // не маршрутизируется в интернете. Прежний 198.18.0.0/15 (RFC 2544)
-        // iOS отвергала: /recent видел DNS-запрос, но dst: в packetFlow не
-        // было ни одного пакета на FakeIP — ответ воркера не принимался.
+        // ── FakeIP как МЕТКА для DoH-воркера ─────────────────────────
+        // Тест 17:22: воркер ответил 149.154.199.199 (адрес внутри УЖЕ
+        // маршрутизируемой 149.154.0.0/16) → пакет сразу появился в
+        // packetFlow: seen=[149.154.199.199], accept:, TLS ClientHello.
+        // Значит весь конвейер D рабочий; не работал именно ВЫБОР адреса:
+        // 198.18.1.1 / 198.51.100.1 ядро в трубу не клало.
+        //
+        // Берём 198.18.0.3 — соседний с интерфейсом (198.18.0.2), но НЕ
+        // принадлежащий ему; ровно так же в be007cd выносили резолвер,
+        // чтобы ядро доставило пакет в packetFlow, а не локально.
+        // Маршрут ТОЛЬКО /32, не /24: иначе весь 198.18.0.x уедет в туннель.
         let workerOn = (proto?.providerConfiguration?["dohWorkerURL"] as? String) != nil
-        if workerOn || (!proxyDomains.isEmpty && !proxyURLs.isEmpty) {
-            routes.append(NEIPv4Route(destinationAddress: "198.51.100.0", subnetMask: "255.255.255.0"))
+        if workerOn {
+            routes.append(NEIPv4Route(destinationAddress: "198.18.0.3", subnetMask: "255.255.255.255"))
+        } else if !proxyDomains.isEmpty && !proxyURLs.isEmpty {
+            // Старый FakeIP-пул (мёртвый путь LRDNS) оставляем как был.
+            routes.append(NEIPv4Route(destinationAddress: "198.18.1.0", subnetMask: "255.255.255.0"))
         }
         // Real-IP фолбэк для упрямых приложений (свой DoH/DoT, проверка
         // bogon-диапазона): заворачиваем подсети CDN, где сидят ИИ-сервисы.
@@ -236,41 +234,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             EventLog.append("fronts_health:\(FrontHealthRegistry.summary())")
             let ver = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
             EventLog.append("tunnel_start v\(ver)")
-            // Локальный DNS: таблица rewrites + upstream. Резолвер создан
-            // ДО конфигурации: writePacket требует self.
-            let resolver = LocalDNSResolver { [weak self] data in
-                self?.writePacket(data)
-            }
-            self?.localDNS = resolver
-            if (proto?.providerConfiguration?["localDNS"] as? Bool) == true {
-                let hosts = proto?.providerConfiguration?["localDNSHosts"] as? String
-                // Upstream: IP выбранного DNS + опциональный транспорт:
-                // localDNSUpstreamDoT (SNI) или localDNSUpstreamDoH (URL);
-                // оба пусты = plain UDP:53.
-                let upstreams = (proto?.providerConfiguration?["localDNSUpstream"] as? [String]) ?? []
-                let doT = proto?.providerConfiguration?["localDNSUpstreamDoT"] as? String
-                let doH = proto?.providerConfiguration?["localDNSUpstreamDoH"] as? String
-                // Прокси-домены и список прокси (автовыбор уже сделан
-                // приложением; сюда доезжает ОДИН рабочий endpoint).
-                let proxyDomains = (proto?.providerConfiguration?["proxyDomains"] as? [String]) ?? []
-                let proxyURLs = (proto?.providerConfiguration?["proxies"] as? [String]) ?? []
-                let proxyEndpoint = proxyURLs.compactMap { ProxyEndpoint.parse($0) }.first
-                resolver.configure(hostsText: hosts, upstreams: upstreams,
-                                   doT: doT, doHURL: doH,
-                                   proxyDomains: proxyDomains)
-                let transport = doT != nil ? "dot" : (doH != nil ? "doh" : "udp")
-                EventLog.append("cfg:localdns=on rules=\(resolver.rewriteCount) upstream=\(upstreams.first ?? "system"):\(transport)")
-                if let pe = proxyEndpoint {
-                    self?.proxyEndpoint = pe
-                    // SNI-фолбэк работает на тех же правилах, что и FakeIP:
-                    // замыкание живёт на lwipQueue, EarlyIP-мапа — внутри LRDNS.
-                    self?.proxyDomainMatcher = { [weak resolver] name in
-                        resolver?.isProxyDomain(name) ?? false
-                    }
-                    EventLog.append("cfg:proxy=\(pe.display) domains=\(resolver.proxyDomainCount)")
-                }
+            // ── Прокси-домены: прямое чтение конфига, без LocalDNSResolver ──
+            // Чистка мёртвого LRDNS: резолвер туннеля больше не создаётся
+            // и не конфигурируется. DNS решает системный DoH-воркер, а здесь
+            // нужен только сам socks5/http endpoint для SNI-ветки.
+            // Ключи приходят из приложения ВНЕ зависимости от выбора DNS
+            // в основном выборщике (раньше «Локальный DNS» ломал Telegram).
+            let proxyURLs = (proto?.providerConfiguration?["proxies"] as? [String]) ?? []
+            let proxyDomains = (proto?.providerConfiguration?["proxyDomains"] as? [String]) ?? []
+            let proxyEndpoint = proxyURLs.compactMap { ProxyEndpoint.parse($0) }.first
+            if let pe = proxyEndpoint {
+                self?.proxyEndpoint = pe
+                EventLog.append("cfg:proxy=\(pe.display) domains=\(proxyDomains.count)")
             } else {
-                resolver.configure(hostsText: nil, upstreams: [])
+                EventLog.append("cfg:proxy=none domains=\(proxyDomains.count)")
             }
             self?.journalServer.start()
             self?.setupLWIP()
@@ -324,17 +301,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let self else { return }
             EventLog.append("io:in=\(self.packetCount) out=\(EventLog.outPkts) v6=\(EventLog.inV6) oth=\(EventLog.inOther) wd=\(EventLog.wsDown) wf=\(EventLog.writeFails) up=\(EventLog.upBytes) rx=\(EventLog.rxBytes) pend=\(EventLog.pendCur) sent=\(EventLog.sentCb) inmem=\(lwip_bridge_inmem_drops()) mem=\(String(format: "%.1f", self.memFootprintMB()))MB conns=\(self.sessions.count)")
             EventLog.append("dst:fakeip=\(self.statFakeIPPkts) seen=[\(self.dstSeen.sorted().joined(separator: ","))]")
-            if let ldns = self.localDNS, ldns.rewriteCount > 0 || ldns.statForwarded > 0 {
-                EventLog.append("ldns:rw=\(ldns.statRewritten) fwd=\(ldns.statForwarded) fail=\(ldns.statFailed) rules=\(ldns.rewriteCount)")
-            }
-            // Диагностика DNS: печатается всегда, даже когда всё по нулям —
-            // именно нули и есть ответ («пакеты в туннель не приходят»).
-            // udp53=0 при живом браузере = dnsSettings не применился.
-            if self.localDNS != nil {
-                let dstList = self.dnsDstSample.isEmpty
-                    ? "-" : self.dnsDstSample.joined(separator: ",")
-                EventLog.append("dnsprobe:m=\(self.dnsProbeMode) udp53=\(self.statUDP53) done=\(self.statDNSHandled) udpOth=\(self.statUDPOther) dst=[\(dstList)]")
-            }
+            let dstList = self.dnsDstSample.isEmpty
+                ? "-" : self.dnsDstSample.joined(separator: ",")
+            EventLog.append("dnsprobe:m=\(self.dnsProbeMode) udp53=\(self.statUDP53) done=\(self.statDNSHandled) udpOth=\(self.statUDPOther) dst=[\(dstList)]")
             for (id, _) in self.sessions.sorted(by: { $0.key < $1.key }).prefix(2) {
                 var st: UInt32 = 0, un: UInt32 = 0
                 lwip_bridge_conn_stats(id, &st, &un)
@@ -352,13 +321,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         postDarwinEvent("accept")
         EventLog.append("accept:c\(connId):\(dotted):p\(lwip.dstPort(connId: connId)):sni=\(isSNIInterceptCandidate(dcIP) ? 1 : 0):cidrs=\(sniCIDRs.count)")
         let dstPort = lwip.dstPort(connId: connId)
-        // ── DoH-воркер: 198.51.100.x — МЕТКА, не мапа ───────────────
+        // ── DoH-воркер: 198.18.0.3 — МЕТКА, не мапа ─────────────────
         // Воркер вернул один и тот же FakeIP на все домены из matchDomains.
-        // localDNS.proxyDomain(forFakeIP:) пуста (DNS в packetFlow не
-        // приходит), поэтому старый путь глух. Домен достаём из TLS SNI
-        // первого пакета и сразу идём в прокси по ИМЕНИ.
-        if dohWorkerActive, let proxy = proxyEndpoint,
-           (dcIP >> 24) == 198 && ((dcIP >> 16) & 0xFF) == 51 && ((dcIP >> 8) & 0xFF) == 100 {
+        // Домен достаём из TLS SNI первого пакета и идём в прокси по ИМЕНИ.
+        if dohWorkerActive, let proxy = proxyEndpoint, dcIP == 0xC6120003 {
             EventLog.append("doh_proxy:conn\(connId):p\(dstPort)")
             let session = TunnelSession(
                 connId: connId, dcIP: dcIP, workerDomain: nil,
@@ -367,35 +333,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 sniProxyEndpoint: proxy,
                 dstPort: dstPort,
                 sniProxyUnconditional: true)
-            sessions[connId] = session
-            return
-        }
-        // Прокси-домен: dst в 198.18.1.0/24 → домен из fake-IP-мапы
-        // LRDNS, соединение через SOCKS5/HTTP-прокси.
-        if let proxy = proxyEndpoint,
-           (dcIP >> 24) == 198 && ((dcIP >> 16) & 0xFF) == 18 && ((dcIP >> 8) & 0xFF) == 1,
-           let domain = localDNS?.proxyDomain(forFakeIP: dcIP) {
-            EventLog.append("proxy:conn\(connId):\(domain)")
-            let session = TunnelSession(
-                connId: connId, dcIP: dcIP, workerDomain: domain,
-                dcOverride: [:], bridge: lwip, queue: lwipQueue,
-                proxyEndpoint: proxy, dstPort: dstPort)
-            sessions[connId] = session
-            return
-        }
-        // Real-IP, пришедший по CIDR-маршруту (приложение обошло FakeIP
-        // через свой DoH). Даём сессии SNI-парсер: домен в списке → прокси,
-        // нет → DIRECT на исходный IP. Telegram сюда не попадает (его
-        // подсети обслуживаются WS-веткой ниже и в cidrs не входят).
-        if let matcher = proxyDomainMatcher, let proxy = proxyEndpoint,
-           isSNIInterceptCandidate(dcIP) {
-            EventLog.append("sni:watch:c\(connId)")
-            let session = TunnelSession(
-                connId: connId, dcIP: dcIP, workerDomain: nil,
-                dcOverride: [:], bridge: lwip, queue: lwipQueue,
-                proxyDomainMatcher: matcher,
-                sniProxyEndpoint: proxy,
-                dstPort: dstPort)
             sessions[connId] = session
             return
         }
@@ -438,13 +375,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         EventLog.inV6 += 1
                         continue
                     }
-                    // Сэмпл dst ДО всех фильтров: если 198.51.100.1 здесь есть,
+                    // Сэмпл dst ДО всех фильтров: если 198.18.0.3 здесь есть,
                     // но accept: нет — пакет теряется внутри lwIP. Если его
                     // нет вообще — iOS не приняла FakeIP от воркера.
                     if packet.count >= 20 {
                         let d = "\(packet[16]).\(packet[17]).\(packet[18]).\(packet[19])"
                         if self.dstSeen.count < 24 { self.dstSeen.insert(d) }
-                        if d == "198.51.100.1" { self.statFakeIPPkts += 1 }
+                        if d == "198.18.0.3" { self.statFakeIPPkts += 1 }
                     }
                     // Диагностика: считаем UDP и отдельно UDP:53 ДО всех
                     // фильтров — иначе не отличить «пакет не пришёл» от
@@ -463,13 +400,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                                 self.statUDPOther += 1
                             }
                         }
-                    }
-                    // Локальный DNS-резолвер: запросы к 198.18.0.2:53
-                    // потребляет он (rewrites → upstream → системный),
-                    // в lwIP они не идут (UDP в стеке выключен).
-                    if let resolver = self.localDNS, resolver.tryHandle(packet) {
-                        self.statDNSHandled += 1
-                        continue
                     }
                     // Только TCP в lwIP; UDP (QUIC) мгновенно сбрасываем
                     // ICMP Port Unreachable — сетевой стек iOS за 0 мс

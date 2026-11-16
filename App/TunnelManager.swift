@@ -1759,59 +1759,54 @@ final class TunnelManager: ObservableObject {
             .filter { !$0.isEmpty }
         if !dcLines.isEmpty { config["dcMap"] = dcLines as NSArray }
         if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
-        // Локальный DNS: резолвер туннеля с hosts-rewrite списком.
-        // Таблица передаётся текстом hosts-файла, upstream — конфиг из
-        // ОБЩЕГО списка DNS + его транспорт (DoT/DoH/UDP — выбор на
-        // странице LRDNS). «Системный» = пустой upstream.
-        if localDNSEnabled {
+        // ── Режим прокси по доменам (бывший LRDNS) ───────────────────
+        // Чистка: при включённом DoH-воркере НЕ шлём мёртвый конфиг
+        // старого локального резолвера (localDNS / dnsProbe / hosts /
+        // upstream). Именно он заставлял «Локальный DNS» ломать Telegram,
+        // тогда как с «Системным» туннель был чистым.
+        // Прокси-домены и сам прокси передаём ВСЕГДА по своему тумблеру,
+        // независимо от выбора DNS в основном выборщике.
+        let workerOn = dohEndpointURL != nil
+        if !workerOn && localDNSEnabled {
             config["localDNS"] = true as NSNumber
-            // Диагностический режим объявления резолвера: расширение само
-            // решает, какие маршруты объявить и что положить в dnsSettings.
             if let probe = dnsProbeMode, !probe.isEmpty {
                 config["dnsProbe"] = probe as NSString
             }
-            // Режим Hosts: таблица перезаписей (только при тумблере).
             if hostsRewritesEnabled, let hosts = localDNSHostsText, !hosts.isEmpty {
                 config["localDNSHosts"] = hosts as NSString
             }
             if let up = localDNSUpstreamConfig, !up.servers.isEmpty {
                 config["localDNSUpstream"] = up.servers as NSArray
-                // Транспорт upstream'а: DoT-хост, DoH-URL или пусто (UDP:53).
                 switch localDNSUpstreamMode {
                 case .dot:
                     if let host = up.dotHostname { config["localDNSUpstreamDoT"] = host as NSString }
                 case .doh:
                     if let url = up.dohURL { config["localDNSUpstreamDoH"] = url as NSString }
                 case .udp:
-                    break // plain :53
+                    break
                 }
             }
-            // Прокси-домены: список доменов (fake-IP в резолвере) + один
-            // активный прокси. Только при тумблере режима; при автовыборе
-            // — лучший из пробитых.
-            if proxyDomainsEnabled {
-                let domainList = await loadProxyDomains()
-                // sniCIDRs НЕ передаём при включённом DoH-воркере: IP самого
-                // воркера (Cloudflare 104.21.x / 172.67.x) попадали в эти
-                // includedRoutes и системный DoH-коннект не устанавливался.
-                // По новой архитектуре для роутинга достаточно 198.18.1.0/24.
-                // CIDR оставляем только когда воркер выключен (старый путь).
-                if dohEndpointURL == nil {
-                    config["sniCIDRs"] = Self.sniCIDRs as NSArray
-                }
-                let activeProxy: String?
-                if selectedProxyIndex >= 0, selectedProxyIndex < proxyURLs.count {
-                    activeProxy = proxyURLs[selectedProxyIndex]
-                } else if let best = bestProxyURL {
-                    activeProxy = best
-                } else {
-                    activeProxy = proxyURLs.first
-                }
-                if !domainList.isEmpty, let activeProxy,
-                   ProxyEndpoint.parse(activeProxy) != nil {
-                    config["proxyDomains"] = domainList as NSArray
-                    config["proxies"] = [activeProxy] as NSArray
-                }
+        }
+        if proxyDomainsEnabled {
+            let domainList = await loadProxyDomains()
+            // sniCIDRs — остатки старой CIDR-архитектуры. При воркере они
+            // не нужны (метка 198.18.0.3/32) и вредны: IP самого воркера
+            // попадал в includedRoutes и ломал TLS к нему.
+            if !workerOn {
+                config["sniCIDRs"] = Self.sniCIDRs as NSArray
+            }
+            let activeProxy: String?
+            if selectedProxyIndex >= 0, selectedProxyIndex < proxyURLs.count {
+                activeProxy = proxyURLs[selectedProxyIndex]
+            } else if let best = bestProxyURL {
+                activeProxy = best
+            } else {
+                activeProxy = proxyURLs.first
+            }
+            if !domainList.isEmpty, let activeProxy,
+               ProxyEndpoint.parse(activeProxy) != nil {
+                config["proxyDomains"] = domainList as NSArray
+                config["proxies"] = [activeProxy] as NSArray
             }
         }
         if !activeDNSServers.isEmpty {
