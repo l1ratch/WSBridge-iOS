@@ -1,4 +1,4 @@
-﻿import Foundation
+import Foundation
 import Network
 import NetworkExtension
 import UserNotifications
@@ -552,7 +552,7 @@ final class TunnelManager: ObservableObject {
                     request.timeoutInterval = 15
                     request.cachePolicy = .reloadIgnoringLocalCacheData
                     do {
-                        let (data, response) = try await URLSession.shared.data(from: request)
+                        let (data, response) = try await URLSession.shared.data(for: request)
                         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
                         let text = String(data: data, encoding: .utf8) ?? ""
                         return text.split(separator: "\n")
