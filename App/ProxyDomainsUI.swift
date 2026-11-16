@@ -9,7 +9,7 @@ struct ProxyDomainsView: View {
     var body: some View {
         Form {
             Section {
-                Text("Включённые списки: их домены LRDNS направляет через прокси. Остальные домены работают как обычно.")
+                Text("Включённые списки: их домены идут через прокси (реальные IP + SNI). Остальные домены работают как обычно.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -125,7 +125,7 @@ struct ProxyDomainsView: View {
             }
 
             Section {
-                Text("Прокси-домены работают только при выбранном «Локальный (LRDNS)» в выборщике DNS. Изменения применятся при следующем включении туннеля.")
+                Text("DNS телефона не меняется. Изменения списков и прокси применятся при следующем включении туннеля.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -108,8 +108,8 @@ struct ContentView: View {
                             Text(dnsLabel)
                                 .font(.body)
                             Circle()
-                                .fill(tunnel.selectedDNSId == "lrdns" || !tunnel.activeDNSServers.isEmpty
-                                      ? Color(hex: 0x17A05E) : Color(.systemGray3))
+                                .fill(tunnel.activeDNSServers.isEmpty
+                                      ? Color(.systemGray3) : Color(hex: 0x17A05E))
                                 .frame(width: 8, height: 8)
                         }
                         .padding(.horizontal, 12)
@@ -194,10 +194,8 @@ struct ContentView: View {
         }
     }
 
-    /// Подпись DNS-бара: название выбранного DNS или LRDNS.
-    private var dnsLabel: String {
-        tunnel.selectedDNSId == "lrdns" ? "Локальный DNS" : tunnel.selectedDNS.name
-    }
+    /// Подпись DNS-бара: название выбранного DNS-пресета.
+    private var dnsLabel: String { tunnel.selectedDNS.name }
 }
 
 /// Меню: штатный Form. На iOS 26 система сама рисует Liquid Glass.
@@ -219,11 +217,6 @@ struct MenuView: View {
                         StatsView(tunnel: tunnel)
                     } label: {
                         Label("Статистика", systemImage: "chart.bar")
-                    }
-                    NavigationLink {
-                        DNSProbeView(tunnel: tunnel)
-                    } label: {
-                        Label("Тест DNS", systemImage: "stethoscope")
                     }
                 }
                 Section("Настройки") {
@@ -259,7 +252,7 @@ struct MenuView: View {
                     NavigationLink {
                         LocalDNSView(tunnel: tunnel)
                     } label: {
-                        Label("Локальный DNS (LRDNS)", systemImage: "server.rack")
+                        Label("Прокси по доменам", systemImage: "server.rack")
                     }
                     NavigationLink {
                         WorkerView(tunnel: tunnel)
@@ -649,143 +642,6 @@ struct StatsView: View {
     }
 }
 
-/// Тест DNS: три способа объявить резолвер системе, чтобы раз и навсегда
-/// выяснить, доходят ли DNS-запросы до туннеля в split-режиме.
-/// Гипотеза проверяется журналом: строка dnsprobe с счётчиками.
-struct DNSProbeView: View {
-    @ObservedObject var tunnel: TunnelManager
-
-    private var tunnelUp: Bool {
-        tunnel.status == .connected || tunnel.status == .connecting || tunnel.status == .reasserting
-    }
-
-    /// nil и "split" для UI — одно и то же: рабочий режим по умолчанию.
-    private var currentMode: String { tunnel.dnsProbeMode ?? "split" }
-
-    var body: some View {
-        Form {
-            // ── Этап 2: минимальная проверка DoH-воркера ──────────────
-            // Полноценный блок «Воркер» (с инструкцией, тестом, Edit) —
-            // этап 3. Здесь ровно то, что нужно для проверки path/matchDomains.
-            Section("DoH-воркер (этап 2)") {
-                TextField("spring-pond-b6cc.sm171105.workers.dev", text: $tunnel.dohWorkerHost)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                    .font(.callout.monospaced())
-                    .disabled(tunnelUp)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("ID устройства").font(.caption).foregroundStyle(.secondary)
-                    Text(tunnel.deviceID)
-                        .font(.caption.monospaced())
-                        .lineLimit(1)
-                        .textSelection(.enabled)
-                }
-                Button {
-                    UIPasteboard.general.string = tunnel.deviceID
-                } label: {
-                    Label("Копировать ID", systemImage: "doc.on.doc")
-                }
-                Button {
-                    Task { await tunnel.testDoHWorker() }
-                } label: {
-                    Label("Тест воркера", systemImage: "bolt.horizontal")
-                }
-                .disabled(tunnel.dohWorkerHost.trimmingCharacters(in: .whitespaces).isEmpty)
-                if let msg = tunnel.dohWorkerTestMessage {
-                    Text(msg).font(.caption).foregroundStyle(.secondary)
-                }
-                Text("Включите туннель и откройте gemini.google.com. В журнале должна появиться строка cfg:doh=worker, а в логах воркера — /dns-query/<ID>.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section {
-                Text("Проверяет один вопрос: применяет ли iOS объявленный резолвер, когда туннель забирает не весь трафик. Три режима — три гипотезы, по одному прогону на каждую.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Режим проверки") {
-                ForEach(TunnelManager.dnsProbeTitles, id: \.id) { item in
-                    Button {
-                        tunnel.dnsProbeMode = item.id
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.title)
-                                    .foregroundStyle(.primary)
-                                Text(item.detail)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            Spacer()
-                            if currentMode == item.id {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(tunnelUp)
-                }
-                if tunnelUp {
-                    Text("Выключите туннель, чтобы сменить режим.")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-            }
-
-            Section("Условия теста") {
-                Text("1. Выберите DNS «Локальный (LRDNS)» на главном экране.")
-                    .font(.caption)
-                Text("2. Выберите режим выше, включите туннель.")
-                    .font(.caption)
-                Text("3. Откройте Safari и зайдите на 2-3 сайта, которых раньше не открывали — DNS-кеш переживает перезапуск туннеля.")
-                    .font(.caption)
-                Text("4. Через минуту откройте «Журнал туннеля» и найдите строку dnsprobe.")
-                    .font(.caption)
-            }
-
-            Section("Как читать результат") {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("udp53 больше нуля")
-                        .font(.caption.weight(.semibold))
-                    Text("DNS-пакеты доходят до туннеля. Тогда смотрим done: если done тоже растёт — перехват работает, hosts и прокси по домену возможны.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("udp53 = 0, udpOth больше нуля")
-                        .font(.caption.weight(.semibold))
-                    Text("В туннель идёт UDP, но не DNS — система резолвит мимо нас. В поле dst видно, куда именно она шлёт запросы.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Всё по нулям")
-                        .font(.caption.weight(.semibold))
-                    Text("В туннель не попадает вообще ничего. Значит резолвер не применён в этом режиме.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Section {
-                NavigationLink {
-                    JournalView(tunnel: tunnel)
-                } label: {
-                    Label("Открыть журнал", systemImage: "doc.text")
-                }
-            } footer: {
-                Text("Режим запоминается и уходит в конфигурацию при следующем включении туннеля. После теста верните «Split (как сейчас)».")
-            }
-        }
-        .navigationTitle("Тест DNS")
-        .navigationBarTitleDisplayMode(.inline)
-    }
-}
 
 /// О программе: суть, версия, разработчик, ссылка на исходник.
 struct AboutView: View {
@@ -879,7 +735,7 @@ struct DNSView: View {
                 DNSModeFallbackNote(tunnel: tunnel)
             }
 
-            // ЕДИНЫЙ список: «Системный» → «Локальный (LRDNS)» → серверы.
+            // ЕДИНЫЙ список: «Системный» → серверы.
             Section("DNS") {
                 Button {
                     tunnel.setDNSMode("system")
@@ -894,25 +750,6 @@ struct DNSView: View {
                         }
                         Spacer()
                         if tunnel.selectedDNSId == "system" {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
-                        }
-                    }
-                }
-                .buttonStyle(.plain)
-                Button {
-                    tunnel.setDNSMode("lrdns")
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Локальный (LRDNS)")
-                                .foregroundStyle(.primary)
-                            Text("Резолвер в туннеле: имена из списка — по списку, остальные — на сервер после списков")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if tunnel.selectedDNSId == "lrdns" {
                             Image(systemName: "checkmark.circle.fill")
                                 .foregroundStyle(.green)
                         }
@@ -1013,7 +850,7 @@ private struct DNSModeFallbackNote: View {
     @ObservedObject var tunnel: TunnelManager
 
     var body: some View {
-        // Пустой список = «Системный»/LRDNS: туннель либо не трогает DNS,
+        // Пустой список = «Системный»: туннель не трогает DNS,
         // либо обрабатывает сам — подсказка про транспорты не про них.
         if !tunnel.activeDNSServers.isEmpty,
            tunnel.effectiveDNSMode != tunnel.dnsMode,
@@ -1107,13 +944,11 @@ struct DNSManageView: View {
     }
 }
 
-/// Локальный DNS (LRDNS): настройки резолвера туннеля. Включается
-/// выбором «Локальный» в общем выборщике DNS.
-/// Режимы: Hosts (перезаписи имён) и Прокси (домены через прокси) —
-/// независимы, можно оба; настройки выключенного режима серые.
+/// Прокси по доменам: настройки списков и socks5/http.
+/// Прокси по доменам (вариант B): списки доменов + SOCKS5/HTTP-прокси.
+/// DNS системы не трогается — маршрутизация идёт по реальным IP + SNI.
 struct LocalDNSView: View {
     @ObservedObject var tunnel: TunnelManager
-    @State private var showAddList = false
 
     private var tunnelUp: Bool {
         tunnel.status == .connected || tunnel.status == .connecting || tunnel.status == .reasserting
@@ -1122,22 +957,11 @@ struct LocalDNSView: View {
     var body: some View {
         Form {
             Section {
-                Text("Включается выбором «Локальный (LRDNS)» в выборщике DNS на главном экране.")
+                Text("Домены из включённых списков резолвятся в IP, их подсети заворачиваются в туннель, а имя сайта читается из TLS SNI. Всё остальное идёт напрямую. DNS телефона не меняется.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-
-            // ── Режимы работы ─────────────────────────────────────
-            Section("Режим работы") {
-                Toggle(isOn: $tunnel.hostsRewritesEnabled) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Hosts (перезаписи)")
-                        Text("Имена из списка получают адреса из списка")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .disabled(tunnelUp)
+            Section("Режим") {
                 Toggle(isOn: $tunnel.proxyDomainsEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Прокси-домены")
@@ -1148,232 +972,20 @@ struct LocalDNSView: View {
                 }
                 .disabled(tunnelUp)
             }
-
-            // ── DNS после списков (общий для обоих режимов) ────────
-            Section("DNS после списков") {
-                Picker("Транспорт", selection: $tunnel.localDNSUpstreamModeRaw) {
-                    ForEach(TunnelManager.DNSMode.allCases, id: \.rawValue) { mode in
-                        Text(mode.shortTitle).tag(mode.rawValue)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .disabled(tunnel.localDNSUpstreamId == "system")
-                Button {
-                    tunnel.localDNSUpstreamId = "system"
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Системный")
-                            Text("DNS устройства, туннель его не трогает")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if tunnel.localDNSUpstreamId == "system" {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
-                        }
-                    }
-                }
-                .buttonStyle(.plain)
-                ForEach(tunnel.allDNS.filter { !$0.servers.isEmpty }) { config in
-                    Button {
-                        tunnel.localDNSUpstreamId = config.id
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(config.name)
-                                Text(config.servers.joined(separator: ", "))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                            Spacer()
-                            if tunnel.localDNSUpstreamId == config.id {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                }
-                Text("Транспорт применяется к серверу выше: DoT — IP:853 с SNI, DoH — HTTPS-запрос, UDP — порт 53 без шифрования. Серверы и их адреса редактируются в «Настройках DNS».")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            // ── Hosts: список перезаписей (серо, если режим выкл) ──
-            Section("Hosts — список перезаписей") {
-                if !tunnel.hostsRewritesEnabled {
-                    Text("Режим Hosts выключен — перезаписи не применяются.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                ForEach(tunnel.allHostsLists) { list in
-                    Button {
-                        tunnel.selectedHostsListId = list.id
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(list.name)
-                                Text(list.url)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
-                            Spacer()
-                            if tunnel.selectedHostsListId == list.id {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!tunnel.hostsRewritesEnabled)
-                    if !list.isPreset && tunnel.hostsRewritesEnabled {
-                        Button(role: .destructive) {
-                            tunnel.customHostsLists.removeAll { $0.id == list.id }
-                            if tunnel.selectedHostsListId == list.id {
-                                tunnel.selectedHostsListId = "geohide"
-                            }
-                        } label: {
-                            Label("Удалить «\(list.name)»", systemImage: "trash")
-                                .font(.caption)
-                        }
-                    }
-                }
-                Button {
-                    showAddList = true
-                } label: {
-                    Label("Добавить список", systemImage: "plus.circle")
-                }
-                .disabled(!tunnel.hostsRewritesEnabled)
-            }
-
-            // ── Hosts: загрузка и тест (серо, если режим выкл) ─────
-            Section("Hosts — обновление и тест") {
-                Button {
-                    Task { await tunnel.updateLocalDNSHosts() }
-                } label: {
-                    Label("Загрузить список заново", systemImage: "arrow.triangle.2.circlepath")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .disabled(!tunnel.hostsRewritesEnabled)
-                Button {
-                    Task { await tunnel.probeHostsList() }
-                } label: {
-                    HStack {
-                        Label("Протестировать список", systemImage: "stethoscope")
-                        if tunnel.hostsListProbeRunning {
-                            Spacer()
-                            ProgressView()
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .disabled(!tunnel.hostsRewritesEnabled || tunnel.hostsListProbeRunning || tunnel.localDNSHostsText == nil)
-                if let summary = tunnel.hostsListProbeSummary {
-                    Text(summary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
-                }
-                if tunnel.localDNSUpdateMessage != nil || tunnel.localDNSHostsUpdatedAt != nil {
-                    VStack(alignment: .leading, spacing: 2) {
-                        if let msg = tunnel.localDNSUpdateMessage {
-                            Text(msg)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        if let updated = tunnel.localDNSHostsUpdatedAt {
-                            Text("Список загружен: \(updated.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-
-            // ── Прокси: домены и прокси (серо, если режим выкл) ────
-            Section("Прокси — домены и серверы") {
-                if !tunnel.proxyDomainsEnabled {
-                    Text("Режим прокси выключен — домены не перенаправляются.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            Section("Списки и прокси") {
                 NavigationLink {
                     ProxyDomainsView(tunnel: tunnel)
                 } label: {
-                    Label("Списки доменов и прокси", systemImage: "arrow.triangle.swap")
+                    Label("Списки доменов и прокси", systemImage: "list.bullet")
                 }
-                .disabled(!tunnel.proxyDomainsEnabled)
             }
-
             Section {
-                Text("Изменения применятся при следующем включении туннеля. Список кешируется: без сети работает последний загруженный.")
+                Text("Telegram всегда обрабатывается встроенным WSBridge и не уходит в прокси, даже если пресет telegram включён.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
-        .navigationTitle("Локальный DNS")
-        .navigationBarTitleDisplayMode(.inline)
-        .sheet(isPresented: $showAddList) {
-            NavigationStack {
-                HostsListEditorView(tunnel: tunnel)
-            }
-        }
-        .task {
-            // При открытии страницы: кеш пустой или старше 30 дней —
-            // обновим тихо (только если режим Hosts включен).
-            if tunnel.hostsRewritesEnabled,
-               (tunnel.localDNSHostsUpdatedAt?.timeIntervalSinceNow ?? -720 * 3600) < -(30 * 24 * 3600) {
-                _ = await tunnel.updateLocalDNSHosts()
-            }
-        }
-    }
-}
-
-/// Конструктор своего списка rewrites (URL hosts-файла).
-struct HostsListEditorView: View {
-    @ObservedObject var tunnel: TunnelManager
-    @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
-    @State private var url = ""
-
-    var body: some View {
-        Form {
-            Section("Название") {
-                TextField("Например: Мой список", text: $name)
-            }
-            Section("URL hosts-файла") {
-                TextField("https://…/hosts", text: $url)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                Text("Формат — hosts: «IP имя» в каждой строке, # — комментарий.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Section {
-                Button("Сохранить") {
-                    let cleanName = name.trimmingCharacters(in: .whitespaces)
-                    let cleanURL = url.trimmingCharacters(in: .whitespaces)
-                    guard !cleanName.isEmpty, URL(string: cleanURL)?.scheme?.hasPrefix("http") == true else { return }
-                    let list = TunnelManager.HostsList(
-                        id: "custom-\(UUID().uuidString.prefix(8))",
-                        name: cleanName, url: cleanURL, isPreset: false)
-                    tunnel.customHostsLists.append(list)
-                    tunnel.selectedHostsListId = list.id
-                    Task { await tunnel.updateLocalDNSHosts() }
-                    dismiss()
-                }
-                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty ||
-                          URL(string: url.trimmingCharacters(in: .whitespaces))?.scheme?.hasPrefix("http") != true)
-            }
-        }
-        .navigationTitle("Новый список")
+        .navigationTitle("Прокси по доменам")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

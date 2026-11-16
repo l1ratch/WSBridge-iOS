@@ -10,7 +10,7 @@ class TunnelSession {
     let connId: UInt32
     let dcIP: UInt32
     let workerDomain: String?
-    /// Прокси-режим: домен (fake-IP 198.18.1.x, восстановлен LRDNS)
+    /// Прокси-режим: домен из TLS SNI (вариант B, реальные IP)
     /// ходит через SOCKS5/HTTP-прокси.
     let proxyEndpoint: ProxyEndpoint?
     /// Прокси для SNI-фолбэка (общий с FakeIP-режимом).

@@ -306,7 +306,7 @@ final class TunnelManager: ObservableObject {
     /// с SNI и не требует бутстрап-резолва имени сервера, который
     /// система делает уже под туннелем (эта ступень и ломала DoH).
     /// UDP — plain :53 без шифрования: нужен как upstream локального
-    /// DNS (LRDNS пересылает запросы туда сырыми).
+    /// DNS (обычный выборщик приложения).
     enum DNSMode: String, CaseIterable {
         case dot, doh, udp
 
@@ -387,30 +387,15 @@ final class TunnelManager: ObservableObject {
     ]
 
     /// Выбранный транспорт шифрованного DNS (по умолчанию DoT).
-    /// Правило LRDNS: при выборе «Локальный» транспорт фиксируется на UDP
-    /// (upstream резолвера — сырые пересылки на :53), а попытка уйти с
-    /// UDP на DoT/DoH сбрасывает режим на «Системный».
     @Published var dnsModeRaw: String =
         UserDefaults.standard.string(forKey: "dnsMode") ?? DNSMode.dot.rawValue {
-        didSet {
-            UserDefaults.standard.set(dnsModeRaw, forKey: "dnsMode")
-            // Правило связки: LRDNS + не-UDP → сброс режима на системный.
-            if selectedDNSId == "lrdns", DNSMode(rawValue: dnsModeRaw) != .udp {
-                selectedDNSId = "system"
-            }
-        }
+        didSet { UserDefaults.standard.set(dnsModeRaw, forKey: "dnsMode") }
     }
 
     var dnsMode: DNSMode { DNSMode(rawValue: dnsModeRaw) ?? .dot }
 
-    /// Установка режима DNS с автофиксацией транспорта: LRDNS тянет за
-    /// собой UDP. Единая точка записи selectedDNSId (UI зовёт только её).
-    func setDNSMode(_ id: String) {
-        if id == "lrdns" {
-            dnsModeRaw = DNSMode.udp.rawValue
-        }
-        selectedDNSId = id
-    }
+    /// Единая точка записи selectedDNSId (UI зовёт только её).
+    func setDNSMode(_ id: String) { selectedDNSId = id }
 
     /// Фактический транспорт для выбранного конфига: если предпочитаемый
     /// недоступен у конфига — берём второй, если и его нет — nil (plain :53).
@@ -438,18 +423,11 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    /// ID выбранного DNS ("system" по умолчанию при первой установке —
-    /// ничего не отваливается без ведома пользователя; LRDNS включается
-    /// выбором «Локальный» руками). Спец-ID:
-    ///   "lrdns"  — локальный DNS (LRDNS): обработка в туннеле;
-    ///   "system" — не выставляет dnsSettings вовсе.
-    /// Реальные резолверы — остальными ID из allDNS.
+    /// ID выбранного DNS ("system" по умолчанию — ничего не отваливается
+    /// без ведома пользователя). Реальные резолверы — остальные ID из allDNS.
     @Published var selectedDNSId: String = UserDefaults.standard.string(forKey: "selectedDNSId") ?? "system" {
         didSet { UserDefaults.standard.set(selectedDNSId, forKey: "selectedDNSId") }
     }
-
-    /// Включён ли локальный DNS: выбирается в общему выборщике DNS.
-    var localDNSEnabled: Bool { selectedDNSId == "lrdns" }
 
     /// Все DNS: пресеты + свои.
     var allDNS: [DNSConfig] { Self.dnsPresets + customDNS }
@@ -462,304 +440,10 @@ final class TunnelManager: ObservableObject {
     /// IP-адреса для туннеля (пусто = системный).
     var activeDNSServers: [String] { selectedDNS.servers }
 
-    // MARK: - Локальный DNS (rewrites + upstream)
-
-    /// Список rewrites для локального резолвера: встроенные пресеты +
-    /// свои (URL). Встроенные — статичные URL, обновляются вручную.
-    struct HostsList: Codable, Identifiable, Equatable {
-        var id: String
-        var name: String
-        /// URL hosts-файла. nil у встроенных? Нет: встроенные тоже URL —
-        /// их контент скачивается и кешируется при включении.
-        var url: String
-        var isPreset: Bool
-    }
-
-    /// Встроенные списки rewrites (обсуждаемо расширяемые).
-    static let hostsListPresets: [HostsList] = [
-        HostsList(id: "malw", name: "dns.malw.link",
-                  url: "https://raw.githubusercontent.com/ImMALWARE/dns.malw.link/master/hosts",
-                  isPreset: true),
-        HostsList(id: "geohide", name: "GeoHide",
-                  url: "https://raw.githubusercontent.com/Internet-Helper/GeoHideDNS/refs/heads/main/hosts/hosts",
-                  isPreset: true),
-    ]
-
-    /// Свои списки rewrites (URL на hosts-файл).
-    @Published var customHostsLists: [HostsList] = {
-        guard let data = UserDefaults.standard.data(forKey: "customHostsLists"),
-              let lists = try? JSONDecoder().decode([HostsList].self, from: data) else { return [] }
-        return lists
-    }() {
-        didSet {
-            if let data = try? JSONEncoder().encode(customHostsLists) {
-                UserDefaults.standard.set(data, forKey: "customHostsLists")
-            }
-        }
-    }
-
-    var allHostsLists: [HostsList] { Self.hostsListPresets + customHostsLists }
-
-    /// Выбранный список rewrites. ГеоHide по умолчанию (большой, RU).
-    @Published var selectedHostsListId: String = UserDefaults.standard.string(forKey: "selectedHostsListId") ?? "geohide" {
-        didSet { UserDefaults.standard.set(selectedHostsListId, forKey: "selectedHostsListId") }
-    }
-
-    /// Upstream для локального DNS: ID DNS-конфига из общего списка или
-    /// "system" (по умолчанию). "system" = резолвер спрашивает системный DNS.
-    @Published var localDNSUpstreamId: String = UserDefaults.standard.string(forKey: "localDNSUpstreamId") ?? "system" {
-        didSet { UserDefaults.standard.set(localDNSUpstreamId, forKey: "localDNSUpstreamId") }
-    }
-
-    /// Транспорт upstream'а локального DNS: DoT / DoH / UDP. Своё
-    /// значение, отдельное от глобального свитчера. По умолчанию UDP.
-    /// Конфиг upstream'а берётся из ОБЩЕГО списка DNS (единственная
-    /// точка, где редактируются серверы).
-    @Published var localDNSUpstreamModeRaw: String =
-        UserDefaults.standard.string(forKey: "localDNSUpstreamMode") ?? DNSMode.udp.rawValue {
-        didSet { UserDefaults.standard.set(localDNSUpstreamModeRaw, forKey: "localDNSUpstreamMode") }
-    }
-
-    var localDNSUpstreamMode: DNSMode { DNSMode(rawValue: localDNSUpstreamModeRaw) ?? .udp }
-
-    /// Конфиг, выбранный upstream'ом LRDNS (nil = системный).
-    var localDNSUpstreamConfig: DNSConfig? {
-        allDNS.first { $0.id == localDNSUpstreamId }
-    }
-
-    /// Режим Hosts (перезаписи имён из списка). Общий тумблер LRDNS-
-    /// страницы: выключен = rewrites не передаются в туннель.
-    @Published var hostsRewritesEnabled: Bool = UserDefaults.standard.object(forKey: "hostsRewritesEnabled") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(hostsRewritesEnabled, forKey: "hostsRewritesEnabled") }
-    }
-
     /// Режим прокси-доменов: выключен = домены не перенаправляются
     /// через прокси (прокси в настройках остаются, но не используются).
     @Published var proxyDomainsEnabled: Bool = UserDefaults.standard.object(forKey: "proxyDomainsEnabled") as? Bool ?? false {
         didSet { UserDefaults.standard.set(proxyDomainsEnabled, forKey: "proxyDomainsEnabled") }
-    }
-
-    // MARK: - Этап 2: проверка DoH-воркера (минимальная конфигурация)
-    //
-    // Полноценный UI (блок «Воркер», нередактируемое поле ID, кнопка
-    // «Копировать», «Тест воркера», инструкция) — этап 3. Здесь только
-    // то, что нужно, чтобы проверить на живом iPhone главный риск:
-    // доходит ли path /dns-query/<ID> и применяется ли matchDomains.
-
-    /// Результат ручной проверки воркера (кнопка «Тест воркера» этапа 2).
-    @Published var dohWorkerTestMessage: String?
-
-    /// Проверяет /diagnose воркера обычным URLSession (НЕ системным DoH).
-    /// Пишет, что воркер распознал, и его ошибки — чтобы до включения
-    /// туннеля убедиться, что код задеплоен и переменные заданы.
-    func testDoHWorker() async {
-        let host = dohWorkerHost
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "https://", with: "")
-            .replacingOccurrences(of: "http://", with: "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !host.isEmpty else {
-            dohWorkerTestMessage = "Укажите адрес воркера"
-            return
-        }
-        guard let url = URL(string: "https://\(host)/diagnose") else {
-            dohWorkerTestMessage = "Невалидный адрес"
-            return
-        }
-        do {
-            let (data, resp) = try await URLSession.shared.data(from: url)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                dohWorkerTestMessage = "Воркер не ответил /diagnose"
-                return
-            }
-            let parsed = json["parsed"] as? [String: Any] ?? [:]
-            let config = json["config"] as? [String: Any] ?? [:]
-            let errors = json["errors"] as? [[String: Any]] ?? []
-            let mode = parsed["mode"] as? String ?? "?"
-            let fake = config["fakeIp"] as? String ?? "?"
-            let codes = errors.compactMap { $0["code"] as? String }.joined(separator: ", ")
-            dohWorkerTestMessage = "OK · mode=\(mode) · fakeIp=\(fake)" +
-                (codes.isEmpty ? "" : " · \(codes)")
-        } catch {
-            dohWorkerTestMessage = "Ошибка: \(error.localizedDescription)"
-        }
-    }
-
-    /// Голый адрес воркера. Дефолт — рабочий воркер для этапа 2; в этапе 3
-    /// станет редактируемым полем блока «Воркер». Пустая строка = тест
-    /// выключен, приложение работает ровно как до этапа 2.
-    @Published var dohWorkerHost: String = UserDefaults.standard.string(forKey: "dohWorkerHost")
-        ?? "spring-pond-b6cc.sm171105.workers.dev" {
-        didSet { UserDefaults.standard.set(dohWorkerHost, forKey: "dohWorkerHost") }
-    }
-
-    /// ID устройства = identifierForVendor. Стабилен между запусками,
-    /// меняется при удалении всех приложений этого вендора. НЕ редактируется
-    /// в UI (этап 3), здесь computed.
-    var deviceID: String { UIDevice.current.identifierForVendor?.uuidString ?? "unknown" }
-
-    /// Точные домены для matchDomains. Этап 2: жёстко заданный минимальный
-    /// набор для проверки (этап 3 заменит на загрузку из включённых .lst).
-    /// НИКАКОЙ агрегации до eTLD+1 — только точные имена.
-    static let stage2MatchDomains: [String] = [
-        "gemini.google.com",
-        "generativelanguage.googleapis.com",
-        "api.openai.com",
-        "chatgpt.com",
-    ]
-
-    /// URL системного DoH для этапа 2. Путь только с ID, без сегмента
-    /// списков: воркер работает в MODE="simple".
-    var dohEndpointURL: URL? {
-        let host = dohWorkerHost
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "https://", with: "")
-            .replacingOccurrences(of: "http://", with: "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !host.isEmpty else { return nil }
-        return URL(string: "https://\(host)/dns-query/\(deviceID)")
-    }
-
-    /// IPv4-адреса хоста через getaddrinfo. Вызывается в Main App ДО
-    /// старта туннеля (RFC 8484 §10 forbids bootstrapping the DoH server
-    /// through itself). Пустой массив → расширение оставит `servers`
-    /// пустым и залогирует ошибку, но не уронит туннель.
-    static func resolveIPv4(_ host: String) -> [String] {
-        guard !host.isEmpty else { return [] }
-        var hints = addrinfo()
-        hints.ai_family = AF_INET
-        hints.ai_socktype = SOCK_STREAM
-        var res: UnsafeMutablePointer<addrinfo>?
-        guard host.withCString({ getaddrinfo($0, nil, &hints, &res) }) == 0,
-              let res else { return [] }
-        defer { freeaddrinfo(res) }
-        var out: [String] = []
-        var cur: UnsafeMutablePointer<addrinfo>? = res
-        while let ai = cur {
-            if ai.pointee.ai_family == AF_INET, let sa = ai.pointee.ai_addr {
-                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
-                    var addr = sin.pointee.sin_addr
-                    if inet_ntop(AF_INET, &addr, &buf, socklen_t(buf.count)) != nil {
-                        let ip = String(cString: buf)
-                        if !out.contains(ip) { out.append(ip) }
-                    }
-                }
-            }
-            cur = ai.pointee.ai_next
-        }
-        return out
-    }
-
-    // MARK: - Диагностика DNS (страница «Тест DNS»)
-
-    /// Диагностический режим для страницы «Тест DNS». Оба варианта работают
-    /// ОДИНАКОВО по сети и отличаются только пометкой в журнале.
-    /// Раньше здесь был режим "default" (0.0.0.0/0) — он забирал весь
-    /// трафик, убивал сайты, loopback-журнал и слал ложные уведомления.
-    /// Удалён: рабочая конфигурация всегда узкая.
-    @Published var dnsProbeMode: String? = UserDefaults.standard.string(forKey: "dnsProbeMode") {
-        didSet { UserDefaults.standard.set(dnsProbeMode, forKey: "dnsProbeMode") }
-    }
-
-    /// Подписи режимов для UI.
-    struct DNSProbeModeInfo: Identifiable {
-        let id: String
-        let title: String
-        let detail: String
-    }
-
-    static let dnsProbeTitles: [DNSProbeModeInfo] = [
-        DNSProbeModeInfo(id: "split", title: "Обычный (рекомендуется)",
-         detail: "Узкие маршруты: Telegram + прокси-домены + CDN. Остальной трафик идёт мимо туннеля. DNS перехватывается маршрутом /32."),
-        DNSProbeModeInfo(id: "matchall", title: "Обычный + расширенный журнал",
-         detail: "То же самое по сети, отличается только пометка в журнале. Ничего не ломает."),
-    ]
-
-    /// Кеш контента выбранного списка (текст hosts-файла).
-    @Published private(set) var localDNSHostsText: String? = UserDefaults.standard.string(forKey: "localDNSHostsText") {
-        didSet { UserDefaults.standard.set(localDNSHostsText, forKey: "localDNSHostsText") }
-    }
-
-    /// Дата последней загрузки списка.
-    @Published private(set) var localDNSHostsUpdatedAt: Date? {
-        didSet { UserDefaults.standard.set(localDNSHostsUpdatedAt, forKey: "localDNSHostsUpdatedAt") }
-    }
-
-    /// Статус загрузки (для UI).
-    @Published var localDNSUpdateMessage: String?
-
-    // MARK: - Прокси-домены (списки itdoginfo + свои) и прокси
-
-    /// Список прокси-доменов: пресеты (itdoginfo/allow-domains) + свои.
-    struct ProxyDomainList: Codable, Identifiable, Equatable {
-        var id: String
-        var name: String
-        /// URL файла с доменами (по одному в строке).
-        var url: String
-        var isPreset: Bool
-    }
-
-    /// Пресеты списков прокси-доменов (itdoginfo/allow-domains, raw-формат).
-    static let proxyListPresets: [ProxyDomainList] = [
-        ProxyDomainList(id: "geoblock", name: "Russia outside (заблокированы в РФ)",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/outside-raw.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "youtube", name: "YouTube",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/youtube.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "discord", name: "Discord",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/discord.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "meta", name: "Meta (Instagram, Facebook)",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/meta.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "twitter", name: "Twitter (X)",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/twitter.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "tiktok", name: "TikTok",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/tiktok.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "google-ai", name: "Google AI (Gemini)",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/google_ai.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "hdrezka", name: "HDRezka",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/hdrezka.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "telegram", name: "Telegram (домены)",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/telegram.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "google-play", name: "Google Play",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/google_play.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "cloudflare", name: "Cloudflare",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/cloudflare.lst",
-                        isPreset: true),
-        ProxyDomainList(id: "roblox", name: "Roblox",
-                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/roblox.lst",
-                        isPreset: true),
-    ]
-
-    /// Свои списки прокси-доменов.
-    @Published var customProxyLists: [ProxyDomainList] = {
-        guard let data = UserDefaults.standard.data(forKey: "customProxyLists"),
-              let lists = try? JSONDecoder().decode([ProxyDomainList].self, from: data) else { return [] }
-        return lists
-    }() {
-        didSet {
-            if let data = try? JSONEncoder().encode(customProxyLists) {
-                UserDefaults.standard.set(data, forKey: "customProxyLists")
-            }
-        }
-    }
-
-    var allProxyLists: [ProxyDomainList] { Self.proxyListPresets + customProxyLists }
-
-    /// Включённые списки прокси-доменов (ID). Пусто = проксирование
-    /// доменов выключено (прокси, однако, может остаться для теста).
-    @Published var enabledProxyListIds: [String] = UserDefaults.standard.stringArray(forKey: "enabledProxyListIds") ?? [] {
-        didSet { UserDefaults.standard.set(enabledProxyListIds, forKey: "enabledProxyListIds") }
     }
 
     /// Прокси: строки socks5://[user:pass@]host:port или http://...
@@ -782,20 +466,22 @@ final class TunnelManager: ObservableObject {
     }
 
     /// Загружает домены ВКЛЮЧЁННЫХ списков (параллельно). Возвращает
-    /// массив доменов (объединённый, дедуплицированный, ≤250: столько
-    /// fake-IP в пуле).
+    /// объединённый дедуплицированный массив. Обрезки нет: варианту B
+    /// не нужен пул FakeIP, домены идут прямо в SNI-матчер.
+    /// Пресет `telegram` исключён: MTProto обрабатывается WSBridge по IP
+    /// датацентров и НЕ должен уходить в socks5 (§4 концепции).
     func loadProxyDomains() async -> [String] {
         var domains: [String] = []
         var seen = Set<String>()
         await withTaskGroup(of: [String]?.self) { group in
-            for list in allProxyLists where enabledProxyListIds.contains(list.id) {
+            for list in allProxyLists where enabledProxyListIds.contains(list.id) && list.id != "telegram" {
                 group.addTask {
                     guard let url = URL(string: list.url) else { return nil }
                     var request = URLRequest(url: url)
                     request.timeoutInterval = 15
                     request.cachePolicy = .reloadIgnoringLocalCacheData
                     do {
-                        let (data, response) = try await URLSession.shared.data(for: request)
+                        let (data, response) = try await URLSession.shared.data(from: request)
                         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
                         let text = String(data: data, encoding: .utf8) ?? ""
                         return text.split(separator: "\n")
@@ -812,22 +498,63 @@ final class TunnelManager: ObservableObject {
                 }
             }
         }
-        return Array(domains.prefix(250))
+        return domains
     }
 
-    /// Подсети для real-IP / SNI-фолбэка. Не «весь Cloudflare», а точечные
-    /// блоки основных AI-сервисов: чем меньше маршрутов, тем меньше трафика
-    /// вообще заходит в utun и тем ниже расход батареи. Списки itdoginfo:
-    /// https://github.com/itdoginfo/allow-domains/tree/main/Subnets/IPv4
-    static let sniCIDRs: [String] = [
-        "104.18.0.0/16",     // Cloudflare (OpenAI/Claude/Perplexity)
-        "172.67.0.0/16",     // Cloudflare
-        "104.16.0.0/13",     // Cloudflare
-        "142.250.0.0/15",    // Google (Gemini)
-        "34.64.0.0/10",      // Google Cloud
-        "151.101.0.0/16",    // Fastly
-        "140.82.112.0/20",   // GitHub / Cursor
-    ]
+    // MARK: - Вариант B: реальные IP + SNI (без подмены DNS)
+
+    /// Резолвит домены включённых списков и превращает их в компактный
+    /// набор CIDR для `NEIPv4Settings.includedRoutes`.
+    ///
+    /// Принцип (как `nft set` в Podkop, только на iOS): мы НЕ трогаем
+    /// системный DNS и НЕ подменяем адреса. Мы заранее говорим ядру,
+    /// какие подсети завернуть в utun; уже внутри туннеля `TLSSNI`
+    /// читает домен из ClientHello и решает: прокси или direct.
+    /// Резолв идёт в Main App (памяти гигабайты), extension получает
+    /// готовые строки и не держит списки в своих 50 МБ.
+    static func resolveToCIDRs(_ domains: [String]) async -> [String] {
+        // Один домен → несколько A-записей; /24 собирает рядом лежащие
+        // адреса одного CDN и резко сокращает число маршрутов.
+        // Никакой агрегации до eTLD+1: только точные IP из getaddrinfo.
+        var cidrs = Set<String>()
+        await withTaskGroup(of: [String]?.self) { group in
+            for domain in domains {
+                group.addTask {
+                    var hints = addrinfo()
+                    hints.ai_family = AF_INET
+                    hints.ai_socktype = SOCK_STREAM
+                    var res: UnsafeMutablePointer<addrinfo>?
+                    guard domain.withCString({ getaddrinfo($0, nil, &hints, &res) }) == 0,
+                          let res else { return nil }
+                    defer { freeaddrinfo(res) }
+                    var out: [String] = []
+                    var cur: UnsafeMutablePointer<addrinfo>? = res
+                    while let ai = cur {
+                        if ai.pointee.ai_family == AF_INET, let sa = ai.pointee.ai_addr {
+                            var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                            sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                                var addr = sin.pointee.sin_addr
+                                if inet_ntop(AF_INET, &addr, &buf, socklen_t(buf.count)) != nil {
+                                    let ip = String(cString: buf)
+                                    let parts = ip.split(separator: ".").compactMap { UInt32($0) }
+                                    if parts.count == 4 {
+                                        out.append("\(parts[0]).\(parts[1]).\(parts[2]).0/24")
+                                    }
+                                }
+                            }
+                        }
+                        cur = ai.pointee.ai_next
+                    }
+                    return out.isEmpty ? nil : out
+                }
+            }
+            for await batch in group {
+                guard let batch else { continue }
+                for c in batch { cidrs.insert(c) }
+            }
+        }
+        return cidrs.sorted()
+    }
 
     // MARK: - Тест прокси
 
@@ -866,7 +593,7 @@ final class TunnelManager: ObservableObject {
             .first?.key
     }
 
-    // MARK: - Пробы живости (выборщик DNS + тест списка LRDNS)
+    // MARK: - Пробы живости (выборщик DNS)
 
     /// Результаты пробы DNS-серверов выборщика: id конфига → результат.
     /// Прогоняется при открытии DNSView.
@@ -893,136 +620,6 @@ final class TunnelManager: ObservableObject {
                 dnsProbes[id] = result
             }
         }
-    }
-
-    // MARK: - Тест выбранного списка LRDNS
-
-    /// Результаты теста списка: уникальные IP → живость+мс.
-    @Published private(set) var hostsListProbe: [String: ProbeResult] = [:]
-
-    /// Домены-примеры для «что доступно» в отчёте теста списка.
-    @Published private(set) var hostsListProbeSummary: String?
-
-    /// Идет ли тест списка.
-    @Published private(set) var hostsListProbeRunning = false
-
-    /// Тестирует выбранный список: TCP:443-проба всех уникальных IP
-    /// (параллельно) + выборка популярных доменов из списка с их
-    /// живостью. Результат — в hostsListProbe и текстовая сводка.
-    func probeHostsList() async {
-        guard !hostsListProbeRunning,
-              let list = selectedHostsList,
-              let text = localDNSHostsText else {
-            hostsListProbeSummary = "Список не загружен"
-            return
-        }
-        hostsListProbeRunning = true
-        hostsListProbe = [:]
-        hostsListProbeSummary = nil
-        defer { hostsListProbeRunning = false }
-        // Уникальные IP из списка (без 0.0.0.0/127.*).
-        var ips: [String] = []
-        var domainsByIP: [String: [String]] = [:]
-        for rawLine in text.split(separator: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
-            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            let ipStr = parts.count >= 2 ? String(parts[0]) : ""
-            guard IPv4AddrQuick.parse(ipStr),
-                  ipStr != "0.0.0.0", !ipStr.hasPrefix("127.") else { continue }
-            if !ips.contains(ipStr) { ips.append(ipStr) }
-            domainsByIP[ipStr, default: []].append(String(parts[1]))
-        }
-        // Пробим параллельно (батчами по 8, чтобы не задушить сеть).
-        var results: [String: ProbeResult] = [:]
-        for batch in stride(from: 0, to: ips.count, by: 8).map({ Array(ips[$0..<min($0+8, ips.count)]) }) {
-            await withTaskGroup(of: (String, ProbeResult).self) { group in
-                for ip in batch {
-                    group.addTask {
-                        let r = await DNSProbe.tcp(ip, port: 443)
-                        return (ip, r)
-                    }
-                }
-                for await (ip, result) in group {
-                    results[ip] = result
-                    hostsListProbe[ip] = result
-                }
-            }
-        }
-        // Сводка по ДОМЕНАМ (не IP): каждый домен смотрим по его IP.
-        // IP-таблицу и «примеры» не показываем — только счётчики
-        // доступности и два списка доменов: работающие и нет.
-        let aliveIPs = Set(results.filter {
-            if case .alive = $0.value { true } else { false }
-        }.keys)
-        let slowIPs = Set(results.filter {
-            if case .slow = $0.value { true } else { false }
-        }.keys)
-        var working: [String] = []      // домены на живых IP
-        var flaky: [String] = []        // домены на медленных IP
-        var broken: [String] = []       // домены на мёртвых IP
-        var seen = Set<String>()
-        for (ip, doms) in domainsByIP {
-            for d in doms {
-                let domain = d.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-                guard !domain.isEmpty, !seen.contains(domain) else { continue }
-                seen.insert(domain)
-                if aliveIPs.contains(ip) { working.append(domain) }
-                else if slowIPs.contains(ip) { flaky.append(domain) }
-                else { broken.append(domain) }
-            }
-        }
-        hostsListProbeSummary = [
-            "Работают: \(working.count) доменов",
-            working.count > 0 ? "  " + working.prefix(30).joined(separator: ", ") : nil,
-            flaky.count > 0 ? "Медленные (нестабильно): \(flaky.count) доменов" : nil,
-            broken.count > 0 ? "Не работают: \(broken.count) доменов" : nil,
-            broken.count > 0 ? "  " + broken.prefix(30).joined(separator: ", ") : nil,
-        ].compactMap { $0 }.joined(separator: "\n")
-    }
-
-    /// Загружает контент выбранного списка rewrites. Валидация: в файле
-    /// должно быть ≥3 строк «IP имя» (см. updateFronts для аналога).
-    @discardableResult
-    func updateLocalDNSHosts() async -> Bool {
-        guard let list = selectedHostsList else {
-            localDNSUpdateMessage = "Список не найден"
-            return false
-        }
-        localDNSUpdateMessage = "Загрузка…"
-        var request = URLRequest(url: URL(string: list.url)!)
-        request.timeoutInterval = 15
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                localDNSUpdateMessage = "Источник ответил \( (response as? HTTPURLResponse)?.statusCode ?? -1)"
-                return false
-            }
-            let text = String(data: data, encoding: .utf8) ?? ""
-            // Валидация: считаем строки-правила (не комментарии).
-            let ruleLines = text.split(separator: "\n")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty && !$0.hasPrefix("#") && $0.split(whereSeparator: { $0 == " " || $0 == "\t" }).count >= 2 }
-            guard ruleLines.count >= 3 else {
-                localDNSUpdateMessage = "Битый файл (\(ruleLines.count) правил)"
-                return false
-            }
-            localDNSHostsText = text
-            localDNSHostsUpdatedAt = Date()
-            localDNSUpdateMessage = "Загружено: \(ruleLines.count) правил"
-            return true
-        } catch {
-            localDNSUpdateMessage = "Ошибка: \(error.localizedDescription)"
-            return false
-        }
-    }
-
-    /// Выбранный список rewrites (nil, если сохранённый ID указывает на
-    /// удалённый список — фолбэк на первый пресет).
-    var selectedHostsList: HostsList? {
-        allHostsLists.first { $0.id == selectedHostsListId }
-            ?? Self.hostsListPresets.first
     }
 
     // MARK: - Фронты (hot-обновление без пересборки)
@@ -1759,42 +1356,14 @@ final class TunnelManager: ObservableObject {
             .filter { !$0.isEmpty }
         if !dcLines.isEmpty { config["dcMap"] = dcLines as NSArray }
         if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
-        // ── Режим прокси по доменам (бывший LRDNS) ───────────────────
-        // Чистка: при включённом DoH-воркере НЕ шлём мёртвый конфиг
-        // старого локального резолвера (localDNS / dnsProbe / hosts /
-        // upstream). Именно он заставлял «Локальный DNS» ломать Telegram,
-        // тогда как с «Системным» туннель был чистым.
-        // Прокси-домены и сам прокси передаём ВСЕГДА по своему тумблеру,
-        // независимо от выбора DNS в основном выборщике.
-        let workerOn = dohEndpointURL != nil
-        if !workerOn && localDNSEnabled {
-            config["localDNS"] = true as NSNumber
-            if let probe = dnsProbeMode, !probe.isEmpty {
-                config["dnsProbe"] = probe as NSString
-            }
-            if hostsRewritesEnabled, let hosts = localDNSHostsText, !hosts.isEmpty {
-                config["localDNSHosts"] = hosts as NSString
-            }
-            if let up = localDNSUpstreamConfig, !up.servers.isEmpty {
-                config["localDNSUpstream"] = up.servers as NSArray
-                switch localDNSUpstreamMode {
-                case .dot:
-                    if let host = up.dotHostname { config["localDNSUpstreamDoT"] = host as NSString }
-                case .doh:
-                    if let url = up.dohURL { config["localDNSUpstreamDoH"] = url as NSString }
-                case .udp:
-                    break
-                }
-            }
-        }
+        // ── Вариант B: прокси по доменам через реальные IP + SNI ──────
+        // DNS системы НЕ трогаем: сайты и Telegram резолвятся как обычно.
+        // Домены включённых списков резолвим здесь, в Main App, и кладём
+        // компактный набор CIDR в includedRoutes. Внутри туннеля TLSSNI
+        // читает имя из ClientHello и решает: прокси или direct.
         if proxyDomainsEnabled {
             let domainList = await loadProxyDomains()
-            // sniCIDRs — остатки старой CIDR-архитектуры. При воркере они
-            // не нужны (метка 198.18.0.3/32) и вредны: IP самого воркера
-            // попадал в includedRoutes и ломал TLS к нему.
-            if !workerOn {
-                config["sniCIDRs"] = Self.sniCIDRs as NSArray
-            }
+            let cidrs = await Self.resolveToCIDRs(domainList)
             let activeProxy: String?
             if selectedProxyIndex >= 0, selectedProxyIndex < proxyURLs.count {
                 activeProxy = proxyURLs[selectedProxyIndex]
@@ -1803,10 +1372,12 @@ final class TunnelManager: ObservableObject {
             } else {
                 activeProxy = proxyURLs.first
             }
-            if !domainList.isEmpty, let activeProxy,
+            if !domainList.isEmpty, !cidrs.isEmpty, let activeProxy,
                ProxyEndpoint.parse(activeProxy) != nil {
                 config["proxyDomains"] = domainList as NSArray
+                config["routeCIDRs"] = cidrs as NSArray
                 config["proxies"] = [activeProxy] as NSArray
+                NSLog("[WSBridge] routeB: domains=%d cidrs=%d", domainList.count, cidrs.count)
             }
         }
         if !activeDNSServers.isEmpty {
@@ -1823,21 +1394,6 @@ final class TunnelManager: ObservableObject {
             case nil:
                 break // ни DoT, ни DoH — plain :53
             }
-        }
-        // ── Этап 2: DoH-воркер (Вариант Б) ──────────────────────────
-        // Включается ТОЛЬКО если задан адрес воркера. Иначе приложение
-        // работает ровно как раньше (системный DNS / обычный выборщик).
-        // Это позволяет выключить тест одним удалением адреса, не пересобирая.
-        if let url = dohEndpointURL {
-            config["dohWorkerURL"] = url.absoluteString as NSString
-            config["dohMatchDomains"] = Self.stage2MatchDomains as NSArray
-            // RFC 8484 §10: IP воркера резолвим ДО включения туннеля,
-            // чтобы не было петли «резолвим воркер через сам воркер».
-            let host = url.host ?? ""
-            let ips = Self.resolveIPv4(host)
-            config["dohWorkerIPs"] = ips as NSArray
-            NSLog("[WSBridge] stage2 DoH: url=%@ match=%d ips=%d",
-                  url.absoluteString, Self.stage2MatchDomains.count, ips.count)
         }
         proto.providerConfiguration = config.isEmpty ? nil : config
         m.protocolConfiguration = proto

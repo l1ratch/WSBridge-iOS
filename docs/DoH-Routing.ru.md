@@ -1,13 +1,56 @@
-# WSBridge · Роутинг по доменам через собственный DoH (концепция D)
+# WSBridge · Роутинг по доменам
 
-> Статус: **утверждается**, код не менялся, коммита/пуша нет.
-> Последняя опубликованная сборка — `0.3.16`.
-> Незапушенный эксперимент с 26 CIDR + IPv6 лежит в рабочем дереве и в эту
-> концепцию **не входит** (откатывается на этапе 0).
+> ⚠️ **СТАТУС: КОНЦЕПЦИЯ D (DoH + FakeIP) ЗАКРЫТА КАК НЕРАБОЧАЯ НА iOS.**
+> Реализован **Вариант B: реальные IP + SNI** (см. раздел 11 в конце).
+> Этот документ сохранён как история решения: почему подмена DNS через
+> `NEDNSOverHTTPSSettings` не даёт гарантии, что iOS спросит наш резолвер
+> и использует его ответ.
+
+## 11. Финальное решение — Вариант B (реальные IP + SNI)
+
+**Причина закрытия D (измерения, а не догадки):**
+
+- `/recent` воркера: iOS присылает `apple.com` (qtype 2), но **не присылает
+  `gemini.google.com`**, хотя он в `matchDomains` и открыт в Safari.
+- `dst:fakeip=0`, `io:in=0` — пакет на FakeIP не попадает в `packetFlow`.
+- Тест с `FAKE_IP=149.154.199.199` (адрес внутри маршрутизируемой /16)
+  доказал: когда iOS всё-таки шлёт пакет, весь конвейер работает
+  (`accept:` → TLS ClientHello → lwIP → SNI → ProxyClient).
+- Значит проблема не в адресе/маршрутах/DNS-ответе, а в том, что
+  **системный DoH-резолвер iOS не гарантирует ни запрос к нам, ни
+  использование нашего A-ответа** (кеш, Happy Eyeballs, NS/AAAA/HTTPS).
+  `matchDomains` не ограничивает и не обязывает.
+
+**Вариант B:**
+
+```
+Main App: включённые .lst → getaddrinfo → /24 CIDR (дедуп)
+   ↓ providerConfiguration["routeCIDRs"] + ["proxyDomains"] + ["proxies"]
+PacketTunnelProvider:
+   includedRoutes = Telegram DC + эти CIDR      (УЗКИЕ маршруты)
+   excludedRoutes = IP socks5/http-прокси
+   dnsSettings НЕ трогаем (обычный выборщик DNS приложения)
+   ↓
+Пакет на реальный IP → lwIP → TLSSNI(ClientHello)
+   ├─ домен в списке → ProxyClient CONNECT по ИМЕНИ → socks5/http
+   └─ домен не в списке → DirectStream наружу
+```
+
+- Не зависит от DNS, кеша, DoH, FakeIP, воркера.
+- Любые списки `allow-domains`, без хардкода подсетей.
+- Батарея: узкие маршруты, остальной трафик мимо utun.
+- Telegram: приоритет по IP датацентров, WSBridge не тронут.
+- Воркер (ветка `worker`) остаётся как справочник `lists.json` и
+  диагностика `/recent` `/diagnose`, но в боевом пути не участвует.
+
+Переиспользовано: `TLSSNI.swift`, `ProxyClient.swift`, `DirectStream`,
+`lwip_bridge.c`, `parseCIDRs`, `isSNIInterceptCandidate`, CI, `X.Y.N`.
+Удалено: `LocalDNSResolver`, `DNSForwarder`, Hosts/LRDNS UI, «Тест DNS»,
+DoH-ветка `startTunnel`, FakeIP-метка, `dnsProbeMode`.
 
 ---
 
-## 0. Почему вообще меняем архитектуру
+## 0. Почему вообще меняем архитектуру (исторический раздел D)
 
 Три сборки попыток перехватить DNS внутри `NEPacketTunnelProvider` провалились
 по одной причине, зафиксированной логами:
