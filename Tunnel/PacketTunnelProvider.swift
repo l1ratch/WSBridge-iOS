@@ -105,7 +105,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var routes = TelegramDCs.includedRoutes
         // Маршрут /32 на 198.18.0.3 больше НЕ нужен: dnsSettings снят,
         // локальный резолвер не перехватывает системный DNS.
-        if !proxyDomains.isEmpty, !proxyURLs.isEmpty {
+        // При включённом DoH-воркере 198.18.1.0/24 нужен ВСЕГДА: воркер
+        // возвращает 198.18.1.1 как метку, и пакет обязан попасть в utun.
+        // Раньше маршрут зависел от proxyDomains/proxyURLs — если они не
+        // доезжали, FakeIP уходил мимо туннеля и сайт «залипал».
+        let workerOn = (proto?.providerConfiguration?["dohWorkerURL"] as? String) != nil
+        if workerOn || (!proxyDomains.isEmpty && !proxyURLs.isEmpty) {
             routes.append(NEIPv4Route(destinationAddress: "198.18.1.0", subnetMask: "255.255.255.0"))
         }
         // Real-IP фолбэк для упрямых приложений (свой DoH/DoT, проверка
@@ -151,6 +156,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             NSLog("[WSBridge] DNS: DoH worker %@ match=%d ips=%d",
                   dohWorkerURL.absoluteString, dohMatchDomains.count, dohWorkerIPs.count)
             EventLog.append("cfg:doh=worker match=\(dohMatchDomains.count) ips=\(dohWorkerIPs.count) url=\(dohWorkerURL.absoluteString)")
+            EventLog.append("cfg:routes=\(routes.count) fakeip=\(workerOn ? 1 : 0) excluded=\(excluded.count)")
         } else if localDNSEnabled {
             // НЕ объявляем dnsSettings ВООБЩЕ.
             //
