@@ -1,4 +1,4 @@
-import Foundation
+﻿import Foundation
 import Network
 import NetworkExtension
 import UserNotifications
@@ -445,6 +445,77 @@ final class TunnelManager: ObservableObject {
     @Published var proxyDomainsEnabled: Bool = UserDefaults.standard.object(forKey: "proxyDomainsEnabled") as? Bool ?? false {
         didSet { UserDefaults.standard.set(proxyDomainsEnabled, forKey: "proxyDomainsEnabled") }
     }
+
+    /// Список прокси-доменов: пресеты (itdoginfo/allow-domains) + свои.
+    struct ProxyDomainList: Codable, Identifiable, Equatable {
+        var id: String
+        var name: String
+        /// URL файла с доменами (по одному в строке).
+        var url: String
+        var isPreset: Bool
+    }
+
+    /// Пресеты списков прокси-доменов (itdoginfo/allow-domains, raw-формат).
+    static let proxyListPresets: [ProxyDomainList] = [
+        ProxyDomainList(id: "geoblock", name: "Russia outside (заблокированы в РФ)",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/outside-raw.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "youtube", name: "YouTube",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/youtube.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "discord", name: "Discord",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/discord.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "meta", name: "Meta (Instagram, Facebook)",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/meta.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "twitter", name: "Twitter (X)",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/twitter.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "tiktok", name: "TikTok",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/tiktok.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "google-ai", name: "Google AI (Gemini)",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/google_ai.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "hdrezka", name: "HDRezka",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/hdrezka.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "telegram", name: "Telegram (домены)",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/telegram.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "google-play", name: "Google Play",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/google_play.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "cloudflare", name: "Cloudflare",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/cloudflare.lst",
+                        isPreset: true),
+        ProxyDomainList(id: "roblox", name: "Roblox",
+                        url: "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/roblox.lst",
+                        isPreset: true),
+    ]
+
+    /// Свои списки прокси-доменов.
+    @Published var customProxyLists: [ProxyDomainList] = {
+        guard let data = UserDefaults.standard.data(forKey: "customProxyLists"),
+              let lists = try? JSONDecoder().decode([ProxyDomainList].self, from: data) else { return [] }
+        return lists
+    }() {
+        didSet {
+            if let data = try? JSONEncoder().encode(customProxyLists) {
+                UserDefaults.standard.set(data, forKey: "customProxyLists")
+            }
+        }
+    }
+
+    var allProxyLists: [ProxyDomainList] { Self.proxyListPresets + customProxyLists }
+
+    /// Включённые списки прокси-доменов (ID). Пусто = проксирование
+    /// доменов выключено (прокси, однако, может остаться для теста).
+    @Published var enabledProxyListIds: [String] = UserDefaults.standard.stringArray(forKey: "enabledProxyListIds") ?? [] {
+        didSet { UserDefaults.standard.set(enabledProxyListIds, forKey: "enabledProxyListIds") }
+    }
+
 
     /// Прокси: строки socks5://[user:pass@]host:port или http://...
     @Published var proxyURLs: [String] = UserDefaults.standard.stringArray(forKey: "proxyURLs") ?? [] {

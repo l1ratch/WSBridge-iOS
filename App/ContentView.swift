@@ -1126,11 +1126,6 @@ struct DNSEditorView: View {
                         if tunnel.selectedDNSId == config?.id {
                             tunnel.selectedDNSId = "system"
                         }
-                        // Был upstream'ом локального DNS — сбрасываем на
-                        // системный, чтобы не осталось битой ссылки.
-                        if tunnel.localDNSUpstreamId == config?.id {
-                            tunnel.localDNSUpstreamId = "system"
-                        }
                         dismiss()
                     }
                 }
