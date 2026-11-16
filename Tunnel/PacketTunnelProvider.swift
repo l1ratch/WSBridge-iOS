@@ -32,6 +32,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var statDNSHandled: UInt64 = 0
     /// Первые N адресов назначения UDP:53 — куда система шлёт DNS.
     private var dnsDstSample: [String] = []
+    /// Диагностика этапа 2/4: все уникальные dst IP, пришедшие в packetFlow.
+    /// Отвечает на вопрос «послала ли iOS пакет на 198.18.1.1 или ушла на
+    /// реальный IP Google» — раньше гадали по отсутствию accept:.
+    private var dstSeen: Set<String> = []
+    private var statFakeIPPkts: UInt64 = 0
     private var pollTimer: DispatchSourceTimer?
     private var ioTimer: DispatchSourceTimer?
     private var workerDomain: String?
@@ -317,6 +322,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         io.setEventHandler { [weak self] in
             guard let self else { return }
             EventLog.append("io:in=\(self.packetCount) out=\(EventLog.outPkts) v6=\(EventLog.inV6) oth=\(EventLog.inOther) wd=\(EventLog.wsDown) wf=\(EventLog.writeFails) up=\(EventLog.upBytes) rx=\(EventLog.rxBytes) pend=\(EventLog.pendCur) sent=\(EventLog.sentCb) inmem=\(lwip_bridge_inmem_drops()) mem=\(String(format: "%.1f", self.memFootprintMB()))MB conns=\(self.sessions.count)")
+            EventLog.append("dst:fakeip=\(self.statFakeIPPkts) seen=[\(self.dstSeen.sorted().joined(separator: ","))]")
             if let ldns = self.localDNS, ldns.rewriteCount > 0 || ldns.statForwarded > 0 {
                 EventLog.append("ldns:rw=\(ldns.statRewritten) fwd=\(ldns.statForwarded) fail=\(ldns.statFailed) rules=\(ldns.rewriteCount)")
             }
@@ -431,6 +437,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     if family.intValue != AF_INET {
                         EventLog.inV6 += 1
                         continue
+                    }
+                    // Сэмпл dst ДО всех фильтров: если 198.18.1.1 здесь есть,
+                    // но accept: нет — пакет теряется внутри lwIP. Если его
+                    // нет вообще — iOS не приняла FakeIP от воркера.
+                    if packet.count >= 20 {
+                        let d = "\(packet[16]).\(packet[17]).\(packet[18]).\(packet[19])"
+                        if self.dstSeen.count < 24 { self.dstSeen.insert(d) }
+                        if d == "198.18.1.1" { self.statFakeIPPkts += 1 }
                     }
                     // Диагностика: считаем UDP и отдельно UDP:53 ДО всех
                     // фильтров — иначе не отличить «пакет не пришёл» от
