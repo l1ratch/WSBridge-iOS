@@ -1,8 +1,8 @@
 // WSBridge DoH worker — MODE="simple" (основной) / MODE="lists" (расширение)
 // Документация: worker/README.md · Концепция: docs/DoH-Routing.ru.md (ветка main)
 //
-// Простой режим: ЛЮБОЙ валидный DNS-запрос → A = FAKE_IP.
-// Фильтрация по доменам живёт на iOS в NEDNSOverHTTPSSettings.matchDomains,
+// Простой режим: TYPE A → A = FAKE_IP; остальные типы (AAAA/SVCB/HTTPS) →
+// пустой NOERROR. Фильтрация по доменам живёт на iOS в matchDomains,
 // поэтому воркер про списки не знает и никуда не форвардит.
 //
 // RFC 8484: POST (бинарный DNS-wire в теле) и GET (?dns=<base64url>),
@@ -99,18 +99,10 @@ function dnsResponse(body, extraHeaders = {}) {
   });
 }
 
-function refused(query, q) {
-  return dnsResponse(buildReply(query, q, 5, null));
-}
-
 function formerr() {
   const empty = new Uint8Array(12);
   empty[2] = 0x80; empty[3] = 1; // QR=1, FORMERR
   return dnsResponse(empty);
-}
-
-function fakeAnswer(query, q, ip) {
-  return dnsResponse(buildReply(query, q, 0, ip));
 }
 
 // ---------- GET: ?dns=<base64url> ----------
@@ -180,6 +172,12 @@ async function handleDoH(request, env, ctx) {
 
 // ---------- Режим lists (НЕ основной, код рядом, выключен MODE) ----------
 
+function listURL(entry) {
+  if (typeof entry === "string") return entry;
+  if (entry && typeof entry === "object") return entry.url || null;
+  return null;
+}
+
 async function handleLists(wire, q, env, ctx, hwid, setsSegment, errors, fakeIP, requireId) {
   const upstream = cfg(env, "UPSTREAM_DOH");
   let LISTS = {};
@@ -195,7 +193,7 @@ async function handleLists(wire, q, env, ctx, hwid, setsSegment, errors, fakeIP,
 
   let domainHit = false;
   for (const id of active) {
-    const text = await fetchList(LISTS[id], env, ctx);
+    const text = await fetchList(listURL(LISTS[id]), env, ctx);
     if (text && textSet(text).has(q.name)) { domainHit = true; break; }
   }
 
@@ -267,7 +265,7 @@ function debugHeader(mode, requireId, hwid, q, answer, setsSegment, errors) {
       path: q ? `/dns-query/${hwid}${setsSegment ? "/" + setsSegment : ""}` : "",
       method: "POST", contentType: "application/dns-message",
       qname: q ? q.name : null, qtype: q ? q.qtype : null,
-      wouldAnswer: answer,
+      wouldAnswer: q && q.qtype === 1 ? answer : null,
     },
     config: {
       mode, requireId, fakeIp: answer, upstream: null,
@@ -282,7 +280,9 @@ async function diagnose(request, env) {
   const url = new URL(request.url);
   const parts = url.pathname.split("/").filter(Boolean);
   const hwid = decodeURIComponent(parts[1] || "");
-  const setsSegment = parts[2] || "";
+  const rawSets = parts[2] || "";
+  // Сегмент "diagnose" — служебный, не список доменов.
+  const setsSegment = rawSets === "diagnose" ? "" : rawSets;
 
   const mode = cfg(env, "MODE");
   const requireId = cfg(env, "REQUIRE_ID").toLowerCase() === "true";
