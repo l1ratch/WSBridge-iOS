@@ -113,6 +113,18 @@ enum FrontHealthRegistry {
         return (ordered, excluded)
     }
 
+    /// Полный сброс реестра. Нужен, когда все фронты успели набрать
+    /// >=3 фейлов (например, во время экспериментов с роутингом) —
+    /// orderAndFilter тогда исключает их ВСЕХ, и каскад сразу падает на
+    /// прямые IP Telegram, которые в РФ не отвечают. Вызывается при
+    /// успешном обновлении списка фронтов: новый список = новая попытка.
+    static func resetAll() {
+        lock.lock(); defer { lock.unlock() }
+        cache = [:]
+        UserDefaults.standard.removeObject(forKey: key)
+        lastFlush = Date.distantPast
+    }
+
     /// Эвикция протухших: мёртвые >7 дней, которых нет в свежем списке апстрима.
     /// Вызывается при обновлении списка фронтов (startTunnel).
     static func evict(absentFrom current: Set<String>) {

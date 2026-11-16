@@ -395,7 +395,8 @@ struct JournalView: View {
 
     private var exportFileURL: URL? {
         guard let text = tunnel.journalText, !text.isEmpty else { return nil }
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("WSBridge-journal.log")
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WSBridge-journal-full.log")
         do {
             try text.write(to: url, atomically: true, encoding: .utf8)
             return url

@@ -67,7 +67,7 @@ private final class JournalReader {
         conn?.cancel()
         conn = nil
         if text.hasPrefix("журнал недоступен") {
-            onText(text + "\n\nЖурнал живёт внутри процесса туннеля. Включи VPN и обнови — первым блоком будет === PREV RUN ===: лог прошлого запуска с причиной смерти (tunnel_stop:reason=N или обрыв + mem= перед ним).")
+            onText(text + "\n\nЖурнал пишется расширением туннеля в файлы прогонов (Library/Logs/run-*.log) и читается через loopback. Включи VPN и обнови.")
         } else {
             onText(text)
         }
@@ -713,12 +713,38 @@ final class TunnelManager: ObservableObject {
     /// Статус последнего обновления (для UI).
     @Published var frontsUpdateMessage: String?
 
-    /// URL списка фронтов. Апстрим + два зеркала jsDelivr (GitHub в РФ плавает).
+    /// URL списка фронтов. Апстрим (main + master для совместимости) и
+    /// зеркала jsDelivr — GitHub в РФ плавает.
     private static let frontListURLs = [
+        "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt",
         "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/master/.github/cfproxy-domains.txt",
-        "https://cdn.jsdelivr.net/gh/Flowseal/tg-ws-proxy@master/.github/cfproxy-domains.txt",
-        "https://fastly.jsdelivr.net/gh/Flowseal/tg-ws-proxy@master/.github/cfproxy-domains.txt",
+        "https://cdn.jsdelivr.net/gh/Flowseal/tg-ws-proxy@main/.github/cfproxy-domains.txt",
+        "https://fastly.jsdelivr.net/gh/Flowseal/tg-ws-proxy@main/.github/cfproxy-domains.txt",
     ]
+
+    /// _dd() из proxy/config.py офф tg-ws-proxy: сдвиговый шифр на буквах
+    /// имени + замена ".com" → ".co.uk". Апстрим намеренно хранит фронты
+    /// в зашифрованном виде, чтобы их не выпиливали по реестру доменов.
+    static func decodeFrontDomain(_ s: String) -> String? {
+        guard s.hasSuffix(".com"), s.count > 4 else { return nil }
+        let body = String(s.dropLast(4))
+        let n = body.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+        var out = ""
+        for ch in body {
+            let scalars = Array(String(ch).unicodeScalars)
+            guard let v = scalars.first, v.value < 128 else { return nil }
+            let u = UInt8(v.value)
+            if (u >= 97 && u <= 122) || (u >= 65 && u <= 90) {
+                let base: UInt8 = u > 96 ? 97 : 65
+                let shifted = (Int(u) - Int(base) - n) % 26
+                let norm = (shifted + 26) % 26
+                out.append(Character(UnicodeScalar(UInt8(base) + UInt8(norm))))
+            } else {
+                out.append(ch)
+            }
+        }
+        return out + ".co.uk"
+    }
 
     /// Скачивает свежий список фронтов (все URL по очереди).
     /// Возвращает (кол-во доменов, дата) или кладёт ошибку в frontsUpdateMessage.
@@ -747,7 +773,16 @@ final class TunnelManager: ObservableObject {
                     rejection = "битый файл (\(domains.count) записей)"
                     continue
                 }
-                let unique = Array(Set(domains))
+                // Апстрим отдаёт НЕ домены, а шифротекст (_CFPROXY_ENC из
+                // proxy/config.py офф tg-ws-proxy). Реальные фронты (.co.uk)
+                // получаются сдвиговым шифром _dd(). Без декодирования
+                // «живых 0 из 20»: kws2.virkgj.com не резолвится никогда.
+                let decoded = domains.compactMap { Self.decodeFrontDomain($0) }
+                guard decoded.count >= 3 else {
+                    rejection = "битый файл (\(decoded.count) записей после декодирования)"
+                    continue
+                }
+                let unique = Array(Set(decoded))
                 // Android-порт: DNS-резолв каждого домена ДО сохранения —
                 // мёртвые не попадают в список, файл с <3 живых = протухший
                 // целиком (NXDOMAIN-волны апстрима). Резолв параллельно.
@@ -772,6 +807,9 @@ final class TunnelManager: ObservableObject {
                 }
                 frontBases = alive
                 frontsUpdatedAt = Date()
+                // Флаг для extension: новый список = обнулить реестр фейлов,
+                // иначе все фронты остаются «мёртвыми» по старым >3 фейлам.
+                UserDefaults.standard.set(true, forKey: "frontsResetPending")
                 frontsUpdateMessage = "Обновлено: \(alive.count) живых (из \(unique.count))"
                 return true
             } catch {
@@ -1427,6 +1465,11 @@ final class TunnelManager: ObservableObject {
             .filter { !$0.isEmpty }
         if !dcLines.isEmpty { config["dcMap"] = dcLines as NSArray }
         if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
+        // Одноразовый флаг: extension сбросит реестр здоровья фронтов.
+        if UserDefaults.standard.bool(forKey: "frontsResetPending") {
+            config["frontsReset"] = true as NSNumber
+            UserDefaults.standard.set(false, forKey: "frontsResetPending")
+        }
         // ── Вариант B: прокси по доменам через реальные IP + SNI ──────
         // DNS системы НЕ трогаем: сайты и Telegram резолвятся как обычно.
         // Домены включённых списков резолвим здесь, в Main App, и кладём

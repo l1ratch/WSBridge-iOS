@@ -54,6 +54,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // а любое изменение здесь рискует снова уронить весь интернет.
         settings.mtu = 1500
 
+        // Новый файл прогона ДО любого append: иначе ранние cfg:-строки
+        // уедут в предыдущий файл и потеряются при beginRun().
+        EventLog.beginRun()
         let proto = protocolConfiguration as? NETunnelProviderProtocol
         let dnsList = proto?.providerConfiguration?["dns"] as? [String]
         let dohURL = proto?.providerConfiguration?["doh"] as? String
@@ -84,6 +87,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if !excluded.isEmpty { ipv4.excludedRoutes = excluded }
         ipv4.includedRoutes = routes
         EventLog.append("cfg:routeB domains=\(proxyDomains.count) cidrs=\(resolvedCIDRs.count) excluded=\(excluded.count)")
+        // Диагностика B: какие /24 реально уехали в includedRoutes. Без
+        // этого «сайт идёт мимо прокси» невозможно отличить от «iOS
+        // закешировала другой IP» — гадать по dst:seen мало.
+        let cidrDump = routeCIDRs.prefix(12).joined(separator: ",")
+        EventLog.append("cfg:cidrs=[\(cidrDump)] total=\(routeCIDRs.count)")
         // DNS НЕ трогаем: обычный выборщик приложения работает как раньше.
         if let dnsList, !dnsList.isEmpty {
             if let dotHost, !dotHost.isEmpty {
@@ -115,7 +123,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             NSLog("[WSBridge] tunnel started")
-            EventLog.loadPrevious()
             let proto = self?.protocolConfiguration as? NETunnelProviderProtocol
             let wd = (proto?.providerConfiguration?["worker"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -138,6 +145,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let fronts = proto?.providerConfiguration?["fronts"] as? [String]
             CFDomains.update(fronts ?? [])
             EventLog.append("cfg:fronts=\(CFDomains.bases.count)")
+            // Одноразовый сброс после «Обновить список фронтов»: старый
+            // реестр мог пометить ВСЕ фронты мёртвыми (>=3 фейлов), и тогда
+            // каскад не пробует их вообще, сразу уходя на прямые IP.
+            if (proto?.providerConfiguration?["frontsReset"] as? Bool) == true {
+                FrontHealthRegistry.resetAll()
+                EventLog.append("fronts_health:reset")
+            }
             // Android-порт: эвикция протухших из реестра (мёртвые >7 дней,
             // пропавшие из апстрима) + запись состояния реестра в журнал.
             FrontHealthRegistry.evict(absentFrom: Set(CFDomains.bases))
@@ -384,14 +398,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return out
     }
 
-    /// Попал ли real-IP в подсети, где мы смотрим SNI. Telegram-диапазоны
-    /// сюда не входят: их обслуживает WS-ветка, и парсить у них ClientHello
-    /// бессмысленно (MTProto obfuscated — это не TLS).
+    /// Попал ли real-IP в подсети, где мы смотрим SNI. Исключаем ТОЛЬКО
+    /// диапазоны датацентров Telegram: их обслуживает WS-ветка, и парсить
+    /// у них ClientHello бессмысленно (MTProto obfuscated — не TLS).
+    ///
+    /// НЕ исключаем 198.18.0.0/15: домашний роутер с Podkop отдаёт
+    /// FakeIP именно из этого диапазона, и для телефона это РЕАЛЬНЫЙ
+    /// адрес назначения из includedRoutes. Старое исключение (наследие
+    /// эпохи FakeIP-метки) отбрасывало такие пакеты и сайт уходил мимо
+    /// прокси — «открывается, но не поддерживается в регионе».
     private func isSNIInterceptCandidate(_ ip: UInt32) -> Bool {
         guard !sniCIDRs.isEmpty else { return false }
         if (ip >> 24) == 149 && ((ip >> 16) & 0xFF) == 154 { return false }
         if (ip >> 24) == 91 && ((ip >> 16) & 0xFF) == 108 { return false }
-        if (ip >> 24) == 198 && ((ip >> 16) & 0xFF) == 18 { return false }
         for (base, mask) in sniCIDRs where (ip & mask) == base { return true }
         return false
     }
