@@ -90,6 +90,27 @@ function ok(label) { passed++; console.log("  ✓ " + label); }
   ok("простой режим отвечает FakeIP на ЛЮБОЙ домен (фильтр только в matchDomains на iOS)");
 }
 
+// ---------- 2b. AAAA / HTTPS RR — пустой NOERROR, БЕЗ A-записи ----------
+{
+  for (const qtype of [28, 64, 65]) {
+    const q = dnsQuery("gemini.google.com", qtype);
+    const r = await call("/dns-query/ID-OK-1", q);
+    const a = parseAnswer(await r.arrayBuffer());
+    assert.equal(a.rcode, 0, "qtype " + qtype + " → NOERROR");
+    assert.equal(a.ancount, 0, "qtype " + qtype + " → без A-записи");
+    assert.equal(a.ip, null);
+  }
+  ok("AAAA(28)/SVCB(64)/HTTPS(65) → пустой NOERROR, A-запись не подсовываем");
+}
+
+// ---------- 2c. /recent накапливает запросы ----------
+{
+  const before = JSON.parse(await (await call("/recent", new Uint8Array(0), ENV, "GET")).text());
+  assert.ok(Array.isArray(before.items));
+  assert.ok(before.items.some((x) => x.qname === "gemini.google.com"));
+  ok("GET /recent показывает разобранные qname/path (диагностика этапа 2)");
+}
+
 // ---------- 3. Левый ID → REFUSED, HTTP 200 ----------
 {
   const q = dnsQuery("gemini.google.com");

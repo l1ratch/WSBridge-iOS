@@ -20,6 +20,15 @@ const DEFAULTS = {
   LISTS: "{}",
 };
 
+// Отладочное кольцо последних запросов (этап 2). НЕ KV, НЕ панель:
+// позволяет одной кнопкой увидеть, доходят ли системные DoH-запросы
+// с iPhone и с каким path/qname. Живёт до перезапуска изолята.
+const RECENT = [];
+function record(entry) {
+  RECENT.push({ at: new Date().toISOString(), ...entry });
+  if (RECENT.length > 20) RECENT.shift();
+}
+
 function cfg(env, key) {
   const v = env && env[key] !== undefined ? env[key] : DEFAULTS[key];
   return String(v);
@@ -52,8 +61,13 @@ function buildReply(query, q, rcode, fakeIP) {
   // Ответ = вопрос как есть (до q.end) + одна A-запись.
   // q.end — позиция сразу после QTYPE/QCLASS; хвост запроса (EDNS OPT и пр.)
   // не копируем, чтобы не тащить чужие дополнительные записи.
+  //
+  // ВАЖНО: A-запись отдаём ТОЛЬКО на вопрос TYPE A (qtype 1). На AAAA(28),
+  // SVCB(64), HTTPS(65) и прочие типы отвечаем ПУСТЫМ NOERROR, иначе
+  // в ответе на «дай AAAA» лежала бы A-запись — iOS такой ответ отбрасывает
+  // и домен «залипает» (проверено на живом воркере, ноябрь 2026).
   const questionLen = q ? q.end : 12;
-  const withAnswer = rcode === 0 && !!fakeIP;
+  const withAnswer = rcode === 0 && !!fakeIP && (!q || q.qtype === 1);
   const out = new Uint8Array(questionLen + (withAnswer ? 16 : 0));
   out.set(query.subarray(0, questionLen), 0);
   out[2] = 0x80 | (query[2] & 0x01); // QR=1, RD из запроса
@@ -144,6 +158,7 @@ async function handleDoH(request, env, ctx) {
 
   const q = parseQName(wire);
   if (!q) return formerr();
+  record({ path: url.pathname, method: request.method, hwid, qname: q.name, qtype: q.qtype, mode, outcome: "pending" });
 
   const hwidTrusted = requireId ? trusted.includes(hwid) : true;
   if (!hwidTrusted) {
@@ -329,6 +344,12 @@ export default {
     // уедет в DNS-обработчик и попытается разобрать JSON как DNS-wire.
     if (url.pathname === "/diagnose" || url.pathname.endsWith("/diagnose")) {
       return diagnose(request, env);
+    }
+    if (url.pathname === "/recent") {
+      return new Response(JSON.stringify({ count: RECENT.length, items: RECENT }, null, 2), {
+        status: 200,
+        headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+      });
     }
     if (url.pathname.startsWith("/dns-query")) return handleDoH(request, env, ctx);
     return new Response("WSBridge DoH worker. См. /diagnose и README.md", { status: 200 });
