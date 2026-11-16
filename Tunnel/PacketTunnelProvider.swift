@@ -110,13 +110,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var routes = TelegramDCs.includedRoutes
         // Маршрут /32 на 198.18.0.3 больше НЕ нужен: dnsSettings снят,
         // локальный резолвер не перехватывает системный DNS.
-        // При включённом DoH-воркере 198.18.1.0/24 нужен ВСЕГДА: воркер
-        // возвращает 198.18.1.1 как метку, и пакет обязан попасть в utun.
-        // Раньше маршрут зависел от proxyDomains/proxyURLs — если они не
-        // доезжали, FakeIP уходил мимо туннеля и сайт «залипал».
+        // При включённом DoH-воркере пул FakeIP нужен ВСЕГДА.
+        // 198.51.100.0/24 = TEST-NET-2 (RFC 5737): публичный, НЕ bogon,
+        // не маршрутизируется в интернете. Прежний 198.18.0.0/15 (RFC 2544)
+        // iOS отвергала: /recent видел DNS-запрос, но dst: в packetFlow не
+        // было ни одного пакета на FakeIP — ответ воркера не принимался.
         let workerOn = (proto?.providerConfiguration?["dohWorkerURL"] as? String) != nil
         if workerOn || (!proxyDomains.isEmpty && !proxyURLs.isEmpty) {
-            routes.append(NEIPv4Route(destinationAddress: "198.18.1.0", subnetMask: "255.255.255.0"))
+            routes.append(NEIPv4Route(destinationAddress: "198.51.100.0", subnetMask: "255.255.255.0"))
         }
         // Real-IP фолбэк для упрямых приложений (свой DoH/DoT, проверка
         // bogon-диапазона): заворачиваем подсети CDN, где сидят ИИ-сервисы.
@@ -351,14 +352,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         postDarwinEvent("accept")
         EventLog.append("accept:c\(connId):\(dotted):p\(lwip.dstPort(connId: connId)):sni=\(isSNIInterceptCandidate(dcIP) ? 1 : 0):cidrs=\(sniCIDRs.count)")
         let dstPort = lwip.dstPort(connId: connId)
-        // ── DoH-воркер: 198.18.1.x — МЕТКА, не мапа ─────────────────
+        // ── DoH-воркер: 198.51.100.x — МЕТКА, не мапа ───────────────
         // Воркер вернул один и тот же FakeIP на все домены из matchDomains.
         // localDNS.proxyDomain(forFakeIP:) пуста (DNS в packetFlow не
         // приходит), поэтому старый путь глух. Домен достаём из TLS SNI
         // первого пакета и сразу идём в прокси по ИМЕНИ.
-        // Это и есть роутинг пакета (этап 4), сделанный минимально.
         if dohWorkerActive, let proxy = proxyEndpoint,
-           (dcIP >> 24) == 198 && ((dcIP >> 16) & 0xFF) == 18 && ((dcIP >> 8) & 0xFF) == 1 {
+           (dcIP >> 24) == 198 && ((dcIP >> 16) & 0xFF) == 51 && ((dcIP >> 8) & 0xFF) == 100 {
             EventLog.append("doh_proxy:conn\(connId):p\(dstPort)")
             let session = TunnelSession(
                 connId: connId, dcIP: dcIP, workerDomain: nil,
@@ -438,13 +438,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         EventLog.inV6 += 1
                         continue
                     }
-                    // Сэмпл dst ДО всех фильтров: если 198.18.1.1 здесь есть,
+                    // Сэмпл dst ДО всех фильтров: если 198.51.100.1 здесь есть,
                     // но accept: нет — пакет теряется внутри lwIP. Если его
                     // нет вообще — iOS не приняла FakeIP от воркера.
                     if packet.count >= 20 {
                         let d = "\(packet[16]).\(packet[17]).\(packet[18]).\(packet[19])"
                         if self.dstSeen.count < 24 { self.dstSeen.insert(d) }
-                        if d == "198.18.1.1" { self.statFakeIPPkts += 1 }
+                        if d == "198.51.100.1" { self.statFakeIPPkts += 1 }
                     }
                     // Диагностика: считаем UDP и отдельно UDP:53 ДО всех
                     // фильтров — иначе не отличить «пакет не пришёл» от
