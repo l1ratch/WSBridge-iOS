@@ -145,13 +145,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let fronts = proto?.providerConfiguration?["fronts"] as? [String]
             CFDomains.update(fronts ?? [])
             EventLog.append("cfg:fronts=\(CFDomains.bases.count)")
-            // Одноразовый сброс после «Обновить список фронтов»: старый
-            // реестр мог пометить ВСЕ фронты мёртвыми (>=3 фейлов), и тогда
-            // каскад не пробует их вообще, сразу уходя на прямые IP.
-            if (proto?.providerConfiguration?["frontsReset"] as? Bool) == true {
-                FrontHealthRegistry.resetAll()
-                EventLog.append("fronts_health:reset")
-            }
+            // Каждый запуск туннеля = новая попытка перебора фронтов.
+            // Офф tg-ws-proxy не имеет персистентного «реестра мёртвых»:
+            // при старте он заново идёт по balancer.get_domains_for_dc().
+            // Наш реестр накапливал >=3 фейлов за время экспериментов и
+            // orderAndFilter исключал ВСЕ фронты (health_excl:19), из-за
+            // чего каскад сразу падал на прямые 149.154.* (таймауты в РФ).
+            // Сбрасываем счётчики фейлов, сохраняя только приоритет по
+            // последним успехам.
+            FrontHealthRegistry.resetFailures()
+            EventLog.append("fronts_health:reset_failures")
             // Android-порт: эвикция протухших из реестра (мёртвые >7 дней,
             // пропавшие из апстрима) + запись состояния реестра в журнал.
             FrontHealthRegistry.evict(absentFrom: Set(CFDomains.bases))

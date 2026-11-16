@@ -94,31 +94,42 @@ enum EventLog {
         try? runHandle?.synchronize()
     }
 
-    /// Полный журнал: все файлы прогонов в хронологическом порядке,
-    /// затем текущий прогон (он же последний файл, но отдаём из памяти,
-    /// чтобы не читать только что записанное с диска дважды).
+    /// Журнал ТЕКУЩЕГО прогона целиком (без обрезания). Прошлые прогоны
+    /// доступны отдельной страницей «Все логи журнала» через logFileURLs().
     static func journal() -> String {
         lock.lock(); defer { lock.unlock() }
         try? runHandle?.synchronize()
-
-        var out = ""
-        let files = runFilesLocked()
-        // Все файлы, кроме текущего, — это завершённые прогоны.
-        for url in files where url != runFileURL {
-            if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
-                out += "=== \(url.lastPathComponent) ===\n\(text)\n"
-            }
-        }
-        // Текущий прогон целиком, без обрезания.
-        if !entries.isEmpty {
-            let cur = entries.map { "\(fmt.string(from: $0.1)) \($0.0)" }
-                .joined(separator: "\n")
-            out += "=== \(runFileURL?.lastPathComponent ?? "current") ===\n\(cur)\n"
-        }
-        return out.isEmpty ? "журнал пуст" : out
+        guard !entries.isEmpty else { return "журнал пуст" }
+        return entries.map { "\(fmt.string(from: $0.1)) \($0.0)" }
+            .joined(separator: "\n") + "\n"
     }
 
-    /// Список файлов журналов для экспорта «Поделиться».
+    /// Содержимое одного файла прогона (для страницы «Все логи журнала»).
+    static func contents(of file: String) -> String {
+        lock.lock(); defer { lock.unlock() }
+        try? runHandle?.synchronize()
+        guard !file.contains("/") && !file.contains(".."),
+              let url = runFilesLocked().first(where: { $0.lastPathComponent == file }),
+              let text = try? String(contentsOf: url, encoding: .utf8) else {
+            return "файл недоступен"
+        }
+        return text
+    }
+
+    /// [(имя, размер, дата)] всех прогонов, свежие сверху.
+    static func logFileEntries() -> [(name: String, size: Int, date: Date)] {
+        lock.lock(); defer { lock.unlock() }
+        try? runHandle?.synchronize()
+        let fm = FileManager.default
+        return runFilesLocked().compactMap { url in
+            guard let a = try? fm.attributesOfItem(atPath: url.path) else { return nil }
+            return (url.lastPathComponent,
+                    (a[.size] as? NSNumber)?.intValue ?? 0,
+                    (a[.modificationDate] as? Date) ?? Date.distantPast)
+        }.sorted { $0.name > $1.name }
+    }
+
+    /// Список файлов журналов (для читателя через loopback).
     static func logFileURLs() -> [URL] {
         lock.lock(); defer { lock.unlock() }
         try? runHandle?.synchronize()

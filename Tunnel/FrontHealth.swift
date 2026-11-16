@@ -113,11 +113,20 @@ enum FrontHealthRegistry {
         return (ordered, excluded)
     }
 
-    /// Полный сброс реестра. Нужен, когда все фронты успели набрать
-    /// >=3 фейлов (например, во время экспериментов с роутингом) —
-    /// orderAndFilter тогда исключает их ВСЕХ, и каскад сразу падает на
-    /// прямые IP Telegram, которые в РФ не отвечают. Вызывается при
-    /// успешном обновлении списка фронтов: новый список = новая попытка.
+    /// Сбрасывает ТОЛЬКО счётчики фейлов при каждом запуске туннеля,
+    /// сохраняя lastSuccess (приоритет свежих успехов). Офф tg-ws-proxy
+    /// перебирает домены заново на каждом старте — у него нет «вечно
+    /// мёртвых» фронтов. Без этого реестр за время тестов помечал все
+    /// 20 фронтов как failCount>=3 и каскад их не пробовал (health_excl:19).
+    static func resetFailures() {
+        lock.lock(); defer { lock.unlock() }
+        var reg = loadLocked()
+        for key in reg.keys { reg[key]?.failCount = 0 }
+        cache = reg
+        flushLocked(immediate: true)
+    }
+
+    /// Полный сброс реестра.
     static func resetAll() {
         lock.lock(); defer { lock.unlock() }
         cache = [:]

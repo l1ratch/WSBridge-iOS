@@ -5,16 +5,21 @@ import UserNotifications
 import ActivityKit
 import UIKit
 
-/// Читает журнал расширения loopback TCP (127.0.0.1:51001, JournalServer).
+/// Читает данные из расширения loopback TCP (127.0.0.1:51001,
+/// JournalServer). Отправляет команду и отдаёт ПОЛНЫЙ ответ без обрезки.
 /// Nonisolated: колбэки NWConnection приходят с произвольных потоков.
 private final class JournalReader {
+    private let command: String
     private let onText: (String) -> Void
     private var onDone: (() -> Void)?
     private var finished = false
     private var acc = Data()
     private var conn: NWConnection?
 
-    init(onText: @escaping (String) -> Void) { self.onText = onText }
+    init(command: String = "journal", onText: @escaping (String) -> Void) {
+        self.command = command
+        self.onText = onText
+    }
 
     func run(onDone: @escaping () -> Void) {
         self.onDone = onDone
@@ -22,21 +27,24 @@ private final class JournalReader {
         self.conn = conn
         conn.stateUpdateHandler = { [weak self] state in
             switch state {
-            case .ready: self?.readMore()
+            case .ready:
+                guard let self else { return }
+                // Команда + \n; сервер ответит и закроет соединение.
+                conn.send(content: Data((self.command + "\n").utf8),
+                          completion: .contentProcessed { _ in self.readMore() })
             case .failed(let err): self?.finish("журнал недоступен: conn: \(err.localizedDescription)")
             case .cancelled: self?.finish("журнал недоступен: cancelled")
             default: break
             }
         }
         conn.start(queue: .global(qos: .userInitiated))
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
-            self?.finish("журнал недоступен: timeout 5s")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 15) { [weak self] in
+            self?.finish("журнал недоступен: timeout 15s")
         }
     }
 
     /// Отмена ридера, который ещё висит на таймауте/коннекте. Зовётся
-    /// перед созданием нового, чтобы старый не перетёр journalText и
-    /// статическую ссылку. onDone НЕ дёргаем — он обнулил бы нового.
+    /// перед созданием нового, чтобы старый не перетёр результат.
     func cancel() {
         if finished { return }
         finished = true
@@ -50,11 +58,7 @@ private final class JournalReader {
             guard let self else { return }
             if let data, !data.isEmpty { self.acc.append(data) }
             if error != nil || isComplete || data == nil {
-                if self.acc.isEmpty {
-                    self.finish("журнал недоступен: empty response")
-                } else {
-                    self.finish("журнал:\n" + (String(data: self.acc, encoding: .utf8) ?? "decode error"))
-                }
+                self.finish(String(data: self.acc, encoding: .utf8) ?? "decode error")
             } else {
                 self.readMore()
             }
@@ -66,11 +70,7 @@ private final class JournalReader {
         finished = true
         conn?.cancel()
         conn = nil
-        if text.hasPrefix("журнал недоступен") {
-            onText(text + "\n\nЖурнал пишется расширением туннеля в файлы прогонов (Library/Logs/run-*.log) и читается через loopback. Включи VPN и обнови.")
-        } else {
-            onText(text)
-        }
+        onText(text)
         onDone?()
         onDone = nil
     }
@@ -242,7 +242,18 @@ final class TunnelManager: ObservableObject {
     /// История переходов статуса — диагностика «мёртвой кнопки».
     @Published private(set) var statusHistory: [String] = []
     @Published private(set) var stats: String?
+    /// Текущий прогон (только он показывается на странице «Журнал»).
     @Published private(set) var journalText: String?
+    /// Список файлов прогонов для страницы «Все логи журнала».
+    @Published private(set) var journalFiles: [JournalFile] = []
+    /// Содержимое выбранного файла прогона.
+    @Published private(set) var journalFileText: String?
+    struct JournalFile: Codable, Identifiable, Equatable {
+        var name: String
+        var size: Int
+        var date: String
+        var id: String { name }
+    }
     @Published private(set) var lastPacketSignal: Date?
     @Published private(set) var lastEvent: String?
     @Published private(set) var lastEventTime: Date?
@@ -746,84 +757,127 @@ final class TunnelManager: ObservableObject {
         return out + ".co.uk"
     }
 
-    /// Скачивает свежий список фронтов (все URL по очереди).
-    /// Возвращает (кол-во доменов, дата) или кладёт ошибку в frontsUpdateMessage.
+    /// Настоящая проверка живости фронта по механике офф tg-ws-proxy
+    /// (proxy/raw_websocket.py: RawWebSocket.connect). НЕ getaddrinfo —
+    /// у базового домена нет A-записи, живой только kws{dc}.<base>, и
+    /// «живой» означает именно WS-хендшейк с ответом 101, а не просто
+    /// DNS-резолв. Возвращает true, если фронт ответил 101.
+    private static func probeFront(_ base: String) async -> Bool {
+        let host = "kws2." + base
+        // Рукописный GET /apiws поверх TCP+TLS, без URLSession: нам важен
+        // сам факт 101 Switching Protocols, а не установленная сессия.
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let queue = DispatchQueue.global(qos: .userInitiated)
+            let conn = NWConnection(host: NWEndpoint.Host(host),
+                                    port: NWEndpoint.Port(rawValue: 443)!, using: .tls)
+            var done = false
+            func finish(_ ok: Bool) {
+                if done { return }
+                done = true
+                conn.cancel()
+                cont.resume(returning: ok)
+            }
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    let key = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+                        .base64EncodedString()
+                    let req = "GET /apiws HTTP/1.1\r\n"
+                        + "Host: \(host)\r\n"
+                        + "Upgrade: websocket\r\n"
+                        + "Connection: Upgrade\r\n"
+                        + "Sec-WebSocket-Key: \(key)\r\n"
+                        + "Sec-WebSocket-Version: 13\r\n"
+                        + "Sec-WebSocket-Protocol: binary\r\n\r\n"
+                    conn.send(content: Data(req.utf8), completion: .contentProcessed { err in
+                        if err != nil { finish(false); return }
+                        conn.receive(minimumIncompleteLength: 12, maximumLength: 512) { data, _, _, err in
+                            guard err == nil, let d = data,
+                                  let s = String(data: d, encoding: .utf8) else {
+                                finish(false); return
+                            }
+                            // 101 Switching Protocols = фронт живой.
+                            finish(s.hasPrefix("HTTP/1.1 101") || s.hasPrefix("HTTP/1.0 101"))
+                        }
+                    })
+                case .failed: finish(false)
+                case .cancelled: finish(false)
+                default: break
+                }
+            }
+            conn.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + 6) { finish(false) }
+        }
+    }
+
+    /// Скачивает свежий список фронтов, РАСШИФРОВЫВАЕТ (_dd) и проверяет
+    /// каждый настоящим WS-хендшейком. Сохраняет только живые, сбрасывает
+    /// реестр здоровья. Вызывается кнопкой «Обновить», при первом запуске
+    /// и в фоне при каждом старте туннеля.
     @discardableResult
     func updateFronts() async -> Bool {
-        frontsUpdateMessage = "Обновление…"
-        // Причина последнего отказа ПРИ ОТВЕТЕ источника: сеть жива, но файл
-        // негодный (битый/протухший). Отличаем от «нет сети».
+        frontsUpdateMessage = "Обновление и проверка…"
         var rejection: String?
         for urlString in Self.frontListURLs {
             guard let url = URL(string: urlString) else { continue }
             var request = URLRequest(url: url)
             request.timeoutInterval = 10
-            // кэш не нужен — хотим всегда свежее
             request.cachePolicy = .reloadIgnoringLocalCacheData
             do {
                 let (data, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { continue }
                 let text = String(data: data, encoding: .utf8) ?? ""
-                // Валидация: домены по одному в строке, буквы/цифры/точки/дефисы.
-                let domains = text
+                // Апстрим хранит ШИФРОТЕКСТ (_CFPROXY_ENC из config.py).
+                let encoded = text
                     .split(separator: "\n")
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty && $0.range(of: "^[a-z0-9][a-z0-9.-]*$", options: .regularExpression, range: $0.startIndex..<$0.endIndex, locale: nil) != nil }
-                guard domains.count >= 3 else {
-                    rejection = "битый файл (\(domains.count) записей)"
-                    continue
+                    .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+                    .filter { !$0.isEmpty && !$0.hasPrefix("#")
+                              && $0.range(of: "^[a-z0-9][a-z0-9.-]*$", options: .regularExpression) != nil }
+                guard encoded.count >= 3 else {
+                    rejection = "битый файл (\(encoded.count) записей)"; continue
                 }
-                // Апстрим отдаёт НЕ домены, а шифротекст (_CFPROXY_ENC из
-                // proxy/config.py офф tg-ws-proxy). Реальные фронты (.co.uk)
-                // получаются сдвиговым шифром _dd(). Без декодирования
-                // «живых 0 из 20»: kws2.virkgj.com не резолвится никогда.
-                let decoded = domains.compactMap { Self.decodeFrontDomain($0) }
+                let decoded = encoded.compactMap { Self.decodeFrontDomain($0) }
                 guard decoded.count >= 3 else {
-                    rejection = "битый файл (\(decoded.count) записей после декодирования)"
-                    continue
+                    rejection = "не удалось расшифровать"; continue
                 }
                 let unique = Array(Set(decoded))
-                // Android-порт: DNS-резолв каждого домена ДО сохранения —
-                // мёртвые не попадают в список, файл с <3 живых = протухший
-                // целиком (NXDOMAIN-волны апстрима). Резолв параллельно.
+                // Живость = WS-хендшейк к kws2.<base>, параллельно, как
+                // офф-версия перебирает balancer.get_domains_for_dc().
                 let alive = await withTaskGroup(of: String?.self) { group in
                     for d in unique {
-                        group.addTask {
-                            var hints = addrinfo()
-                            hints.ai_family = AF_INET
-                            var res: UnsafeMutablePointer<addrinfo>?
-                            let rc = getaddrinfo(d, nil, &hints, &res)
-                            defer { freeaddrinfo(res) }
-                            return rc == 0 ? d : nil
-                        }
+                        group.addTask { await Self.probeFront(d) ? d : nil }
                     }
                     var out: [String] = []
                     for await r in group { if let d = r { out.append(d) } }
                     return out
                 }
                 guard alive.count >= 3 else {
-                    rejection = "протух: живых \(alive.count) из \(unique.count)"
-                    continue
+                    rejection = "живых \(alive.count) из \(unique.count)"; continue
                 }
                 frontBases = alive
                 frontsUpdatedAt = Date()
-                // Флаг для extension: новый список = обнулить реестр фейлов,
-                // иначе все фронты остаются «мёртвыми» по старым >3 фейлам.
+                // Новый список = новая попытка: обнуляем реестр фейлов в
+                // расширении (иначе все фронты остаются «мёртвыми»).
                 UserDefaults.standard.set(true, forKey: "frontsResetPending")
                 frontsUpdateMessage = "Обновлено: \(alive.count) живых (из \(unique.count))"
                 return true
-            } catch {
-                continue // следующий URL
-            }
+            } catch { continue }
         }
         if let rejection {
-            // Сеть жива, источник ответил — негодный сам файл. Прежний
-            // список frontBases не трогаем, каскад работает на нём.
             frontsUpdateMessage = "Источник ответил, но список негодный: \(rejection). Оставил прежний."
         } else {
             frontsUpdateMessage = "Не удалось обновить (нет сети или источники недоступны)"
         }
         return false
+    }
+
+    /// Тихий фоновый прогон: при первом запуске и при каждом старте
+    /// туннеля. Не трогает UI-сообщение, если список уже свежий.
+    func refreshFrontsInBackground() {
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            await self.updateFronts()
+        }
     }
 
     // ── Смена сети: догонялка через журнал ──────────────────────
@@ -946,6 +1000,9 @@ final class TunnelManager: ObservableObject {
         }
         UNUserNotificationCenter.current().delegate = Self.bannerPresenter
         Task { await reload() }
+        // Первый запуск: сразу расшифровать + проверить живость фронтов,
+        // чтобы к первому включению туннеля список был актуальным.
+        refreshFrontsInBackground()
     }
 
     /// ponytail: Darwin notifications — единственный IPC без entitlements.
@@ -1016,6 +1073,40 @@ final class TunnelManager: ObservableObject {
         Self.currentReader?.cancel()
         let reader = JournalReader { [weak self] text in
             Task { @MainActor in self?.journalText = text }
+        }
+        Self.currentReader = reader
+        reader.run { [weak reader] in
+            if Self.currentReader === reader { Self.currentReader = nil }
+        }
+    }
+
+    /// Список всех файлов прогонов (страница «Все логи журнала»).
+    func fetchJournalFiles() {
+        Self.currentReader?.cancel()
+        let reader = JournalReader(command: "list") { [weak self] text in
+            let items = (try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]]) ?? []
+            let files = items.compactMap { d -> JournalFile? in
+                guard let n = d["name"] as? String else { return nil }
+                return JournalFile(name: n,
+                                   size: (d["size"] as? NSNumber)?.intValue ?? 0,
+                                   date: d["date"] as? String ?? "")
+            }
+            Task { @MainActor in self?.journalFiles = files }
+        }
+        Self.currentReader = reader
+        reader.run { [weak reader] in
+            if Self.currentReader === reader { Self.currentReader = nil }
+        }
+    }
+
+    /// Содержимое одного прогона. Экспорт делается системным ShareLink
+    /// из UI (файл уже лежит в контейнере расширения, но мы отдаём текст,
+    /// чтобы не возиться с межпроцессным доступом к ФС).
+    func fetchJournalFile(name: String) {
+        Self.currentReader?.cancel()
+        journalFileText = "читаю…"
+        let reader = JournalReader(command: "file:" + name) { [weak self] text in
+            Task { @MainActor in self?.journalFileText = text }
         }
         Self.currentReader = reader
         reader.run { [weak reader] in
@@ -1523,9 +1614,9 @@ final class TunnelManager: ObservableObject {
         manager = m
         try m.connection.startVPNTunnel()
         status = m.connection.status
-        if needsFrontsUpdate {
-            Task { await updateFronts() }
-        }
+        // Каждый старт туннеля: тихий прогон расшифровки + проверки
+        // живости фронтов (как в офф tg-ws-proxy при запуске).
+        refreshFrontsInBackground()
         // Сторож: статус не сдвинулся за 20 с — расширение умерло молча.
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 20_000_000_000)

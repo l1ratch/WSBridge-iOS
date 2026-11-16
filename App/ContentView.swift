@@ -214,6 +214,11 @@ struct MenuView: View {
                         Label("Журнал туннеля", systemImage: "doc.text")
                     }
                     NavigationLink {
+                        AllJournalView(tunnel: tunnel)
+                    } label: {
+                        Label("Все логи журнала", systemImage: "doc.text.fill")
+                    }
+                    NavigationLink {
                         StatsView(tunnel: tunnel)
                     } label: {
                         Label("Статистика", systemImage: "chart.bar")
@@ -352,17 +357,62 @@ struct WorkerView: View {
     }
 }
 
-/// Журнал: моноширинный текст + системный toolbar (стеклянный на iOS 26).
+/// Журнал ТЕКУЩЕГО прогона. Автопрокрутка к низу (свежее внизу),
+/// плавающая кнопка «вниз/вверх» в зависимости от положения.
 struct JournalView: View {
     @ObservedObject var tunnel: TunnelManager
+    @State private var atBottom = true
 
     var body: some View {
-        ScrollView {
-            Text(tunnel.journalText ?? "")
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    Color.clear.frame(height: 1).id("journalTop")
+                    Text(tunnel.journalText ?? "")
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                    // Якорь для автопрокрутки к самому свежему.
+                    Color.clear.frame(height: 1).id("journalBottom")
+                }
+            }
+            // Автопрокрутка к низу при каждом обновлении лога, пока
+            // пользователь сам не нажал «К началу» (atBottom = false).
+            .onChange(of: tunnel.journalText) { _, _ in
+                guard atBottom else { return }
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo("journalBottom", anchor: .bottom)
+                }
+            }
+            .onAppear {
+                if tunnel.journalText == nil { tunnel.fetchStats() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    proxy.scrollTo("journalBottom", anchor: .bottom)
+                }
+            }
+            // Кнопка: внизу → листаем к началу, не внизу → к свежему.
+            .overlay(alignment: .bottomTrailing) {
+                Button {
+                    withAnimation(.easeOut(duration: 0.25)) {
+                        if atBottom {
+                            proxy.scrollTo("journalTop", anchor: .top)
+                        } else {
+                            proxy.scrollTo("journalBottom", anchor: .bottom)
+                        }
+                        atBottom.toggle()
+                    }
+                } label: {
+                    Image(systemName: atBottom ? "arrow.up.circle.fill" : "arrow.down.circle.fill")
+                        .font(.title2)
+                        .symbolRenderingMode(.hierarchical)
+                        .padding(10)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .padding(.trailing, 16)
+                .padding(.bottom, 16)
+                .accessibilityLabel(atBottom ? "К началу" : "К свежему")
+            }
         }
         .navigationTitle("Журнал")
         .navigationBarTitleDisplayMode(.inline)
@@ -388,21 +438,127 @@ struct JournalView: View {
                 }
             }
         }
-        .onAppear {
-            if tunnel.journalText == nil { tunnel.fetchStats() }
-        }
     }
 
     private var exportFileURL: URL? {
         guard let text = tunnel.journalText, !text.isEmpty else { return nil }
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("WSBridge-journal-full.log")
+            .appendingPathComponent("WSBridge-journal-current.log")
         do {
             try text.write(to: url, atomically: true, encoding: .utf8)
             return url
-        } catch {
-            return nil
+        } catch { return nil }
+    }
+}
+
+// MARK: - Все логи журнала
+
+/// Список файлов прогонов. Каждый можно открыть и посмотреть, либо
+/// экспортировать системным «Поделиться».
+struct AllJournalView: View {
+    @ObservedObject var tunnel: TunnelManager
+
+    var body: some View {
+        List {
+            Section {
+                Text("Каждое включение туннеля пишется в отдельный файл целиком, без обрезания. Хранятся последние 20 прогонов.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("Файлы") {
+                ForEach(tunnel.journalFiles) { file in
+                    NavigationLink {
+                        JournalFileView(tunnel: tunnel, file: file)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(file.name)
+                                    .font(.system(.caption, design: .monospaced))
+                                Text("\(Self.humanSize(file.size)) · \(file.date)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                    }
+                }
+                if tunnel.journalFiles.isEmpty {
+                    Text("Логов пока нет")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
+        .navigationTitle("Все логи журнала")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    tunnel.fetchJournalFiles()
+                } label: { Label("Обновить", systemImage: "arrow.clockwise") }
+            }
+        }
+        .onAppear { tunnel.fetchJournalFiles() }
+    }
+
+    static func humanSize(_ bytes: Int) -> String {
+        if bytes < 1024 { return "\(bytes) Б" }
+        if bytes < 1024 * 1024 { return "\(bytes / 1024) КБ" }
+        return String(format: "%.1f МБ", Double(bytes) / 1024 / 1024)
+    }
+}
+
+/// Просмотр одного файла прогона + системный экспорт.
+struct JournalFileView: View {
+    @ObservedObject var tunnel: TunnelManager
+    let file: TunnelManager.JournalFile
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                Text(tunnel.journalFileText ?? "")
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                    .id("top")
+                Color.clear.frame(height: 1).id("bottom")
+            }
+            .overlay(alignment: .bottomTrailing) {
+                Button {
+                    withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+                } label: {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.title2).symbolRenderingMode(.hierarchical)
+                        .padding(10).background(.ultraThinMaterial, in: Circle())
+                }
+                .padding(16)
+            }
+        }
+        .navigationTitle(file.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .bottomBar) {
+                Button {
+                    tunnel.fetchJournalFile(name: file.name)
+                } label: { Label("Обновить", systemImage: "arrow.clockwise") }
+                Spacer()
+                if let url = exportURL {
+                    ShareLink(item: url) {
+                        Label("Поделиться", systemImage: "square.and.arrow.up")
+                    }
+                }
+            }
+        }
+        .onAppear { tunnel.fetchJournalFile(name: file.name) }
+    }
+
+    private var exportURL: URL? {
+        guard let text = tunnel.journalFileText, !text.isEmpty,
+              !text.hasPrefix("файл недоступен"), text != "читаю…" else { return nil }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(file.name)
+        do { try text.write(to: url, atomically: true, encoding: .utf8); return url }
+        catch { return nil }
     }
 }
 
