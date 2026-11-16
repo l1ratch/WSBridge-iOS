@@ -766,7 +766,7 @@ final class TunnelManager: ObservableObject {
         let host = "kws2." + base
         // Рукописный GET /apiws поверх TCP+TLS, без URLSession: нам важен
         // сам факт 101 Switching Protocols, а не установленная сессия.
-        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             let queue = DispatchQueue.global(qos: .userInitiated)
             let conn = NWConnection(host: NWEndpoint.Host(host),
                                     port: NWEndpoint.Port(rawValue: 443)!, using: .tls)
