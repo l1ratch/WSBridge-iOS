@@ -252,14 +252,20 @@ final class WSClient {
             }
         }
 
-        // Таймер только на фазу коннекта (5с: живые фронты дают 101 за <1с,
-        // висящие эндпоинты не должны съедать терпение Telegram).
-        // Доставленный init (delivered) гасит его.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+        // Таймаут 10с, КАК В ОФФ tg-ws-proxy (raw_websocket.py connect
+        // timeout=10, pool.py 7-8с). Раньше стояло 5с: на сотовой сети
+        // DNS→TCP→TLS→101 стал занимать чуть больше, и мы САМИ убивали
+        // задачу (`-999 NSURLErrorDomain:отменено`), не дождавшись 101.
+        // Обновление фронтов с timeoutInterval=10 при этом работало —
+        // сеть цела, дело было только в нашем преждевременном cancel.
+        // Доставленный init (delivered) гасит таймер раньше.
+        let started = Date()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
             guard !state.delivered, state.claim() else { return }
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
             NSLog("[WSBridge] WS: \(ep.host) connect timed out, trying next")
             self.post("ws_timeout:\(ep.host)")
-            self.post("ws_timeout:detail:no_101_no_init")
+            self.post("ws_timeout:detail:no_101_no_init:\(ms)ms")
             Self.markDead(ep.host)
             wsTask.cancel(with: .goingAway, reason: nil)
             self.task = nil
