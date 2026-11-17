@@ -239,6 +239,14 @@ final class WSClient {
             case .success(let message):
                 _ = state.claim()
                 self.connected = true
+                // ЭТАП 1: если первое сообщение — CLOSE-фрейм от гейтвея,
+                // логируем код и ПРИЧИНУ. ПК-тест дал `1000 "404"` сразу
+                // после 101 на любой init; надо подтвердить то же на iOS.
+                switch message {
+                case .string(let text): self.post("ws_first:string:\(text.prefix(64))")
+                case .data(let d): self.post("ws_first:data:\(d.count)B")
+                @unknown default: self.post("ws_first:unknown")
+                }
                 if let initFrame {
                     self.task?.send(.data(initFrame)) { error in
                         if let error {
@@ -261,7 +269,10 @@ final class WSClient {
                 self.receiveLoop(onMessage: onMessage, onClose: onClose)
             case .failure(let error):
                 let ns = error as NSError
+                let code = wsTask.closeCode.rawValue
+                let reason = wsTask.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                 post("ws_err:\(ep.host):\(ns.code):\(ns.domain):\(error.localizedDescription)")
+                post("ws_closeinfo:\(ep.host):code=\(code):reason=\(reason.prefix(64))")
                 NSLog("[WSBridge] WS: \(ep.host) failed (\(error.localizedDescription)), next")
                 if self.firstRecv {
                     Self.markAlive(ep.host) // умерла живая сессия — эндпоинт не виноват
@@ -287,6 +298,7 @@ final class WSClient {
             NSLog("[WSBridge] WS: \(ep.host) connect timed out, trying next")
             self.post("ws_timeout:\(ep.host)")
             self.post("ws_timeout:detail:no_101_no_init:\(ms)ms")
+            self.post("ws_closeinfo:\(ep.host):code=\(wsTask.closeCode.rawValue):reason=\((wsTask.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(64))")
             Self.markDead(ep.host)
             wsTask.cancel(with: .goingAway, reason: nil)
             self.task = nil
