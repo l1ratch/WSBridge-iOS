@@ -187,6 +187,27 @@ final class WSClient {
         task = wsTask
         wsTask.resume()
 
+        // ДИАГНОСТИКА: снимок состояния задачи на 1с и 3с. Показывает,
+        // стартовал ли URLSessionWebSocketTask вообще: state, сколько
+        // байт ушло/пришло, есть ли error. Ничего не меняем в логике.
+        // По логу (4): за 100+ попыток нет ни ws_challenge, ни ws_taskerr —
+        // задача висит на старте. Эти строки покажут, где именно.
+        for delay in [1.0, 3.0] {
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.task === wsTask else { return }
+                let st: String
+                switch wsTask.state {
+                case .running: st = "running"
+                case .suspended: st = "suspended"
+                case .canceling: st = "canceling"
+                case .completed: st = "completed"
+                @unknown default: st = "unknown"
+                }
+                let err = wsTask.error.map { String(($0 as NSError).code) } ?? "-"
+                self.post("ws_taskstate:\(Int(delay))s:\(st):sent=\(wsTask.countOfBytesSent):rcvd=\(wsTask.countOfBytesReceived):err=\(err)")
+            }
+        }
+
         // Failover валиден, пока гейтвей не прислал ни байта: тот же init
         // отправляется на следующем эндпоинте (CTR-позиции клиента и DC
         // синхронны от init, потерянные кадры MTProto ретраит сам).
