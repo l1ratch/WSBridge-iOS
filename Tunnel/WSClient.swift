@@ -33,11 +33,16 @@ final class WSClient {
         func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
                         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
             let host = challenge.protectionSpace.host
+            let method = challenge.protectionSpace.authenticationMethod
             let parts = host.split(separator: ".")
             let isIPv4 = parts.count == 4 && parts.allSatisfy { Int($0) != nil }
+            // ДИАГНОСТИКА: видим, дошёл ли вообще TLS-challenge до сессии
+            // и что решил delegate. Без этого ws_timeout беспричинен.
+            WSClient.postEvent("ws_challenge:\(host):\(method == NSURLAuthenticationMethodServerTrust ? "trust" : "other")")
             guard isIPv4,
-                  challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+                  method == NSURLAuthenticationMethodServerTrust,
                   let trust = challenge.protectionSpace.serverTrust else {
+                WSClient.postEvent("ws_challenge:\(host):default")
                 completionHandler(.performDefaultHandling, nil)
                 return
             }
@@ -45,11 +50,25 @@ final class WSClient {
                 SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, name as CFString))
                 var err: CFError?
                 if SecTrustEvaluateWithError(trust, &err) {
+                    WSClient.postEvent("ws_challenge:\(host):accepted")
                     completionHandler(.useCredential, URLCredential(trust: trust))
                     return
                 }
             }
+            WSClient.postEvent("ws_challenge:\(host):CANCELLED")
             completionHandler(.cancelAuthenticationChallenge, nil)
+        }
+
+        /// HTTP-статус handshake: URLSessionWebSocketTask сообщает его через
+        /// task-делегат. 101 = успех; 302/403/400 = сервер ответил, но не
+        /// апгрейднул; отсутствие строки = ответа не было вообще.
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        didCompleteWithError error: Error?) {
+            if let error {
+                WSClient.postEvent("ws_taskerr:\((error as NSError).code):\((error as NSError).domain)")
+            } else {
+                WSClient.postEvent("ws_taskdone")
+            }
         }
     }
 
@@ -186,28 +205,33 @@ final class WSClient {
             onClose()
         }
 
-        // Init — первым фреймом (URLSession буферизует до конца handshake).
-        // ws_up = init в сокете; с этого момента каскадный таймер выключен.
-        if let initFrame {
-            wsTask.send(.data(initFrame)) { error in
-                if let error {
-                    NSLog("[WSBridge] WS init send error: \(error.localizedDescription)")
-                } else {
-                    state.delivered = true
-                    if !self.upPosted {
-                        self.upPosted = true
-                        self.post("ws_up")
-                    }
-                }
-            }
-        }
-
+        // Офф tg-ws-proxy (proxy/raw_websocket.py) сначала ДОЖИДАЕТСЯ
+        // `101 Switching Protocols`, и только после этого шлёт relay_init.
+        // Раньше мы звали send(initFrame) СРАЗУ после resume(), до конца
+        // handshake: URLSession буферизует кадр, но если 101 не приходит,
+        // send висит вечно и ws_up не наступает НИ РАЗУ (в логах так и есть).
+        // Переносим отправку в момент первого успешного receive — ровно
+        // как в рабочей версии для ПК.
         wsTask.receive { [weak self] result in
             guard let self else { return }
             switch result {
             case .success(let message):
                 _ = state.claim()
                 self.connected = true
+                if let initFrame {
+                    self.task?.send(.data(initFrame)) { error in
+                        if let error {
+                            self.post("ws_send:err:\((error as NSError).code)")
+                        } else {
+                            state.delivered = true
+                            if !self.upPosted {
+                                self.upPosted = true
+                                self.post("ws_up")
+                            }
+                            self.post("ws_send:ok")
+                        }
+                    }
+                }
                 if case .data(let data) = message {
                     self.firstRecv = true
                     Self.markAlive(ep.host)
@@ -215,8 +239,9 @@ final class WSClient {
                 }
                 self.receiveLoop(onMessage: onMessage, onClose: onClose)
             case .failure(let error):
+                let ns = error as NSError
+                post("ws_err:\(ep.host):\(ns.code):\(ns.domain):\(error.localizedDescription)")
                 NSLog("[WSBridge] WS: \(ep.host) failed (\(error.localizedDescription)), next")
-                post("ws_err:\(ep.host):\(error.localizedDescription)")
                 if self.firstRecv {
                     Self.markAlive(ep.host) // умерла живая сессия — эндпоинт не виноват
                     fail()
@@ -234,6 +259,7 @@ final class WSClient {
             guard !state.delivered, state.claim() else { return }
             NSLog("[WSBridge] WS: \(ep.host) connect timed out, trying next")
             self.post("ws_timeout:\(ep.host)")
+            self.post("ws_timeout:detail:no_101_no_init")
             Self.markDead(ep.host)
             wsTask.cancel(with: .goingAway, reason: nil)
             self.task = nil
