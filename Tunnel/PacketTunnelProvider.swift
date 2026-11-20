@@ -151,6 +151,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             EventLog.append("fronts_health:\(FrontHealthRegistry.summary())")
             let ver = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
             EventLog.append("tunnel_start v\(ver)")
+            // ДИАГНОСТИКА: в журнале 0.3.31 у ВСЕХ WS-задач было
+            // sent=0/rcvd=0 и ни одного ws_challenge — сокет не открывался.
+            // Два независимых замера изнутри расширения отделяют «весь
+            // исходящий стек расширения мёртв» от «дело только в WS-таске».
+            // На логику туннеля не влияет, старт не блокирует.
+            self?.runOutboundProbes()
             // ── Вариант B: список доменов → SNI-матчер ────────────────
             // Список приходит из Main App уже загруженным/дедуплицированным.
             // Extension хранит только Set<String> (в своих 50 МБ это копейки),
@@ -183,6 +189,76 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self?.startPathMonitor()
             self?.scheduleLongSessionNudge()
             completionHandler(nil)
+        }
+    }
+
+    /// Потокобезопасный once для контрольных замеров: state-handler
+    /// NWConnection и таймер приходят с разных потоков, строка в журнал
+    /// должна быть ровно одна на замер.
+    private final class ProbeOnce {
+        private let lock = NSLock()
+        private var claimed = false
+        func claim() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if claimed { return false }
+            claimed = true
+            return true
+        }
+    }
+
+    /// Контрольные исходящие замеры (только журнал, без влияния на трафик).
+    /// 1) probe:https  — обычный HTTPS через URLSession.shared (не WS,
+    ///    не наш sharedSession, без нашего delegate) к заведомо живому хосту.
+    /// 2) probe:tcp443 — NWConnection TCP к первому gatewayIP.
+    /// 3) probe:ws80   — NWConnection TCP к CF-фронту на порт 80: проверяем,
+    ///    проходит ли вообще plaintext-порт, на который перешёл апстрим.
+    private func runOutboundProbes() {
+        let started = Date()
+        func ms() -> Int { Int(Date().timeIntervalSince(started) * 1000) }
+
+        if let url = URL(string: "https://www.gstatic.com/generate_204") {
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 8
+            URLSession.shared.dataTask(with: req) { _, resp, err in
+                if let http = resp as? HTTPURLResponse {
+                    EventLog.append("probe:https:ok:\(http.statusCode):\(ms())ms")
+                } else if let err {
+                    let ns = err as NSError
+                    EventLog.append("probe:https:err:\(ns.code):\(ns.domain):\(ms())ms")
+                } else {
+                    EventLog.append("probe:https:none:\(ms())ms")
+                }
+            }.resume()
+        }
+
+        func tcpProbe(_ label: String, host: String, port: UInt16) {
+            guard let p = NWEndpoint.Port(rawValue: port) else { return }
+            let conn = NWConnection(host: NWEndpoint.Host(host), port: p, using: .tcp)
+            // ProbeOnce — потокобезопасный once (как TryState в WSClient):
+            // state-handler и таймер приходят с разных потоков. cancel()
+            // вызывается ВНЕ замка: он зовёт handler обратно и под замком
+            // мог бы задедлочиться.
+            let once = ProbeOnce()
+            func report(_ state: String) {
+                guard once.claim() else { return }
+                EventLog.append("probe:\(label):\(state):\(ms())ms")
+                conn.cancel()
+            }
+            conn.stateUpdateHandler = { st in
+                switch st {
+                case .ready: report("ready")
+                case .failed(let e): report("failed:\(e)")
+                case .waiting(let e): report("waiting:\(e)")
+                default: break
+                }
+            }
+            conn.start(queue: .global(qos: .utility))
+            DispatchQueue.global().asyncAfter(deadline: .now() + 8) { report("timeout") }
+        }
+
+        tcpProbe("tcp443", host: "149.154.167.220", port: 443)
+        if let front = CFDomains.bases.first {
+            tcpProbe("ws80", host: "kws2.\(front)", port: 80)
         }
     }
 

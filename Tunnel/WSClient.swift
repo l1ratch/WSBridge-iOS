@@ -119,13 +119,23 @@ final class WSClient {
         FrontHealthRegistry.recordSuccess(host)
     }
 
-    private static func aliveOnly(_ eps: [(host: String, hostHeader: String?)]) -> [(host: String, hostHeader: String?)] {
+    /// Эндпоинт каскада. `plain` = WS без TLS на порт 80 (см. connect()).
+    /// Здоровье считается ПО КЛЮЧУ host+plain: мёртвый 443 не должен
+    /// прятать живой 80 того же фронта, и наоборот.
+    private typealias Endpoint = (host: String, hostHeader: String?, plain: Bool)
+
+    private static func healthKey(_ host: String, plain: Bool) -> String {
+        plain ? "ws80:\(host)" : host
+    }
+
+    private static func aliveOnly(_ eps: [Endpoint]) -> [Endpoint] {
         healthLock.lock(); defer { healthLock.unlock() }
         let now = Date()
         return eps.filter { ep in
-            guard let until = deadUntil[ep.host] else { return true }
+            let key = healthKey(ep.host, plain: ep.plain)
+            guard let until = deadUntil[key] else { return true }
             if until > now { return false }
-            deadUntil.removeValue(forKey: ep.host)
+            deadUntil.removeValue(forKey: key)
             return true
         }
     }
@@ -155,16 +165,24 @@ final class WSClient {
             rotated = ordered
         }
 
-        var endpoints: [(host: String, hostHeader: String?)] =
-            rotated.prefix(6).map { ($0, nil as String?) }
-        endpoints += Self.gatewayIPs.map { ($0, gwHost as String?) }
-        endpoints.append((gwHost, nil))
+        // WS/80 БЕЗ TLS для CF-фронтов — обход, который 19.11.2026 массово
+        // подтверждён у офф tg-ws-proxy («Выключить TLS для CF-прокси»,
+        // Flowseal #1652) и включён по умолчанию в Android-форке v1.11.10
+        // (Regstar2 PR #169, ws://…:80/apiws). Участок до CF не шифруется,
+        // но MTProto-payload остаётся под собственным obfuscated2.
+        // Порядок: сначала 80 у тех же 6 фронтов, затем ПРЕЖНИЙ каскад
+        // (443-фронты → gatewayIP → gwHost) целиком, как fallback.
+        let top = rotated.prefix(6)
+        var endpoints: [Endpoint] = top.map { ($0, nil as String?, true) }
+        endpoints += top.map { ($0, nil as String?, false) }
+        endpoints += Self.gatewayIPs.map { ($0, gwHost as String?, false) }
+        endpoints.append((gwHost, nil, false))
 
         let healthy = Self.aliveOnly(endpoints)
         tryConnect(endpoints: healthy.isEmpty ? endpoints : healthy, path: path, index: 0, onMessage: onMessage, onClose: onClose)
     }
 
-    private func tryConnect(endpoints: [(host: String, hostHeader: String?)], path: String, index: Int, onMessage: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+    private func tryConnect(endpoints: [Endpoint], path: String, index: Int, onMessage: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
         guard index < endpoints.count else {
             NSLog("[WSBridge] WS: all endpoints failed")
             post("ws_fail")
@@ -172,12 +190,15 @@ final class WSClient {
             return
         }
         let ep = endpoints[index]
-        guard let url = URL(string: "wss://\(ep.host)\(path)") else {
+        let key = Self.healthKey(ep.host, plain: ep.plain)
+        let scheme = ep.plain ? "ws" : "wss"
+        let port = ep.plain ? ":80" : ""
+        guard let url = URL(string: "\(scheme)://\(ep.host)\(port)\(path)") else {
             tryConnect(endpoints: endpoints, path: path, index: index + 1, onMessage: onMessage, onClose: onClose)
             return
         }
-        NSLog("[WSBridge] WS: trying \(ep.host)")
-        post("ws_try:\(ep.host)")
+        NSLog("[WSBridge] WS: trying \(key)")
+        post("ws_try:\(key)")
         var request = URLRequest(url: url)
         request.setValue("binary", forHTTPHeaderField: "Sec-WebSocket-Protocol")
         if let hh = ep.hostHeader {
@@ -263,7 +284,7 @@ final class WSClient {
                 }
                 if case .data(let data) = message {
                     self.firstRecv = true
-                    Self.markAlive(ep.host)
+                    Self.markAlive(key)
                     onMessage(data)
                 }
                 self.receiveLoop(onMessage: onMessage, onClose: onClose)
@@ -271,14 +292,14 @@ final class WSClient {
                 let ns = error as NSError
                 let code = wsTask.closeCode.rawValue
                 let reason = wsTask.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-                post("ws_err:\(ep.host):\(ns.code):\(ns.domain):\(error.localizedDescription)")
-                post("ws_closeinfo:\(ep.host):code=\(code):reason=\(reason.prefix(64))")
-                NSLog("[WSBridge] WS: \(ep.host) failed (\(error.localizedDescription)), next")
+                post("ws_err:\(key):\(ns.code):\(ns.domain):\(error.localizedDescription)")
+                post("ws_closeinfo:\(key):code=\(code):reason=\(reason.prefix(64))")
+                NSLog("[WSBridge] WS: \(key) failed (\(error.localizedDescription)), next")
                 if self.firstRecv {
-                    Self.markAlive(ep.host) // умерла живая сессия — эндпоинт не виноват
+                    Self.markAlive(key) // умерла живая сессия — эндпоинт не виноват
                     fail()
                 } else {
-                    Self.markDead(ep.host)
+                    Self.markDead(key)
                     advance()
                 }
             }
@@ -295,11 +316,11 @@ final class WSClient {
         DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
             guard !state.delivered, state.claim() else { return }
             let ms = Int(Date().timeIntervalSince(started) * 1000)
-            NSLog("[WSBridge] WS: \(ep.host) connect timed out, trying next")
-            self.post("ws_timeout:\(ep.host)")
+            NSLog("[WSBridge] WS: \(key) connect timed out, trying next")
+            self.post("ws_timeout:\(key)")
             self.post("ws_timeout:detail:no_101_no_init:\(ms)ms")
-            self.post("ws_closeinfo:\(ep.host):code=\(wsTask.closeCode.rawValue):reason=\((wsTask.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(64))")
-            Self.markDead(ep.host)
+            self.post("ws_closeinfo:\(key):code=\(wsTask.closeCode.rawValue):reason=\((wsTask.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(64))")
+            Self.markDead(key)
             wsTask.cancel(with: .goingAway, reason: nil)
             self.task = nil
             self.tryConnect(endpoints: endpoints, path: path, index: index + 1, onMessage: onMessage, onClose: onClose)

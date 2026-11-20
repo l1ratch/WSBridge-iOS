@@ -100,6 +100,73 @@ targets:
         NSExtension:
           NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+        # ATS: разрешаем ws:// (порт 80) ТОЛЬКО к CF-фронтам из
+        # CFDomains.builtinBases. Глобального NSAllowsArbitraryLoads нет,
+        # остальные соединения расширения по-прежнему требуют TLS.
+        # Нужен для WS/80-обхода (Flowseal #1652 / Regstar2 PR #169).
+        # Список должен совпадать с Tunnel/CFDomains.swift:builtinBases.
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            pclead.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            offshor.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            cakeisalie.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            noskomnadzor.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            lovetrue.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            sorokdva.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            pyatdesyatdva.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            kartoshka.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            sorokodin.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            pyatdesyatodin.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            notelega.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            ebally.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            nebally.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            havegreatday.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            pomogite.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            fixtelega.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            sadnews.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            onedaychamp.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            stopblocking.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            nothingthere.co.uk:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
     entitlements:
       path: Tunnel/WSBridgeTunnel.entitlements
       properties:
