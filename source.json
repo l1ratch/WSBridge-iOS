@@ -7,10 +7,10 @@
       "name": "WSBridge",
       "bundleIdentifier": "com.l1ratch.WSBridge",
       "developerName": "l1ratch",
-      "version": "0.3.31",
-      "versionDate": "2026-11-17T08:20:04Z",
-      "versionDescription": "preview build 31",
-      "size": 3883931,
+      "version": "0.3.32",
+      "versionDate": "2026-11-20T08:46:48Z",
+      "versionDescription": "preview build 32",
+      "size": 3889577,
       "downloadURL": "https://l1ratch.github.io/WSBridge-iOS/wsb.ipa",
       "localizedDescription": "IP-over-WebSocket relay для iOS. Неподписанный IPA — GBox подпишет при установке."
     }
