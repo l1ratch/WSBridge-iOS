@@ -259,6 +259,11 @@ final class WSClient {
         // придёт, сработает наш 10с таймер и каскад пойдёт дальше.
         // sendInit идемпотентен: ровно один кадр на эндпоинт.
         let sentOnce = TryState()
+        // Признак «этот эндпоинт прислал кадр данных» — ЛОКАЛЬНЫЙ для
+        // попытки. self.firstRecv живёт на весь WSClient и после первого
+        // успеха остался бы true навсегда, погасив таймеры всех следующих
+        // эндпоинтов каскада (мёртвые держали бы сессию вечно).
+        let gotData = GotData()
         func sendInit() {
             guard let initFrame, sentOnce.claim() else { return }
             wsTask.send(.data(initFrame)) { [weak self] error in
@@ -281,6 +286,10 @@ final class WSClient {
             switch result {
             case .success(let message):
                 self.connected = true
+                // ЛЮБОЙ успешный receive = эндпоинт жив: гасим таймер сразу,
+                // до разбора типа. Иначе строковый кадр оставил бы живое
+                // соединение под таймером и мы бы его убили через 10с.
+                gotData.set()
                 // Первое сообщение гейтвея: тип и размер. CLOSE-фрейм
                 // обычно приходит как .failure (см. ниже) с closeCode.
                 switch message {
@@ -312,23 +321,40 @@ final class WSClient {
         }
 
         // Таймаут 10с, КАК В ОФФ tg-ws-proxy (raw_websocket.py connect
-        // timeout=10, pool.py 7-8с). Гасится ТОЛЬКО реально полученными
-        // байтами (countOfBytesReceived), а не фактом отправки init:
-        // с 0.3.33 init уходит сразу, поэтому «отправлено» больше не
-        // означает, что гейтвей жив — иначе молчащий сервер держал бы
-        // сессию вечно и каскад не шёл бы дальше.
+        // timeout=10, pool.py 7-8с).
+        // Гасится ТОЛЬКО полученным кадром данных этого эндпоинта.
+        // НЕ countOfBytesReceived: журнал 0.3.33 показал, что у
+        // URLSessionWebSocketTask эти счётчики остаются 0 даже ПОСЛЕ
+        // успешного обмена (ws_first:data:345B, а рядом rcvd=0) — они
+        // про HTTP-тело, не про WS-фреймы. Из-за этого таймер убивал
+        // живые сессии через 10с: ws_up → data:345B → ws_timeout.
         let started = Date()
         DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
-            guard wsTask.countOfBytesReceived == 0, state.claim() else { return }
+            guard !gotData.value, state.claim() else { return }
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             NSLog("[WSBridge] WS: \(key) connect timed out, trying next")
             self.post("ws_timeout:\(key)")
-            self.post("ws_timeout:detail:no_data:\(ms)ms:sent=\(wsTask.countOfBytesSent)")
+            self.post("ws_timeout:detail:no_data:\(ms)ms")
             self.post("ws_closeinfo:\(key):code=\(wsTask.closeCode.rawValue):reason=\((wsTask.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(64))")
             Self.markDead(key)
             wsTask.cancel(with: .goingAway, reason: nil)
             self.task = nil
             self.tryConnect(endpoints: endpoints, path: path, index: index + 1, onMessage: onMessage, onClose: onClose)
+        }
+    }
+
+    /// «Эндпоинт прислал кадр данных» — пишется из receive-колбэка,
+    /// читается таймером с другого потока, поэтому под замком.
+    private final class GotData {
+        private let lock = NSLock()
+        private var got = false
+        var value: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return got
+        }
+        func set() {
+            lock.lock(); defer { lock.unlock() }
+            got = true
         }
     }
 
