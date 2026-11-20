@@ -206,30 +206,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// Контрольные исходящие замеры (только журнал, без влияния на трафик).
-    /// 1) probe:https  — обычный HTTPS через URLSession.shared (не WS,
-    ///    не наш sharedSession, без нашего delegate) к заведомо живому хосту.
-    /// 2) probe:tcp443 — NWConnection TCP к первому gatewayIP.
-    /// 3) probe:ws80   — NWConnection TCP к CF-фронту на порт 80: проверяем,
-    ///    проходит ли вообще plaintext-порт, на который перешёл апстрим.
+    /// Контрольный исходящий замер (только журнал, без влияния на трафик).
+    /// probe:ws80 — NWConnection TCP к CF-фронту на порт 80: проходит ли
+    /// plaintext-порт, на который перешёл апстрим.
+    /// Замеры https/tcp443 из 0.3.32 удалены: свою задачу выполнили —
+    /// в журнале (6) дали https:ok:204:738ms и tcp443:timeout, т.е.
+    /// исходящий стек расширения жив, 443 к гейтвею молчит, 80 открыт.
     private func runOutboundProbes() {
         let started = Date()
         func ms() -> Int { Int(Date().timeIntervalSince(started) * 1000) }
-
-        if let url = URL(string: "https://www.gstatic.com/generate_204") {
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 8
-            URLSession.shared.dataTask(with: req) { _, resp, err in
-                if let http = resp as? HTTPURLResponse {
-                    EventLog.append("probe:https:ok:\(http.statusCode):\(ms())ms")
-                } else if let err {
-                    let ns = err as NSError
-                    EventLog.append("probe:https:err:\(ns.code):\(ns.domain):\(ms())ms")
-                } else {
-                    EventLog.append("probe:https:none:\(ms())ms")
-                }
-            }.resume()
-        }
 
         func tcpProbe(_ label: String, host: String, port: UInt16) {
             guard let p = NWEndpoint.Port(rawValue: port) else { return }
@@ -256,7 +241,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             DispatchQueue.global().asyncAfter(deadline: .now() + 8) { report("timeout") }
         }
 
-        tcpProbe("tcp443", host: "149.154.167.220", port: 443)
         if let front = CFDomains.bases.first {
             tcpProbe("ws80", host: "kws2.\(front)", port: 80)
         }

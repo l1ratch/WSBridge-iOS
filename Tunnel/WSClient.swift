@@ -247,40 +247,46 @@ final class WSClient {
             onClose()
         }
 
-        // Офф tg-ws-proxy (proxy/raw_websocket.py) сначала ДОЖИДАЕТСЯ
-        // `101 Switching Protocols`, и только после этого шлёт relay_init.
-        // Раньше мы звали send(initFrame) СРАЗУ после resume(), до конца
-        // handshake: URLSession буферизует кадр, но если 101 не приходит,
-        // send висит вечно и ws_up не наступает НИ РАЗУ (в логах так и есть).
-        // Переносим отправку в момент первого успешного receive — ровно
-        // как в рабочей версии для ПК.
+        // init шлём СРАЗУ после resume(), НЕ дожидаясь первого receive.
+        // Журнал 0.3.32 (WS/80) показал: гейтвей отвечает CLOSE
+        // `code=1000 reason=404`, а он приходит как .failure — значит ветка
+        // «отправить init внутри первого успешного receive» не выполнялась
+        // НИ РАЗУ (во всех 657 снимках было sent=0). Мы ждали данных,
+        // которых сервер не пришлёт, пока не получит init. Так же ведёт
+        // себя офф tg-ws-proxy: relay_init уходит сразу после 101, а не
+        // после первого сообщения сервера. URLSession буферизует кадр до
+        // конца handshake, поэтому ранний send безопасен; если 101 не
+        // придёт, сработает наш 10с таймер и каскад пойдёт дальше.
+        // sendInit идемпотентен: ровно один кадр на эндпоинт.
+        let sentOnce = TryState()
+        func sendInit() {
+            guard let initFrame, sentOnce.claim() else { return }
+            wsTask.send(.data(initFrame)) { [weak self] error in
+                guard let self else { return }
+                if let error {
+                    self.post("ws_send:err:\((error as NSError).code)")
+                } else {
+                    if !self.upPosted {
+                        self.upPosted = true
+                        self.post("ws_up")
+                    }
+                    self.post("ws_send:ok")
+                }
+            }
+        }
+        sendInit()
+
         wsTask.receive { [weak self] result in
             guard let self else { return }
             switch result {
             case .success(let message):
-                _ = state.claim()
                 self.connected = true
-                // ЭТАП 1: если первое сообщение — CLOSE-фрейм от гейтвея,
-                // логируем код и ПРИЧИНУ. ПК-тест дал `1000 "404"` сразу
-                // после 101 на любой init; надо подтвердить то же на iOS.
+                // Первое сообщение гейтвея: тип и размер. CLOSE-фрейм
+                // обычно приходит как .failure (см. ниже) с closeCode.
                 switch message {
                 case .string(let text): self.post("ws_first:string:\(text.prefix(64))")
                 case .data(let d): self.post("ws_first:data:\(d.count)B")
                 @unknown default: self.post("ws_first:unknown")
-                }
-                if let initFrame {
-                    self.task?.send(.data(initFrame)) { error in
-                        if let error {
-                            self.post("ws_send:err:\((error as NSError).code)")
-                        } else {
-                            state.delivered = true
-                            if !self.upPosted {
-                                self.upPosted = true
-                                self.post("ws_up")
-                            }
-                            self.post("ws_send:ok")
-                        }
-                    }
                 }
                 if case .data(let data) = message {
                     self.firstRecv = true
@@ -306,19 +312,18 @@ final class WSClient {
         }
 
         // Таймаут 10с, КАК В ОФФ tg-ws-proxy (raw_websocket.py connect
-        // timeout=10, pool.py 7-8с). Раньше стояло 5с: на сотовой сети
-        // DNS→TCP→TLS→101 стал занимать чуть больше, и мы САМИ убивали
-        // задачу (`-999 NSURLErrorDomain:отменено`), не дождавшись 101.
-        // Обновление фронтов с timeoutInterval=10 при этом работало —
-        // сеть цела, дело было только в нашем преждевременном cancel.
-        // Доставленный init (delivered) гасит таймер раньше.
+        // timeout=10, pool.py 7-8с). Гасится ТОЛЬКО реально полученными
+        // байтами (countOfBytesReceived), а не фактом отправки init:
+        // с 0.3.33 init уходит сразу, поэтому «отправлено» больше не
+        // означает, что гейтвей жив — иначе молчащий сервер держал бы
+        // сессию вечно и каскад не шёл бы дальше.
         let started = Date()
         DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
-            guard !state.delivered, state.claim() else { return }
+            guard wsTask.countOfBytesReceived == 0, state.claim() else { return }
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             NSLog("[WSBridge] WS: \(key) connect timed out, trying next")
             self.post("ws_timeout:\(key)")
-            self.post("ws_timeout:detail:no_101_no_init:\(ms)ms")
+            self.post("ws_timeout:detail:no_data:\(ms)ms:sent=\(wsTask.countOfBytesSent)")
             self.post("ws_closeinfo:\(key):code=\(wsTask.closeCode.rawValue):reason=\((wsTask.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(64))")
             Self.markDead(key)
             wsTask.cancel(with: .goingAway, reason: nil)
@@ -332,7 +337,6 @@ final class WSClient {
     private final class TryState {
         private let lock = NSLock()
         private var claimed = false
-        var delivered = false
         func claim() -> Bool {
             lock.lock(); defer { lock.unlock() }
             if claimed { return false }
