@@ -337,7 +337,7 @@ final class WSClient {
         // живые сессии через 10с: ws_up → data:345B → ws_timeout.
         let started = Date()
         DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
-            guard !closedFlag.value, !gotData.value, state.claim() else { return }
+            guard !self.closedFlag.value, !gotData.value, state.claim() else { return }
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             NSLog("[WSBridge] WS: \(key) connect timed out, trying next")
             self.post("ws_timeout:\(key)")
