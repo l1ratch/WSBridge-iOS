@@ -73,6 +73,12 @@ final class WSClient {
     }
 
     private var task: URLSessionWebSocketTask?
+    /// Клиент закрыл соединение: каскад обязан остановиться. Без этого
+    /// запланированный 10с-таймер всё равно звал tryConnect и поднимал
+    /// каскад заново уже для мёртвой сессии (журнал 0.3.34: c1 закрыт
+    /// close:fin:12s в 22:40:25, а его ws_try шли до 22:41:15 — 6 лишних
+    /// эндпоинтов, каждый помечал живой фронт мёртвым).
+    private let closedFlag = ClosedFlag()
     private var connected = false
     private var initFrame: Data?
     private var firstRecv = false
@@ -183,6 +189,7 @@ final class WSClient {
     }
 
     private func tryConnect(endpoints: [Endpoint], path: String, index: Int, onMessage: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+        guard !closedFlag.value else { return }
         guard index < endpoints.count else {
             NSLog("[WSBridge] WS: all endpoints failed")
             post("ws_fail")
@@ -282,7 +289,7 @@ final class WSClient {
         sendInit()
 
         wsTask.receive { [weak self] result in
-            guard let self else { return }
+            guard let self, !self.closedFlag.value else { return }
             switch result {
             case .success(let message):
                 self.connected = true
@@ -330,7 +337,7 @@ final class WSClient {
         // живые сессии через 10с: ws_up → data:345B → ws_timeout.
         let started = Date()
         DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
-            guard !gotData.value, state.claim() else { return }
+            guard !closedFlag.value, !gotData.value, state.claim() else { return }
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             NSLog("[WSBridge] WS: \(key) connect timed out, trying next")
             self.post("ws_timeout:\(key)")
@@ -340,6 +347,21 @@ final class WSClient {
             wsTask.cancel(with: .goingAway, reason: nil)
             self.task = nil
             self.tryConnect(endpoints: endpoints, path: path, index: index + 1, onMessage: onMessage, onClose: onClose)
+        }
+    }
+
+    /// «Соединение закрыто клиентом» — ставится из close() на lwipQueue,
+    /// читается из receive/таймеров на других потоках, поэтому под замком.
+    private final class ClosedFlag {
+        private let lock = NSLock()
+        private var closed = false
+        var value: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return closed
+        }
+        func set() {
+            lock.lock(); defer { lock.unlock() }
+            closed = true
         }
     }
 
@@ -468,6 +490,7 @@ final class WSClient {
 
     func close() {
         connected = false
+        closedFlag.set()
         if let rc = relayConn {
             relayConn = nil
             rc.cancel()
