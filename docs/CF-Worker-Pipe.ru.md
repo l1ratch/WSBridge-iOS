@@ -33,7 +33,7 @@ kws-каскад при этом не используется.
    **Workers & Pages** → **Create application** → **Start with Hello World!** →
    **Deploy**. Имя возьмите новое, например `wsbridge-pipe`.
 3. **Важно:** не перезаписывайте существующий DoH-воркер
-   (`spring-pond-b6cc.sm171105.workers.dev`) — там другой код, он `/apiws` не
+   (свой домен вида <name>.workers.dev) - там другой код, он /apiws не
    обслуживает (проверено: отвечает текстом «WSBridge DoH worker»).
 4. **Edit code** → стереть всё слева → вставить содержимое
    [`cf-worker-pipe.js`](./cf-worker-pipe.js) целиком → **Deploy**.
