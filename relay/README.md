@@ -105,6 +105,39 @@ sudo ufw allow 2087/tcp                    # ОБЯЗАТЕЛЬНО открыт
 volume из compose по умолчанию — он наследует владельца из образа
 и работает сразу.
 
+**Третий затык (HTTP/2) — самый коварный.** Симптомы: в журнале iOS
+`relayws_try` → `relayws_auth_sent` → `ws_closed:0::Ошибка протокола`
+мгновенно, на каждую попытку; а на релее `connections_total=0`, т.е.
+соединение вообще не доходит до Python. Причина: nginx отдаёт **ALPN h2**,
+а `URLSessionWebSocketTask` умеет WS только по HTTP/1.1 `Upgrade`
+(h2 требует extended CONNECT из RFC 8441, который iOS не использует).
+
+Лечение: в server-блоке поддомена должен быть `http2 off;` (в нашем конфиге
+уже есть). Проверить и перезапустить:
+
+```bash
+sudo nginx -T | grep -n 'http2\|wsb-remote'   # найти свой блок
+# убедиться, что в нём есть строка:  http2 off;
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Проверка снаружи (должно быть `http/1.1`, а не `h2`):
+```bash
+curl -sI --http1.1 https://ВАШ_ПОДДОМЕН/ -o /dev/null -w 'alpn=%{http_version}\n'
+```
+Или на любом хосте с Python:
+```bash
+python3 -c "import socket,ssl;c=ssl.create_default_context();c.set_alpn_protocols(['h2','http/1.1']);s=c.wrap_socket(socket.create_connection(('ВАШ_ПОДДОМЕН',443),timeout=10),server_hostname='ВАШ_ПОДДОМЕН');print(s.selected_alpn_protocol())"
+```
+Должно напечатать `http/1.1`. Если `h2` — строка `http2 off;` не применилась
+(например, её перекрыл другой server-блок или `listen 443 ssl http2;`).
+
+Диагностический A/B, который это доказал (тот же хост, тот же путь):
+```
+curl --http1.1 + Upgrade: websocket  ->  HTTP/1.1 101 Switching Protocols
+ручной HTTP/2 extended CONNECT       ->  :status 200 (nginx умеет, iOS нет)
+```
+
 ## Подключение в WSBridge
 
 1. Выключить туннель.
