@@ -72,6 +72,40 @@ E_CLIENT_IDLE = "client_idle"
 E_OVERSIZED = "packet_oversized"
 E_LIMIT = "conn_limit"
 
+# Страница для обычных HTTP-запросов (браузер, пробинг). Живой сайт вместо
+# «426 Upgrade Required» — обязательная часть маскировки: сканер, зашедший
+# по https, должен увидеть настоящий сервис, а не загадочный апгрейд.
+_LANDING_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WSBridge Remote</title>
+<style>
+:root{color-scheme:dark}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font:16px/1.6 -apple-system,'Segoe UI',Roboto,sans-serif;background:#0e1116;color:#d7dce3;min-height:100vh;display:flex;align-items:center;justify-content:center}
+main{max-width:560px;padding:48px 24px;text-align:center}
+h1{font-size:1.35rem;font-weight:650;letter-spacing:.01em;margin-bottom:6px}
+p{color:#8b939e;font-size:.95rem}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#3ddc84;margin-right:8px;box-shadow:0 0 8px #3ddc8466;animation:p 2s infinite}
+@keyframes p{50%{opacity:.5}}
+code{font:0.85em/1.4 ui-monospace,monospace;background:#1a1f27;padding:2px 7px;border-radius:5px;color:#9ecbff}
+footer{margin-top:36px;font-size:.8rem;color:#5b626b}
+</style>
+</head>
+<body>
+<main>
+<h1><span class="dot"></span>WSBridge Remote</h1>
+<p>Служба удалённого доступа активна.</p>
+<p>Подключение выполняется клиентом WSBridge; для браузера этот интерфейс
+не используется.</p>
+<footer>Status: operational</footer>
+</main>
+</body>
+</html>
+""".encode("utf-8")
+
 
 # ---------------------------------------------------------------- WS-слой
 
@@ -151,7 +185,11 @@ class WSConn:
 
 async def accept_ws(reader: asyncio.StreamReader,
                     writer: asyncio.StreamWriter) -> WSConn | None:
-    """HTTP Upgrade -> 101. Отвечаем 101 всем (ключ проверяется позже)."""
+    """HTTP Upgrade -> 101. Отвечаем 101 всем (ключ проверяется позже).
+
+    Обычный GET без Upgrade получает обычную страницу-заглушку: релей
+    выглядит как живой сайт, а не «странный сервис, требующий апгрейд».
+    """
     try:
         request_line = await asyncio.wait_for(reader.readline(), timeout=10)
         if not request_line:
@@ -165,9 +203,12 @@ async def accept_ws(reader: asyncio.StreamReader,
                 k, v = line.split(b":", 1)
                 headers[k.strip().lower()] = v.strip()
         if headers.get(b"upgrade", b"").lower() != b"websocket":
-            # Не WS — ведём себя как обычный веб-сервер: 426.
-            writer.write(b"HTTP/1.1 426 Upgrade Required\r\n"
-                         b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+            body = _LANDING_HTML
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/html; charset=utf-8\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Connection: close\r\n\r\n" + body)
             await writer.drain()
             writer.close()
             return None

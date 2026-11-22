@@ -34,44 +34,83 @@ iPhone ──WSS──→ VDS:<port> ──TLS──→ kws{dc}.web.telegram.org
 
 ## Быстрый старт
 
+### Вариант A: с nginx на выделенном поддомене (рекомендуется)
+
+Весь поддомен (например `wsb-remote.example.com`) — это мост. Снаружи только
+443, TLS + WS, выглядит как корпоративный remote-access сервис.
+
 ```bash
+# 0. DNS: A-запись wsb-remote.example.com -> IP вашего VDS
+#    (в панели управления доменом)
+
+# 1. Забрать файлы на сервер
 git clone https://github.com/l1ratch/WSBridge-iOS.git
 cd WSBridge-iOS/relay
 
-# 1. Проверьте свободный порт и IPv6 на хосте
-sudo ss -tlnp | grep 2087          # должно быть пусто
+# 2. Проверить IPv6 (нужен для исходящих к Telegram)
 curl -6 -sS --max-time 8 https://ipv6.google.com -o /dev/null -w '%{http_code}\n'   # 200
 
-# 2. Запуск
+# 3. Запустить релей (слушает 127.0.0.1 внутри compose — наружу не торчит)
 docker compose up -d --build
 
-# 3. Ключ выводится ОДИН РАЗ при первом запуске
+# 4. Ключ выводится ОДИН РАЗ при первом запуске
 docker compose logs relay | head -20
+# Сохраните ключ!
 
-# 4. Откройте порт в фаерволе (обязательно!)
-sudo ufw allow 2087/tcp
-sudo ufw status | grep 2087
+# 5. nginx: положить конфиг, заменить домен, получить сертификат
+sudo cp wsb-remote.nginx.conf /etc/nginx/sites-available/wsb-remote
+sudo ln -s /etc/nginx/sites-available/wsb-remote /etc/nginx/sites-enabled/
+sudo nano /etc/nginx/sites-available/wsb-remote   # заменить wsb-remote.example.com
+sudo certbot --nginx -d wsb-remote.example.com
+sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Порт меняется в `docker-compose.yml` → `command: ["--port", "ВАШ_ПОРТ", ...]`.
-На типичном VDS 443/80/8443 заняты nginx, 2053/2083/2084 — контейнерами;
-из свободных подходят 2087, 2096, 9443.
+### Вариант B: без домена, прямой порт
+
+```bash
+git clone https://github.com/l1ratch/WSBridge-iOS.git
+cd WSBridge-iOS/relay
+docker compose up -d --build
+docker compose logs relay | head -20        # ключ
+sudo ufw allow 2087/tcp                    # ОБЯЗАТЕЛЬНО открыть порт
+```
+
+В приложении тогда указывается `IP:2087` — но это без TLS, только для теста.
+Для постоянного использования — вариант A.
+
+## Какие файлы нужны
+
+Всё уже в `relay/` репозитории:
+
+| Файл | Назначение |
+|---|---|
+| `relay.py` | сервер (WS-приём, авторизация, апстрим) |
+| `mtproto.py` | AES-CTR, разбор init, сплиттер |
+| `state.py` | ключ, статистика, диагностика |
+| `Dockerfile` | образ alpine, non-root |
+| `docker-compose.yml` | лимиты, healthcheck, restart |
+| `wsb-remote.nginx.conf` | готовый конфиг nginx для поддомена |
+| `README.md` | этот файл |
+
+Ничего скачивать отдельно не нужно — `git clone` и всё.
 
 **Частый затык:** мост слушает, но `stats: total=0` — порт закрыт UFW.
-`sudo ufw allow <port>/tcp` решает.
+В варианте A наружу торчит только 443 (уже открыт под nginx); в варианте B —
+`sudo ufw allow <port>/tcp`.
 
 ## Подключение в WSBridge
 
 1. Выключить туннель.
-2. Меню → **WSBridge Relay** → домен (`relay.example.com`) и ключ.
+2. Меню → **Релей и воркер** → **WSBridge Relay** → домен
+   (`wsb-remote.example.com`) и ключ.
 3. Включить туннель.
 
-В журнале: `cfg:relay=…` → `relay_up` → `ws_up` → `ws_recv:…` — успех.
+В журнале: `cfg:relay=…` → `relayws_try:…` → `ws_up` → `ws_recv:…` — успех.
 
 ## Протокол
 
 ```
-wss://relay.example.com/bridge          TLS 1.3 (терминирует nginx)
+wss://wsb-remote.example.com/            TLS 1.3 (терминирует nginx)
 → 101 Switching Protocols               ВСЕМ, до проверки ключа
 → {"v":1,"token":"<key>"}               первый кадр, внутри TLS
 → {"ok":true}  |  close 1008            отказ как у защищённого сервиса
@@ -84,8 +123,21 @@ wss://relay.example.com/bridge          TLS 1.3 (терминирует nginx)
 - токен внутри TLS, не в URL — не попадает в логи nginx;
 - отказ = `close 1008` (policy violation) — стандартный код защищённого сервиса.
 
-Первый MTProto-кадр — **оригинальный init** без самодеятельных заголовков,
-байт-в-байт как у официального клиента tg-ws-proxy.
+Релей принимает ЛЮБОЙ путь (`/`, `/ws`, `/bridge` — без разницы): выделенный
+поддомен сам по себе и есть адрес. Приложение шлёт на корень `/`.
+
+## Обновление IPv6-адресов
+
+Адреса kws получены через DoH и могут смениться:
+
+```bash
+curl -s 'https://dns.google/resolve?name=kws2.web.telegram.org&type=AAAA'
+```
+
+Обновить без пересборки — в `docker-compose.yml`:
+```yaml
+command: ["--port","2087","--data-dir","/data","--dc6","2=НОВЫЙ_IPV6"]
+```
 
 ## Команды
 
@@ -138,70 +190,29 @@ docker compose exec relay python3 /app/relay.py --data-dir /data doctor         
 Диагностика ограничена: 500 записей в памяти, файл ≤1 МБ с ротацией.
 Ничего не растёт неограниченно.
 
-## Маскировка (nginx на 443)
+## Маскировка
 
-Мост слушает `127.0.0.1:2087`, nginx терминирует TLS и разделяет по пути:
+Релей слушает `127.0.0.1:2087` и наружу не торчит. nginx терминирует TLS на
+выделенном поддомене и проксирует всё на релей. Готовый конфиг —
+[`wsb-remote.nginx.conf`](./wsb-remote.nginx.conf).
 
-```nginx
-server {
-    listen 443 ssl;
-    http2 on;
-    server_name relay.example.com;
+Со стороны это **обычный HTTPS+WS-сервис на собственном домене**:
+- TLS 1.3 с валидным сертификатом Let's Encrypt — неотличимо от любого сайта;
+- первый кадр после `101` — авторизационный токен, как у любого защищённого
+  remote-access сервиса (ttyd, code-server, Jupyter, TURN-релеи);
+- пробинг без ключа получает `close 1008` — стандартное поведение защиты.
 
-    ssl_certificate     /etc/letsencrypt/live/relay.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
+Открытый WS-релей, который пускает всех, выглядит как open proxy и палится;
+релей с обязательным токеном выглядит как корпоративная удалёнка. Это и есть
+главная функция ключа — не только безопасность, но и правдоподобие.
 
-    # Легенда: настоящий WS-сервис (remote control / live-логи)
-    location /term {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 3600s;
-    }
-
-    # Наш канал — тот же WS, другой путь
-    location /bridge {
-        proxy_pass http://127.0.0.1:2087;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_buffering off;
-    }
-
-    location / {
-        root /var/www/relay;
-        index index.html;
-    }
-}
-```
-
-Сертификат: `certbot --nginx -d relay.example.com`.
-
-Снаружи `/term` и `/bridge` неразличимы: тот же TLS, тот же WS-апгрейд, тот же
-профиль трафика (симметричный обмен мелкими пакетами, долгие сессии). Отличить
-можно только зная ключ. Пробинг без ключа получает `close 1008` — как любой
-защищённый remote-access сервис.
+Профиль трафика (симметричный обмен мелкими пакетами, долгие сессии) совпадает
+с профилем веб-терминала/remote control, поэтому легенда поддомена как
+«удалённого управления» естественна.
 
 **Чего не делать:** голый MTProto-proxy на 443 без TLS — его DPI уже
 распознаёт. Ключ — не криптография, а маркер доступа; содержимое защищает
 MTProto end-to-end (мост видит только obfuscated2-поток).
-
-## Обновление IPv6-адресов
-
-Адреса kws получены через DoH и могут смениться:
-
-```bash
-curl -s 'https://dns.google/resolve?name=kws2.web.telegram.org&type=AAAA'
-```
-
-Обновить без пересборки — в `docker-compose.yml`:
-```yaml
-command: ["--port","2087","--data-dir","/data","--dc6","2=НОВЫЙ_IPV6"]
-```
 
 ## Безопасность
 

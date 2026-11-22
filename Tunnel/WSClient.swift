@@ -401,7 +401,7 @@ final class WSClient {
         var comps = URLComponents()
         comps.scheme = "wss"
         comps.host = host
-        comps.path = "/bridge"
+        comps.path = "/"
         guard let url = comps.url else {
             post("relay_badurl:\(host)")
             onClose()
@@ -412,9 +412,7 @@ final class WSClient {
         task = wsTask
         // Авторизационный кадр шлём сразу: URLSession буферизует его до
         // конца WS-хендшейка (101 отдаётся до проверки ключа — см. relay.py).
-        // Авторизационный кадр: JSON с токеном. Кодируем вручную — токен
-        // base64url, экранировать нечего, но соберём через JSONSerialization
-        // для надёжности (без force-unwrap).
+        // JSON собираем через JSONSerialization — без force-unwrap.
         let authData = try? JSONSerialization.data(withJSONObject: ["v": 1, "token": token])
         guard let authData, let auth = String(data: authData, encoding: .utf8) else {
             post("relayws_authenc_fail")
