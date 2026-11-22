@@ -12,7 +12,9 @@
 #   logging max-size    — docker не забьёт диск логами (ротацция 2x5 МБ).
 #   healthcheck         — doctor проверяет ключ, IPv6 до kws и DNS;
 #                         при падении контейнер перезапускается.
-#   volume ./data:/data — ключ, stats.json и diag.log переживают рестарт.
+#   volume relay-data:/data — ключ, stats.json и diag.log переживают рестарт;
+#                         именованный volume наследует владельца из образа,
+#                         поэтому non-root процесс может писать без chown.
 
 services:
   relay:
@@ -28,7 +30,12 @@ services:
     mem_reservation: 32m
     cpus: 0.5
     volumes:
-      - ./data:/data
+      # Именованный volume: Docker копирует владельца каталога из образа
+      # (relay:relay, uid 10001), поэтому запись ключа работает сразу.
+      # НЕ заменяйте на bind-mount ./data:/data: каталог на хосте создаётся
+      # от root, и процесс в контейнере (uid 10001) не сможет писать ключ.
+      # Если всё же нужен bind-mount: sudo chown -R 10001:10001 ./data
+      - relay-data:/data
     # Порт задаётся в command; по умолчанию 2087. Проверьте занятость:
     #   sudo ss -tlnp | grep 2087
     # и откройте в фаерволе:  sudo ufw allow 2087/tcp
@@ -48,3 +55,6 @@ services:
     # Останавливаем корректно: SIGTERM -> flush stats -> выход.
     stop_signal: SIGTERM
     stop_grace_period: 10s
+
+volumes:
+  relay-data:

@@ -72,11 +72,35 @@ def load_or_create_key(data_dir: str, log=print) -> tuple[AuthKey, bool]:
                 f"новый (все клиенты нужно будет перенастроить).")
         return key, False
 
-    os.makedirs(data_dir, exist_ok=True)
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(_perm_hint(data_dir, e))
     value = secrets.token_urlsafe(KEY_BYTES)
     key = AuthKey(value, time.time(), 1)
-    _write_key(path, key)
+    try:
+        _write_key(path, key)
+    except OSError as e:
+        raise RuntimeError(_perm_hint(data_dir, e))
     return key, True
+
+
+def _perm_hint(data_dir: str, e: BaseException) -> str:
+    """Понятная подсказка вместо голого PermissionError.
+
+    Частая причина: bind-mount ./data создан Docker'ом от root, а процесс
+    в контейнере работает под relay (uid 10001) и не может писать.
+    """
+    who = f"{os.getuid()}/{os.getgid()}" if hasattr(os, "getuid") else "unknown"
+    return (
+        f"не удалось записать ключ в {data_dir}: {e!r}\n"
+        f"  uid/gid процесса: {who}\n"
+        f"  Чаще всего это права на каталог. Если используется bind-mount"
+        f" (./data:/data), выполните на хосте:\n"
+        f"      sudo chown -R 10001:10001 {os.path.abspath(data_dir)}\n"
+        f"  Либо используйте именованный volume (так по умолчанию в"
+        f" docker-compose.yml) — он наследует владельца из образа."
+    )
 
 
 def rotate_key(data_dir: str, old: AuthKey | None, log=print) -> AuthKey:
