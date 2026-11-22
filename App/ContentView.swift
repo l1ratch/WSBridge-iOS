@@ -262,7 +262,7 @@ struct MenuView: View {
                     NavigationLink {
                         WorkerView(tunnel: tunnel)
                     } label: {
-                        Label("CF Worker", systemImage: "cloud")
+                        Label("Релей и воркер", systemImage: "antenna.radiowaves.left.and.right")
                     }
                     // Кнопка на всю область строки; состояние и ответ
                     // обновления — отдельными строками ПОД ней (вместо
@@ -307,20 +307,52 @@ struct MenuView: View {
     }
 }
 
-/// CF Worker: настройка собственного worker'а или реле + «DC → IP».
+/// CF Worker: настройка собственного worker'а + «DC → IP» (формат тгвспрокси).
+/// WSBridge Relay: домен + ключ авторизации (см. relay/ в репозитории).
 struct WorkerView: View {
     @ObservedObject var tunnel: TunnelManager
 
     var body: some View {
         Form {
-            Section("CF Worker или реле") {
-                TextField("worker.example.com, второй.doma.in или ip:port", text: $tunnel.workerDomain)
+            Section {
+                TextField("worker.example.com, второй.doma.in", text: $tunnel.workerDomain)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .disabled(tunnel.status == .connected)
                 Text(workerHint)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            } header: {
+                Text("CF Worker")
+            } footer: {
+                Text("Домен вашего воркера в Cloudflare. Несколько — через запятую, распределение round-robin. Пусто — kws-фронты Cloudflare.")
+            }
+            Section {
+                TextField("relay.example.com", text: $tunnel.relayHost)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                    .disabled(tunnel.status == .connected)
+                SecureField("Ключ авторизации", text: $tunnel.relayKey)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .disabled(tunnel.status == .connected)
+                Text(relayHint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if !tunnel.relayHost.isEmpty && tunnel.relayKey.isEmpty {
+                    Label("Без ключа релей не пустит", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                Link(destination: URL(string: "https://github.com/l1ratch/WSBridge-iOS/tree/main/relay")!) {
+                    Label("Готовый Docker-набор WSBridge Relay", systemImage: "shippingbox")
+                        .font(.caption)
+                }
+            } header: {
+                Text("WSBridge Relay")
+            } footer: {
+                Text("Свой сервер (Docker) с ключом подтверждения. Приоритетнее CF Worker. Ключ выдаётся один раз при первом запуске контейнера.")
             }
             Section("Датацентры Telegram (DC → IP)") {
                 TextEditor(text: $tunnel.dcMapText)
@@ -337,23 +369,29 @@ struct WorkerView: View {
                     .foregroundStyle(.tertiary)
             }
         }
-        .navigationTitle("CF Worker")
+        .navigationTitle("Релей и воркер")
         .navigationBarTitleDisplayMode(.inline)
     }
 
     private var workerHint: String {
         let wd = tunnel.workerDomain.trimmingCharacters(in: .whitespaces)
         if wd.isEmpty {
-            return "Пусто = kws-фронты Cloudflare (основной режим)."
-        }
-        if wd.contains(":") {
-            return "Прямой режим: сырой TCP на реле host:port, без CF."
+            return tunnel.relayHost.isEmpty ? "Пусто = kws-фронты Cloudflare (основной режим)."
+                                            : "Не используется: задан WSBridge Relay."
         }
         let count = wd.split(separator: ",").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
         if count > 1 {
-            return "Pipe-режим, \(count) домена: соединения распределяются round-robin. Перезапусти туннель."
+            return "Pipe-режим, \(count) домена: соединения распределяются round-robin."
         }
-        return "Pipe-режим через свой CF worker. Перезапусти туннель, чтобы применилось."
+        return "Pipe-режим через свой CF worker."
+    }
+
+    private var relayHint: String {
+        let h = tunnel.relayHost.trimmingCharacters(in: .whitespaces)
+        if h.isEmpty { return "Пусто — релей не используется." }
+        if !h.contains(".") { return "Похоже на неполный домен." }
+        if tunnel.relayKey.isEmpty { return "Введите ключ авторизации." }
+        return "Подключение: wss://\(h)/bridge с ключом."
     }
 }
 

@@ -30,6 +30,10 @@ class TunnelSession {
     /// Override «DC → IP» из настроек: канонический DC-адрес → IP, который
     /// worker'у реально диалить. Пусто = как прилетело от Telegram.
     let dcOverride: [String: String]
+    /// WSBridge Relay (см. relay/ в репо): домен + ключ авторизации.
+    /// Заданы — сессия идёт через релей, init парсится на сервере.
+    let relayHost: String?
+    let relayKey: String?
     let bridge: LWIPBridge
     let queue: DispatchQueue
     private var ws: WSClient?
@@ -52,7 +56,9 @@ class TunnelSession {
          proxyDomainMatcher: ((String) -> Bool)? = nil,
          sniProxyEndpoint: ProxyEndpoint? = nil,
          dstPort: UInt16 = 443,
-         sniProxyUnconditional: Bool = false) {
+         sniProxyUnconditional: Bool = false,
+         relayHost: String? = nil,
+         relayKey: String? = nil) {
         self.connId = connId
         self.dcIP = dcIP
         self.workerDomain = workerDomain
@@ -63,6 +69,8 @@ class TunnelSession {
         self.sniProxyEndpoint = sniProxyEndpoint
         self.dstPort = dstPort == 0 ? 443 : dstPort
         self.sniProxyUnconditional = sniProxyUnconditional
+        self.relayHost = relayHost
+        self.relayKey = relayKey
         // FakeIP-сессия уже знает домен — SNI-парсер ей не нужен.
         // Исключение: режим воркера (sniProxyUnconditional) — там SNI нужен,
         // чтобы достать имя для CONNECT.
@@ -137,6 +145,14 @@ class TunnelSession {
             sendToProxy(data)
             return
         }
+        // WSBridge Relay: домен + ключ заданы — сырой поток на релей.
+        // Релей сам парсит init (оригинальный формат tg-ws-proxy), узнаёт DC
+        // и ходит к kws по IPv6. Клиенту сплиттер не нужен: сервер режет сам.
+        if let rh = relayHost, let rk = relayKey, !rh.isEmpty, !rk.isEmpty {
+            if !wsConnected { startRelay(host: rh, key: rk) }
+            forwardToWS(data)
+            return
+        }
         // Pipe-режим: собственный CF worker пользователя. Без init-парсинга и
         // сплиттера — сырой поток в WS, worker домостит его до DC:443.
         if workerDomain != nil {
@@ -187,6 +203,19 @@ class TunnelSession {
         postEvent("ws_sent")
     }
 
+    /// WSBridge Relay (см. relay/ в репо): WSS на домен релея с ключом.
+    /// Протокол: 101 → {"v":1,"token":…} → {"ok":true} → сырой MTProto-поток
+    /// (оригинальный init парсит сервер). TLS терминирует nginx на 443.
+    private func startRelay(host: String, key: String) {
+        postEvent("relayws:conn\(connId):\(host)")
+        let ws = WSClient(tag: "c\(connId)")
+        self.ws = ws
+        ws.connectBridge(host: host, token: key,
+                         onMessage: { [weak self] data in self?.handleWSData(data) },
+                         onClose: { [weak self] in self?.handleWSClose() })
+        wsConnected = true
+    }
+
     private func startPipe() {
         guard let workerDomain else { return }
         var dst = String(format: "%d.%d.%d.%d", (dcIP >> 24) & 255, (dcIP >> 16) & 255, (dcIP >> 8) & 255, dcIP & 255)
@@ -201,13 +230,9 @@ class TunnelSession {
         self.ws = ws
         let onMsg: (Data) -> Void = { [weak self] data in self?.handleWSData(data) }
         let onCls: () -> Void = { [weak self] in self?.handleWSClose() }
-        // Поле «host:port» = прямое реле на VPS: сырой TCP, CF не участвует.
-        let rest = workerDomain.split(separator: ":", maxSplits: 1)
-        if rest.count == 2, let port = UInt16(rest[1]) {
-            ws.connectRelay(host: String(rest[0]), port: port, dst: dst, onMessage: onMsg, onClose: onCls)
-        } else {
-            ws.connectPipe(workerDomain: workerDomain, dst: dst, onMessage: onMsg, onClose: onCls)
-        }
+        // Только pipe-режим через CF worker. Legacy сырой TCP (host:port)
+        // удалён: релей теперь WSBridge Relay (WSS + ключ, см. relay/).
+        ws.connectPipe(workerDomain: workerDomain, dst: dst, onMessage: onMsg, onClose: onCls)
         wsConnected = true
     }
 

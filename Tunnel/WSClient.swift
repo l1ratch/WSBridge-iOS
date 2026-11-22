@@ -83,10 +83,6 @@ final class WSClient {
     private var initFrame: Data?
     private var firstRecv = false
     private var pingOK = false
-    private var relayConn: NWConnection?
-    private var relayReady = false
-    private var relayPending = Data()
-    private static let relaySecret = "wsb1"
     private var upPosted = false
     private static var sndErrLogged = 0
     private let tag: String
@@ -393,6 +389,59 @@ final class WSClient {
         }
     }
 
+    /// WSBridge Relay (relay/ в репо): WSS к домену релея + ключ авторизации.
+    /// Протокол: 101 → {"v":1,"token":…} (первый кадр) → {"ok":true} →
+    /// сырой MTProto-поток (оригинальный init парсит СЕРВЕР — клиенту
+    /// сплиттер не нужен). Отказ = close 1008 — как у защищённого сервиса.
+    /// Использует sharedSession (валидация сертификатов — системная);
+    /// заголовка Host-оверрайда нет: nginx терминирует TLS по SNI домена.
+    func connectBridge(host: String, token: String,
+                       onMessage: @escaping (Data) -> Void,
+                       onClose: @escaping () -> Void) {
+        var comps = URLComponents()
+        comps.scheme = "wss"
+        comps.host = host
+        comps.path = "/bridge"
+        guard let url = comps.url else {
+            post("relay_badurl:\(host)")
+            onClose()
+            return
+        }
+        post("relayws_try:\(host)")
+        let wsTask = Self.sharedSession.webSocketTask(with: URLRequest(url: url))
+        task = wsTask
+        // Авторизационный кадр шлём сразу: URLSession буферизует его до
+        // конца WS-хендшейка (101 отдаётся до проверки ключа — см. relay.py).
+        // Авторизационный кадр: JSON с токеном. Кодируем вручную — токен
+        // base64url, экранировать нечего, но соберём через JSONSerialization
+        // для надёжности (без force-unwrap).
+        let authData = try? JSONSerialization.data(withJSONObject: ["v": 1, "token": token])
+        guard let authData, let auth = String(data: authData, encoding: .utf8) else {
+            post("relayws_authenc_fail")
+            onClose()
+            return
+        }
+        wsTask.resume()
+        wsTask.send(.string(auth)) { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.post("relayws_autherr:\((error as NSError).code)")
+            } else {
+                self.post("relayws_auth_sent")
+            }
+        }
+        receiveLoop(onMessage: onMessage, onClose: onClose)
+        // Watchdog: если за 8с нет ни ответа на auth, ни данных — релей
+        // недоступен (порт закрыт / TLS не поднялся / ключ отклонён).
+        DispatchQueue.global().asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self, self.task === wsTask, !self.firstRecv else { return }
+            self.post("relayws_slow")
+            wsTask.cancel(with: .goingAway, reason: nil)
+            self.task = nil
+            onClose()
+        }
+    }
+
     /// Pipe-режим через СОБСТВЕННЫЙ CF worker пользователя: сырые байты в обе
     /// стороны, worker сам открывает TCP к dst:443 (DC). Ни гейтвея, ни сплиттера:
     /// init уходит частью потока, границы WS-фреймов не важны.
@@ -465,14 +514,6 @@ final class WSClient {
     // ponytail: send сразу после resume() — URLSession сам буферизует до конца
     // handshake. Guard на connected был багом: init дропался, гейтвей молчал.
     func send(_ data: Data) {
-        if let rc = relayConn {
-            if relayReady {
-                rc.send(content: data, completion: .contentProcessed { _ in })
-            } else {
-                relayPending.append(data)
-            }
-            return
-        }
         task?.send(.data(data)) { error in
             if let error {
                 NSLog("[WSBridge] WS send error: \(error.localizedDescription)")
@@ -491,84 +532,8 @@ final class WSClient {
     func close() {
         connected = false
         closedFlag.set()
-        if let rc = relayConn {
-            relayConn = nil
-            rc.cancel()
-            return
-        }
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
-    }
-
-    /// Прямой режим: сырой TCP на своё реле (VPS) — без CF, без WS, без TLS
-    /// (ATS не действует на NWConnection, сертификат не нужен). Протокол тот
-    /// же, что у воркера: строка «секрет dst\n», дальше сырой поток в обе стороны.
-    func connectRelay(host: String, port: UInt16, dst: String, onMessage: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
-        post("relay_try:\(host):\(port)")
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
-            post("relay_badport:\(port)")
-            onClose()
-            return
-        }
-        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
-        relayConn = conn
-        var finished = false
-        let finishOnce = {
-            guard !finished else { return }
-            finished = true
-            self.relayConn = nil
-            onClose()
-        }
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .ready:
-                self.relayReady = true
-                self.post("relay_up")
-                var head = Data("\(Self.relaySecret) \(dst)\n".utf8)
-                head.append(self.relayPending)
-                self.relayPending = Data()
-                conn.send(content: head, completion: .contentProcessed { _ in })
-                self.relayReceive(onMessage: onMessage, finish: finishOnce)
-            case .failed(let error):
-                self.post("relay_closed:\(error.localizedDescription)")
-                finishOnce()
-            case .cancelled:
-                finishOnce()
-            default:
-                break
-            }
-        }
-        conn.start(queue: .global(qos: .userInitiated))
-        // Реле принимает мгновенно; нет .ready за 5с — адрес недоступен.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
-            guard let self, self.relayConn === conn, !self.relayReady else { return }
-            self.post("relay_slow")
-            conn.cancel()
-            finishOnce()
-        }
-    }
-
-    private func relayReceive(onMessage: @escaping (Data) -> Void, finish: @escaping () -> Void) {
-        relayConn?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let data, !data.isEmpty {
-                if !self.firstRecv {
-                    self.firstRecv = true
-                    if !self.upPosted {
-                        self.upPosted = true
-                        self.post("ws_up") // единая стадия для статистики приложения
-                    }
-                }
-                onMessage(data)
-                self.relayReceive(onMessage: onMessage, finish: finish)
-                return
-            }
-            if isComplete || error != nil {
-                self.post("relay_closed:end")
-                finish()
-            }
-        }
     }
 
     private static func postEvent(_ name: String) {

@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import NetworkExtension
+import Security
 import UserNotifications
 import ActivityKit
 import UIKit
@@ -269,6 +270,49 @@ final class TunnelManager: ObservableObject {
     /// по одной на строку. Пусто = как прилетело от Telegram.
     @Published var dcMapText: String = UserDefaults.standard.string(forKey: "dcMap") ?? "" {
         didSet { UserDefaults.standard.set(dcMapText, forKey: "dcMap") }
+    }
+
+    /// WSBridge Relay: домен своего сервера (Docker, см. relay/ в репо).
+    /// Приоритетнее CF Worker: если задан — Telegram-сессии идут через релей.
+    @Published var relayHost: String = UserDefaults.standard.string(forKey: "relayHost") ?? "" {
+        didSet { UserDefaults.standard.set(relayHost, forKey: "relayHost") }
+    }
+
+    /// Ключ авторизации релея. Хранится в Keychain (не в UserDefaults —
+    /// это секрет, а не настройка): бэкапы UserDefaults его не унесут.
+    @Published var relayKey: String = Self.keychainGet() {
+        didSet { Self.keychainSet(relayKey) }
+    }
+
+    /// Keychain: сервис WSBridge, аккаунт relayKey. Класс kSecClassGenericPassword.
+    private static func keychainGet() -> String {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "WSBridge",
+            kSecAttrAccount as String: "relayKey",
+            kSecReturnData as String: true,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else { return "" }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private static func keychainSet(_ value: String) {
+        let data = Data(value.utf8)
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "WSBridge",
+            kSecAttrAccount as String: "relayKey",
+        ]
+        let attrs: [String: Any] = [kSecValueData as String: data]
+        let status = SecItemUpdate(base as CFDictionary, attrs as CFDictionary)
+        if status == errSecItemNotFound {
+            var add = base
+            add[kSecValueData as String] = data
+            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            SecItemAdd(add as CFDictionary, nil)
+        }
     }
 
     /// Live Activity (Dynamic Island / локскрин): молния + таймер аптайма.
@@ -1468,6 +1512,16 @@ final class TunnelManager: ObservableObject {
         let wd = workerDomain.trimmingCharacters(in: .whitespacesAndNewlines)
         var config: [String: NSObject] = [:]
         if !wd.isEmpty { config["worker"] = wd as NSString }
+        // WSBridge Relay: домен + ключ. Приоритетнее worker: расширение
+        // при заданном relayHost шлёт Telegram-сессии через релей.
+        // Ключ передаётся в providerConfiguration (доступен расширению),
+        // но хранится в Keychain приложения, не в UserDefaults.
+        let rh = relayHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rk = relayKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !rh.isEmpty && !rk.isEmpty {
+            config["relayHost"] = rh as NSString
+            config["relayKey"] = rk as NSString
+        }
         // «DC → IP»: по строке «номер:IP», невалидные расширение отбросит.
         let dcLines = dcMapText
             .split(separator: "\n")

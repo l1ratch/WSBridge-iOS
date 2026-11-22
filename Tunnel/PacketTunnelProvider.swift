@@ -29,6 +29,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Работники из «домены через запятую» + счётчик round-robin.
     private var workerDomains: [String] = []
     private var workerRRIndex = 0
+    /// WSBridge Relay (см. relay/ в репо): домен + ключ авторизации.
+    /// Заданы оба — Telegram-сессии идут через релей, минуя worker/фронты.
+    var relayHost: String?
+    var relayKey: String?
     /// «DC → IP» маппинг из настроек.
     private var dcOverride: [String: String] = [:]
     /// Уникальные dst IP в packetFlow (диагностика маршрутизации B).
@@ -135,6 +139,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self?.workerDomains = domains
             self?.workerDomain = domains.first
             EventLog.append("cfg:worker=\(self?.workerDomain ?? "-")(x\(domains.count))")
+            // WSBridge Relay: домен + ключ (приоритетнее worker).
+            let rh = (proto?.providerConfiguration?["relayHost"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let rk = (proto?.providerConfiguration?["relayKey"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !rh.isEmpty && !rk.isEmpty {
+                self?.relayHost = rh
+                self?.relayKey = rk
+                EventLog.append("cfg:relay=\(rh)")
+            } else {
+                EventLog.append("cfg:relay=-")
+            }
             // «DC → IP» маппинг: строки «номер:IP».
             self?.dcOverride = TunnelSession.parseDCOverride(
                 proto?.providerConfiguration?["dcMap"] as? [String])
@@ -319,6 +335,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 proxyDomainMatcher: matcher,
                 sniProxyEndpoint: proxy,
                 dstPort: dstPort)
+            sessions[connId] = session
+            return
+        }
+        // WSBridge Relay приоритетнее worker: сессии идут через релей.
+        // init парсится на релее — клиенту достаточно сырого потока.
+        if let rh = relayHost, let rk = relayKey, !rh.isEmpty, !rk.isEmpty {
+            let session = TunnelSession(
+                connId: connId, dcIP: dcIP, workerDomain: nil,
+                dcOverride: [:], bridge: lwip, queue: lwipQueue,
+                relayHost: rh, relayKey: rk)
             sessions[connId] = session
             return
         }
