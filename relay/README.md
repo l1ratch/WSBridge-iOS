@@ -112,27 +112,44 @@ volume из compose по умолчанию — он наследует влад
 а `URLSessionWebSocketTask` умеет WS только по HTTP/1.1 `Upgrade`
 (h2 требует extended CONNECT из RFC 8441, который iOS не использует).
 
-Лечение: в server-блоке поддомена должен быть `http2 off;` (в нашем конфиге
-уже есть). Проверить и перезапустить:
+Лечение — **два** места, и это важнее, чем выглядит. Проверено на реальном
+сервере (nginx 1.31.9): `http2 off;` в server-блоке поддомена **не помогает**,
+если где-то ещё остался устаревший параметр `http2` в `listen`, потому что он
+включает HTTP/2 на весь слушающий сокет `0.0.0.0:443` — сразу для всех
+виртуальных хостов порта, независимо от их собственных `http2 off`.
 
 ```bash
-sudo nginx -T | grep -n 'http2\|wsb-remote'   # найти свой блок
-# убедиться, что в нём есть строка:  http2 off;
+# 1. Найти ВСЕ включения http2 — и директиву, и устаревший параметр listen
+sudo nginx -T | grep -n 'http2\|listen.*443'
+
+# 2. Типичный виновник — default/blackhole-блок:
+#      listen 443 ssl http2 default_server;        <- устаревший синтаксис
+#      listen [::]:443 ssl http2 default_server;
+#    Убрать параметр http2 (оставить просто ssl):
+#      listen 443 ssl default_server;
+#      listen [::]:443 ssl default_server;
+#    nginx сам подскажет: [warn] the "listen ... http2" directive is deprecated
+
+# 3. В server-блоке поддомена оставить современный синтаксис:
+#      http2 off;
+
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Проверка снаружи (должно быть `http/1.1`, а не `h2`):
-```bash
-curl -sI --http1.1 https://ВАШ_ПОДДОМЕН/ -o /dev/null -w 'alpn=%{http_version}\n'
-```
-Или на любом хосте с Python:
+Проверка снаружи — должно быть `http/1.1` (а не `h2`) именно на поддомене
+релея; основной сайт может остаться на h2, это нормально:
 ```bash
 python3 -c "import socket,ssl;c=ssl.create_default_context();c.set_alpn_protocols(['h2','http/1.1']);s=c.wrap_socket(socket.create_connection(('ВАШ_ПОДДОМЕН',443),timeout=10),server_hostname='ВАШ_ПОДДОМЕН');print(s.selected_alpn_protocol())"
 ```
-Должно напечатать `http/1.1`. Если `h2` — строка `http2 off;` не применилась
-(например, её перекрыл другой server-блок или `listen 443 ssl http2;`).
 
-Диагностический A/B, который это доказал (тот же хост, тот же путь):
+Реальный замер до/после правки (один сервер, два хоста):
+```
+до:    <поддомен релея>  ALPN=h2         <основной домен>  ALPN=h2
+после: <поддомен релея>  ALPN=http/1.1   <основной домен>  ALPN=h2  (сайт цел)
+       WS upgrade на поддомене          -> HTTP/1.1 101 Switching Protocols
+```
+
+Диагностический A/B, который изначально это доказал (тот же хост, тот же путь):
 ```
 curl --http1.1 + Upgrade: websocket  ->  HTTP/1.1 101 Switching Protocols
 ручной HTTP/2 extended CONNECT       ->  :status 200 (nginx умеет, iOS нет)
