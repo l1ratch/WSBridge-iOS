@@ -280,8 +280,8 @@ final class TunnelManager: ObservableObject {
 
     /// Ключ авторизации релея. Хранится в Keychain (не в UserDefaults —
     /// это секрет, а не настройка): бэкапы UserDefaults его не унесут.
-    @Published var relayKey: String = Self.keychainGet() {
-        didSet { Self.keychainSet(relayKey) }
+    @Published var relayKey: String = TunnelManager.keychainGet() {
+        didSet { TunnelManager.keychainSet(relayKey) }
     }
 
     /// Keychain: сервис WSBridge, аккаунт relayKey. Класс kSecClassGenericPassword.
