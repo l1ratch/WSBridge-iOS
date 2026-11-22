@@ -30,3 +30,5 @@ __pycache__/
 tools/
 worker-pipe*.js
 icon/
+# relay runtime data (keys, stats, diag) - never commit
+relay/data/

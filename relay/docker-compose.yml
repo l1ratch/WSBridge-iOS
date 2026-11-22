@@ -1,0 +1,50 @@
+# WSBridge Relay — docker compose.
+#
+# Требования владельца: стабильность, самоподъём, минимум ресурсов
+# (2-5 активных клиентов), максимум деталей при ошибках.
+#
+# Что здесь важно:
+#   network_mode: host  — контейнеру нужен ИСХОДЯЩИЙ IPv6 хоста
+#                         (к Telegram ведёт только IPv6); мост слушает
+#                         0.0.0.0:2087 по IPv4, телефону IPv6 не нужен.
+#   mem_limit/cpus      — жёсткий потолок: сервер не «съест» ресурсы VDS.
+#   restart: unless-stopped — самоподъём после краша/ребута хоста.
+#   logging max-size    — docker не забьёт диск логами (ротацция 2x5 МБ).
+#   healthcheck         — doctor проверяет ключ, IPv6 до kws и DNS;
+#                         при падении контейнер перезапускается.
+#   volume ./data:/data — ключ, stats.json и diag.log переживают рестарт.
+
+services:
+  relay:
+    build: .
+    image: wsb-relay:latest
+    container_name: wsb-relay
+    restart: unless-stopped
+    network_mode: host
+    # Потолок ресурсов: реально мост держит 2-5 клиентов в ~40-60 МБ.
+    # 96 МБ — с запасом на пики; cpus 0.5 — AES-CTR расшифровывает только
+    # префиксы длин, так что CPU не нагружается.
+    mem_limit: 96m
+    mem_reservation: 32m
+    cpus: 0.5
+    volumes:
+      - ./data:/data
+    # Порт задаётся в command; по умолчанию 2087. Проверьте занятость:
+    #   sudo ss -tlnp | grep 2087
+    # и откройте в фаерволе:  sudo ufw allow 2087/tcp
+    command: ["--port", "2087", "--data-dir", "/data"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    healthcheck:
+      # doctor: ключ читается + IPv6 до kws2 + DNS. Не поднимает соединений.
+      test: ["CMD", "python3", "/app/relay.py", "--data-dir", "/data", "doctor"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 20s
+    # Останавливаем корректно: SIGTERM -> flush stats -> выход.
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
