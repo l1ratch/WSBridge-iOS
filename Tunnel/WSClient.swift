@@ -231,7 +231,9 @@ final class WSClient {
         }
     }
 
-    func connect(dc: Int, isMedia: Bool, isTestDC: Bool, initFrame: Data, onMessage: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+    func connect(dc: Int, isMedia: Bool, isTestDC: Bool, initFrame: Data,
+                 tlsFirst: Bool = false, frontsDisabled: Bool = false,
+                 onMessage: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
         let path = isTestDC ? "/apiws_test" : "/apiws"
         self.initFrame = initFrame
 
@@ -243,17 +245,19 @@ final class WSClient {
         // Персистентный реестр здоровья (Android-порт): переупорядочиваем
         // фронтами по lastSuccess (свежие успехи первыми), известные мёртвые
         // (<3 фейлов подряд, без успеха 24ч) отбрасываем.
-        let fronts = CFDomains.domains(dc: dc)
+        let fronts = frontsDisabled ? [] : CFDomains.domains(dc: dc)
         Self.rrStart = (Self.rrStart + 1) % max(fronts.count, 1)
         let start = Self.rrStart
-        var rotated = Array(fronts[start...] + fronts[..<start])
-        let (ordered, excluded) = FrontHealthRegistry.orderAndFilter(rotated)
-        if excluded > 0 {
-            post("health_excl:\(excluded)")
-            NSLog("[WSBridge] health registry: excluded \(excluded) endpoints")
-            rotated = ordered.isEmpty ? rotated : ordered
-        } else {
-            rotated = ordered
+        var rotated = fronts.isEmpty ? [] : Array(fronts[start...] + fronts[..<start])
+        if !rotated.isEmpty {
+            let (ordered, excluded) = FrontHealthRegistry.orderAndFilter(rotated)
+            if excluded > 0 {
+                post("health_excl:\(excluded)")
+                NSLog("[WSBridge] health registry: excluded \(excluded) endpoints")
+                rotated = ordered.isEmpty ? rotated : ordered
+            } else {
+                rotated = ordered
+            }
         }
 
         // WS/80 БЕЗ TLS для CF-фронтов — обход, который 19.11.2026 массово
@@ -261,17 +265,28 @@ final class WSClient {
         // Flowseal #1652) и включён по умолчанию в Android-форке v1.11.10
         // (Regstar2 PR #169, ws://…:80/apiws). Участок до CF не шифруется,
         // но MTProto-payload остаётся под собственным obfuscated2.
-        // Порядок: сначала 80 у тех же 6 фронтов, затем ПРЕЖНИЙ каскад
-        // (443-фронты → gatewayIP → gwHost) целиком, как fallback.
+        //
+        // Тумблеры (аналоги no_secure/cfproxy апстрима):
+        //  frontsDisabled — CF-фронты исключены целиком, каскад сразу
+        //    gatewayIP → kws{dc}: для сетей, где фронты заблокированы волной.
+        //  tlsFirst — только wss://…:443, без ws://…:80: для сетей, где
+        //    фильтруется 80. Адаптивный порядок ниже это тоже учит, но
+        //    явный запрет надёжнее и не тратит попытку.
         let top = rotated.prefix(6)
-        var endpoints: [Endpoint] = top.map { ($0, nil as String?, true) }
+        var endpoints: [Endpoint] = []
+        if !tlsFirst {
+            endpoints += top.map { ($0, nil as String?, true) }
+        }
         endpoints += top.map { ($0, nil as String?, false) }
         endpoints += Self.gatewayIPs.map { ($0, gwHost as String?, false) }
         endpoints.append((gwHost, nil, false))
+        if frontsDisabled { post("cascade:fronts_off") }
+        if tlsFirst { post("cascade:tls_first") }
 
         // Адаптивный порядок транспортов (порт cf_websocket.py 1.12.0):
         // какой транспорт чаще соединялся — тот первым; остывшие после
-        // таймаутов — в конец, но не выбрасываются.
+        // таймаутов — в конец, но не выбрасываются. При tlsFirst в списке
+        // нет plain-эндпоинтов, так что перестановка ничего не меняет.
         endpoints = Self.orderTransports(endpoints)
 
         let healthy = Self.aliveOnly(endpoints)

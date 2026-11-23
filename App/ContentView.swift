@@ -368,6 +368,16 @@ struct WorkerView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
+            Section {
+                Toggle("Сначала TLS (без ws://…:80)", isOn: $tunnel.tlsFirst)
+                    .disabled(tunnel.status == .connected)
+                Toggle("Отключить CF-фронты", isOn: $tunnel.frontsDisabled)
+                    .disabled(tunnel.status == .connected)
+            } header: {
+                Text("Каскад kws (фронты)")
+            } footer: {
+                Text("Действуют в режиме kws-каскада (когда релей и воркер не заданы). TLS: если порт 80 фильтруется — не тратить попытки на ws://…:80. Отключение фронтов: сразу прямые IP гейтвеев — когда фронты заблокированы волной. По умолчанию оба выключены: порядок транспортов подстраивается сам по успехам.")
+            }
         }
         .navigationTitle("Релей и воркер")
         .navigationBarTitleDisplayMode(.inline)

@@ -278,6 +278,21 @@ final class TunnelManager: ObservableObject {
         didSet { UserDefaults.standard.set(relayHost, forKey: "relayHost") }
     }
 
+    /// Тумблеры каскада kws (аналоги no_secure/cfproxy из tg-ws-proxy).
+    /// TLS-first: если 80 фильтруется — не жечь таймауты на ws://…:80,
+    /// идти сразу на wss://…:443. По умолчанию выключен (адаптивный
+    /// порядок сам учится по успехам — см. WSClient.orderTransports).
+    @Published var tlsFirst: Bool = UserDefaults.standard.bool(forKey: "tlsFirst") {
+        didSet { UserDefaults.standard.set(tlsFirst, forKey: "tlsFirst") }
+    }
+
+    /// Отключить CF-фронты: каскад пойдёт сразу gateway IP → kws{dc}.
+    /// Для сетей, где фронты заблокированы волной и каждый старт жжёт
+    /// 12 таймаутов на мёртвых доменах.
+    @Published var frontsDisabled: Bool = UserDefaults.standard.bool(forKey: "frontsDisabled") {
+        didSet { UserDefaults.standard.set(frontsDisabled, forKey: "frontsDisabled") }
+    }
+
     /// Ключ авторизации релея. Хранится в Keychain (не в UserDefaults —
     /// это секрет, а не настройка): бэкапы UserDefaults его не унесут.
     @Published var relayKey: String = TunnelManager.keychainGet() {
@@ -1529,6 +1544,9 @@ final class TunnelManager: ObservableObject {
             .filter { !$0.isEmpty }
         if !dcLines.isEmpty { config["dcMap"] = dcLines as NSArray }
         if !frontBases.isEmpty { config["fronts"] = frontBases as NSArray }
+        // Тумблеры каскада: TLS-first и отключение CF-фронтов.
+        if tlsFirst { config["tlsFirst"] = true as NSNumber }
+        if frontsDisabled { config["frontsDisabled"] = true as NSNumber }
         // ── Вариант B: прокси по доменам через реальные IP + SNI ──────
         // DNS системы НЕ трогаем: сайты и Telegram резолвятся как обычно.
         // Домены включённых списков резолвим здесь, в Main App, и кладём

@@ -34,6 +34,9 @@ class TunnelSession {
     /// Заданы — сессия идёт через релей, init парсится на сервере.
     let relayHost: String?
     let relayKey: String?
+    /// Тумблеры каскада kws: TLS-first и отключение CF-фронтов.
+    let tlsFirst: Bool
+    let frontsDisabled: Bool
     let bridge: LWIPBridge
     let queue: DispatchQueue
     private var ws: WSClient?
@@ -58,7 +61,9 @@ class TunnelSession {
          dstPort: UInt16 = 443,
          sniProxyUnconditional: Bool = false,
          relayHost: String? = nil,
-         relayKey: String? = nil) {
+         relayKey: String? = nil,
+         tlsFirst: Bool = false,
+         frontsDisabled: Bool = false) {
         self.connId = connId
         self.dcIP = dcIP
         self.workerDomain = workerDomain
@@ -71,6 +76,8 @@ class TunnelSession {
         self.sniProxyUnconditional = sniProxyUnconditional
         self.relayHost = relayHost
         self.relayKey = relayKey
+        self.tlsFirst = tlsFirst
+        self.frontsDisabled = frontsDisabled
         // FakeIP-сессия уже знает домен — SNI-парсер ей не нужен.
         // Исключение: режим воркера (sniProxyUnconditional) — там SNI нужен,
         // чтобы достать имя для CONNECT.
@@ -193,7 +200,7 @@ class TunnelSession {
 
         let ws = WSClient(tag: "c\(connId)")
         self.ws = ws
-        ws.connect(dc: parsed.dcId, isMedia: parsed.isMedia, isTestDC: parsed.isTestDC, initFrame: initData, onMessage: { [weak self] data in
+        ws.connect(dc: parsed.dcId, isMedia: parsed.isMedia, isTestDC: parsed.isTestDC, initFrame: initData, tlsFirst: tlsFirst, frontsDisabled: frontsDisabled, onMessage: { [weak self] data in
             self?.handleWSData(data)
         }, onClose: { [weak self] in
             self?.handleWSClose()

@@ -35,6 +35,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     var relayKey: String?
     /// «DC → IP» маппинг из настроек.
     private var dcOverride: [String: String] = [:]
+    /// Тумблеры каскада kws: TLS-first (не жечь 80) и отключение CF-фронтов.
+    private var tlsFirst = false
+    private var frontsDisabled = false
     /// Уникальные dst IP в packetFlow (диагностика маршрутизации B).
     private var dstSeen: Set<String> = []
     /// ID нуджа «долго включен». Владелец — расширение (см. scheduleLongSessionNudge).
@@ -161,6 +164,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let fronts = proto?.providerConfiguration?["fronts"] as? [String]
             CFDomains.update(fronts ?? [])
             EventLog.append("cfg:fronts=\(CFDomains.bases.count)")
+            // Тумблеры каскада (аналоги no_secure/cfproxy апстрима).
+            self?.tlsFirst = (proto?.providerConfiguration?["tlsFirst"] as? NSNumber)?.boolValue ?? false
+            self?.frontsDisabled = (proto?.providerConfiguration?["frontsDisabled"] as? NSNumber)?.boolValue ?? false
+            EventLog.append("cfg:cascade=tlsFirst=\(self?.tlsFirst == true ? 1 : 0) fronts=\(self?.frontsDisabled == true ? "off" : "on")")
             // Android-порт: эвикция протухших из реестра (мёртвые >7 дней,
             // пропавшие из апстрима) + запись состояния реестра в журнал.
             FrontHealthRegistry.evict(absentFrom: Set(CFDomains.bases))
@@ -359,7 +366,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let session = TunnelSession(
             connId: connId, dcIP: dcIP, workerDomain: domain,
-            dcOverride: dcOverride, bridge: lwip, queue: lwipQueue)
+            dcOverride: dcOverride, bridge: lwip, queue: lwipQueue,
+            tlsFirst: tlsFirst, frontsDisabled: frontsDisabled)
         sessions[connId] = session
     }
 
