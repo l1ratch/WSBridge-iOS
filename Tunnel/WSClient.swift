@@ -121,6 +121,95 @@ final class WSClient {
         FrontHealthRegistry.recordSuccess(host)
     }
 
+    // MARK: - Адаптивный выбор транспорта (порт cf_websocket.py, tg-ws-proxy 1.12.0)
+    //
+    // Апстрим добавил авто-fallback TLS↔plain по таймауту. У нас каскад уже
+    // содержит оба транспорта, но порядок был статическим: всегда сначала
+    // шесть ws://…:80, потом шесть wss://…:443. Если 80 в этой сети фильтруется,
+    // каждая сессия платила шесть таймаутов прежде чем дойти до рабочего 443.
+    //
+    // Порт их механики:
+    //   CF_TIMEOUT_COOLDOWN = 30.0        → transportCooldown
+    //   CF_CONNECT_TIMEOUTS = (3,3,5,5,10) → connectTimeouts
+    //   cf_prefers_tls(): tls >= no_tls   → transportPrefersTLS()
+    //
+    // Отличие: у них чередование транспорта по чётности таймаутов внутри
+    // одного списка доменов; у нас список эндпоинтов уже несёт флаг plain,
+    // поэтому эквивалент — переставить группы и дать остывшему транспорту
+    // второй шанс в конце списка.
+
+    /// Кулдаун транспорта после таймаута: (host, plain) → момент, когда пробовать снова.
+    private static var transportCooldown: [String: Date] = [:]
+    /// Счётчики успехов по транспорту — определяют, какой ставить первым.
+    private static var tlsWins = 0
+    private static var plainWins = 0
+    /// Прогрессия таймаутов по числу таймаутов в текущем каскаде.
+    private static let connectTimeouts: [Double] = [3, 3, 5, 5, 10]
+    private static let transportCooldownSec: TimeInterval = 30
+
+    private static func transportPrefersTLS() -> Bool {
+        healthLock.lock(); defer { healthLock.unlock() }
+        return tlsWins >= plainWins
+    }
+
+    /// Таймаут текущей попытки: остывший транспорт пробуется коротко (3с),
+    /// полный 10с остаётся последнему шансу. index — позиция в итоговом списке.
+    private static func attemptTimeout(index: Int, cooled: Bool) -> Double {
+        let base = connectTimeouts[min(index, connectTimeouts.count - 1)]
+        return cooled ? min(base, 3) : base
+    }
+
+    static func markTransportTimeout(_ key: String) {
+        healthLock.lock(); defer { healthLock.unlock() }
+        transportCooldown[key] = Date().addingTimeInterval(transportCooldownSec)
+    }
+
+    static func markTransportAlive(_ key: String, plain: Bool) {
+        healthLock.lock(); defer { healthLock.unlock() }
+        transportCooldown.removeValue(forKey: key)
+        if plain { plainWins += 1 } else { tlsWins += 1 }
+    }
+
+    /// Идёт ли транспорт в кулдауне — нужно вызывающему, чтобы дать попытке
+    /// короткий таймаут вместо полного (экономия батареи на мёртвом пути).
+    private static func isTransportCooled(_ key: String) -> Bool {
+        healthLock.lock(); defer { healthLock.unlock() }
+        guard let until = transportCooldown[key] else { return false }
+        return until > Date()
+    }
+
+    /// Переставляет группы транспортов: успешный чаще — первым;
+    /// остывшие после таймаута — в конец (не выбрасываются: могут ожить).
+    /// Сортировка устойчивая (по исходному индексу), чтобы round-robin
+    /// порядок фронтов внутри группы не перетасовывался произвольно.
+    private static func orderTransports(_ eps: [Endpoint]) -> [Endpoint] {
+        let preferTLS = transportPrefersTLS()
+        healthLock.lock()
+        let now = Date()
+        // Побочно вычищаем протухшие кулдауны: словарь не растёт (их код
+        // делает то же в connect_cf_domains перед записью нового).
+        transportCooldown = transportCooldown.filter { $0.value > now }
+        var cooledKeys: Set<String> = []
+        for ep in eps {
+            let k = healthKey(ep.host, plain: ep.plain)
+            if transportCooldown[k] != nil { cooledKeys.insert(k) }
+        }
+        healthLock.unlock()
+        // group: 0 = предпочтительный транспорт, 1 = второй
+        func group(_ ep: Endpoint) -> Int {
+            (ep.plain == !preferTLS) ? 0 : 1
+        }
+        let fresh = eps.enumerated().filter { !cooledKeys.contains(Self.healthKey($0.element.host, plain: $0.element.plain)) }
+        let cooled = eps.enumerated().filter { cooledKeys.contains(Self.healthKey($0.element.host, plain: $0.element.plain)) }
+        func byGroup(_ a: (offset: Int, element: Endpoint), _ b: (offset: Int, element: Endpoint)) -> Bool {
+            let ga = group(a.element), gb = group(b.element)
+            if ga != gb { return ga < gb }
+            return a.offset < b.offset   // устойчиво: исходный порядок
+        }
+        return fresh.sorted(by: byGroup).map(\.element)
+            + cooled.sorted(by: byGroup).map(\.element)
+    }
+
     /// Эндпоинт каскада. `plain` = WS без TLS на порт 80 (см. connect()).
     /// Здоровье считается ПО КЛЮЧУ host+plain: мёртвый 443 не должен
     /// прятать живой 80 того же фронта, и наоборот.
@@ -180,6 +269,11 @@ final class WSClient {
         endpoints += Self.gatewayIPs.map { ($0, gwHost as String?, false) }
         endpoints.append((gwHost, nil, false))
 
+        // Адаптивный порядок транспортов (порт cf_websocket.py 1.12.0):
+        // какой транспорт чаще соединялся — тот первым; остывшие после
+        // таймаутов — в конец, но не выбрасываются.
+        endpoints = Self.orderTransports(endpoints)
+
         let healthy = Self.aliveOnly(endpoints)
         tryConnect(endpoints: healthy.isEmpty ? endpoints : healthy, path: path, index: 0, onMessage: onMessage, onClose: onClose)
     }
@@ -194,6 +288,7 @@ final class WSClient {
         }
         let ep = endpoints[index]
         let key = Self.healthKey(ep.host, plain: ep.plain)
+        let epCooled = Self.isTransportCooled(key)
         let scheme = ep.plain ? "ws" : "wss"
         let port = ep.plain ? ":80" : ""
         guard let url = URL(string: "\(scheme)://\(ep.host)\(port)\(path)") else {
@@ -303,6 +398,7 @@ final class WSClient {
                 if case .data(let data) = message {
                     self.firstRecv = true
                     Self.markAlive(key)
+                    Self.markTransportAlive(key, plain: ep.plain)
                     onMessage(data)
                 }
                 self.receiveLoop(onMessage: onMessage, onClose: onClose)
@@ -323,8 +419,9 @@ final class WSClient {
             }
         }
 
-        // Таймаут 10с, КАК В ОФФ tg-ws-proxy (raw_websocket.py connect
-        // timeout=10, pool.py 7-8с).
+        // Таймаут попытки: прогрессия 3/3/5/5/10с по позиции в каскаде
+        // (порт CF_CONNECT_TIMEOUTS из cf_websocket.py 1.12.0). Остывший
+        // после таймаута транспорт пробуется коротко — 3с, не 10.
         // Гасится ТОЛЬКО полученным кадром данных этого эндпоинта.
         // НЕ countOfBytesReceived: журнал 0.3.33 показал, что у
         // URLSessionWebSocketTask эти счётчики остаются 0 даже ПОСЛЕ
@@ -332,7 +429,8 @@ final class WSClient {
         // про HTTP-тело, не про WS-фреймы. Из-за этого таймер убивал
         // живые сессии через 10с: ws_up → data:345B → ws_timeout.
         let started = Date()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
+        let attemptSec = Self.attemptTimeout(index: index, cooled: epCooled)
+        DispatchQueue.global().asyncAfter(deadline: .now() + attemptSec) {
             guard !self.closedFlag.value, !gotData.value, state.claim() else { return }
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             NSLog("[WSBridge] WS: \(key) connect timed out, trying next")
@@ -340,6 +438,7 @@ final class WSClient {
             self.post("ws_timeout:detail:no_data:\(ms)ms")
             self.post("ws_closeinfo:\(key):code=\(wsTask.closeCode.rawValue):reason=\((wsTask.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(64))")
             Self.markDead(key)
+            Self.markTransportTimeout(key)
             wsTask.cancel(with: .goingAway, reason: nil)
             self.task = nil
             self.tryConnect(endpoints: endpoints, path: path, index: index + 1, onMessage: onMessage, onClose: onClose)
