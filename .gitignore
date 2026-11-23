@@ -32,3 +32,6 @@ worker-pipe*.js
 icon/
 # relay runtime data (keys, stats, diag) - never commit
 relay/data/
+# но диагностические скрипты самого релея - часть поставки
+!relay/tools/
+!relay/tools/**

@@ -14,6 +14,9 @@ RUN adduser -D -H -u 10001 relay
 
 WORKDIR /app
 COPY mtproto.py state.py relay.py /app/
+# Диагностические скрипты (kws-frame-test.py и др.) — часть поставки,
+# запускаются внутри контейнера: docker compose exec relay python3 /app/tools/...
+COPY tools/ /app/tools/
 
 # /data — volume для ключа, статистики и diag.log
 RUN mkdir -p /data && chown relay:relay /data

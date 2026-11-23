@@ -117,11 +117,14 @@ class WSConn:
     """
 
     def __init__(self, reader: asyncio.StreamReader,
-                 writer: asyncio.StreamWriter):
+                 writer: asyncio.StreamWriter, peer: str = "?"):
         self.r = reader
         self.w = writer
         self._frag = bytearray()
         self.closed = False
+        # Реальный IP клиента за nginx (X-Real-IP / X-Forwarded-For),
+        # иначе в логах был бы только 127.0.0.1 прокси.
+        self.peer = peer
 
     async def send(self, payload: bytes, opcode: int = 0x2) -> None:
         self.w.write(mtproto.ws_frame(payload, opcode))
@@ -225,7 +228,16 @@ async def accept_ws(reader: asyncio.StreamReader,
         )
         writer.write(resp.encode())
         await writer.drain()
-        return WSConn(reader, writer)
+        # Реальный IP: nginx проксирует, getpeername() дал бы 127.0.0.1.
+        # Берём X-Real-IP, затем первый адрес X-Forwarded-For, иначе peer сокета.
+        raw_peer = writer.get_extra_info("peername")
+        sock_ip = raw_peer[0] if raw_peer else "?"
+        real = headers.get(b"x-real-ip", b"").decode("latin1").strip()
+        if not real:
+            xff = headers.get(b"x-forwarded-for", b"").decode("latin1")
+            real = xff.split(",")[0].strip() if xff else ""
+        peer_label = f"{real or sock_ip}:{raw_peer[1] if raw_peer else 0}"
+        return WSConn(reader, writer, peer_label)
     except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
         return None
 
@@ -263,7 +275,7 @@ async def upstream_connect(dc6: str, sni: str, path: str, insecure: bool):
     if not lines or "101" not in lines[0]:
         writer.close()
         raise ConnectionError(f"upstream upgrade: {lines[0] if lines else 'empty'}")
-    return WSConn(reader, writer)
+    return WSConn(reader, writer, f"{sni}")
 
 
 # ---------------------------------------------------------------- сессия
@@ -293,6 +305,8 @@ async def handle_client(reader: asyncio.StreamReader,
             ws = await accept_ws(reader, writer)
             if ws is None:
                 return
+            # accept_ws уже вытащил реальный IP из X-Real-IP.
+            label = ws.peer
 
             # --- авторизация: первый кадр {"v":1,"token":...}
             try:
