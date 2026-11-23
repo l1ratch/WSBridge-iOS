@@ -321,16 +321,35 @@ async def handle_client(reader: asyncio.StreamReader,
             stats.inc("auth_ok")
             await ws.send_text('{"ok":true}')
 
-            # --- init: оригинальный 64-байтовый obfuscated2
-            try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=INIT_TIMEOUT)
-            except asyncio.TimeoutError:
-                diag.event(E_INIT_TIMEOUT, label)
-                await ws.close(1008, "init timeout")
-                return
-            if msg is None:
-                return
-            op, init = msg
+            # --- init: оригинальный 64-байтовый obfuscated2.
+            # ВАЖНО: клиент шлёт init И первый MTProto-пакет ОДНИМ кадром
+            # (forwardToWS отдаёт весь буфер lwIP, в журнале uphead=1460B).
+            # Поэтому берём первые 64 байта как init, а остаток сохраняем
+            # и прогоняем через splitter ниже. Требование «ровно 64 байта
+            # в кадре» ломало ВСЕ сессии: auth_ok=161, sessions_fail=161.
+            pending = b""
+            init = b""
+            deadline = asyncio.get_running_loop().time() + INIT_TIMEOUT
+            while len(init) < mtproto.HANDSHAKE_LEN:
+                left = deadline - asyncio.get_running_loop().time()
+                if left <= 0:
+                    diag.event(E_INIT_TIMEOUT, label)
+                    await ws.close(1008, "init timeout")
+                    return
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=left)
+                except asyncio.TimeoutError:
+                    diag.event(E_INIT_TIMEOUT, label)
+                    await ws.close(1008, "init timeout")
+                    return
+                if msg is None:
+                    return
+                op, payload = msg
+                if op != 0x2:
+                    continue          # служебный/текстовый кадр — не MTProto
+                need = mtproto.HANDSHAKE_LEN - len(init)
+                init += payload[:need]
+                pending = payload[need:]
             parsed = mtproto.parse_init(init)
             if parsed is None:
                 stats.inc("sessions_fail")
@@ -374,7 +393,17 @@ async def handle_client(reader: asyncio.StreamReader,
             got_reply = asyncio.Event()
 
             async def client_to_up():
-                nonlocal up_bytes
+                nonlocal up_bytes, pending
+                # Хвост первого кадра (после 64 байт init) — это уже
+                # MTProto-пакеты. Прогоняем их ПЕРЕД чтением новых кадров,
+                # иначе первый запрос клиента потеряется и Telegram будет
+                # молчать вечно.
+                if pending:
+                    tail, pending = pending, b""
+                    up_bytes += len(tail)
+                    for pkt in splitter.feed(tail):
+                        await up.send(pkt)
+                        stats.inc("ws_frames_up")
                 try:
                     while True:
                         msg = await asyncio.wait_for(ws.recv(), timeout=IDLE_TIMEOUT)
