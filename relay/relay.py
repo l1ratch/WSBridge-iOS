@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import ssl
 import struct
 import sys
@@ -46,8 +47,35 @@ INIT_TIMEOUT = 15.0           # сек на 64-байтовый init
 UPSTREAM_TIMEOUT = 10.0       # сек на TLS+WS к kws
 IDLE_TIMEOUT = 600.0          # сек без трафика -> закрыть
 READ_BUF = 65536
+SOCK_BUF = 256 * 1024         # SO_RCVBUF/SO_SNDBUF, как buffer_size у апстрима
 STATS_FLUSH_SEC = 30.0
 HEALTH_FILE = "health"        # touch каждые 30с; healthcheck смотрит mtime
+
+
+def set_sock_opts(writer: asyncio.StreamWriter) -> None:
+    """TCP_NODELAY + буферы на принятом/открытом сокете.
+
+    Замер 23.11.2026: asyncio ставит TCP_NODELAY=1 только на ИСХОДЯЩИЕ
+    соединения; на принятых серверных остаётся 0, т.е. алгоритм Нейгла
+    включён и мелкие MTProto-кадры могут ждать до 40 мс перед отправкой.
+    Апстрим (tg-ws-proxy raw_websocket.set_sock_opts) выставляет это явно
+    на обеих сторонах — делаем так же.
+
+    Ошибки setsockopt не фатальны: сокет может быть уже закрыт, а на
+    некоторых платформах опция недоступна. Транспорт от этого не рвём.
+    """
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except (OSError, AttributeError):
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF)
+    except OSError:
+        pass
 
 # IPv6 kws-гейтвеев (DoH 22.11.2026, проверены MTProto-обменом).
 DEFAULT_DC6 = {
@@ -130,6 +158,9 @@ class WSConn:
         # RFC 6455: сервер не маскирует; masked-кадр от сервера iOS отклоняет
         # как нарушение протокола — именно это давало ws_closed:0 на iPhone.
         self.mask_outgoing = mask_outgoing
+        # NODELAY + буферы на ОБЕИХ сторонах: здесь единая точка, через
+        # которую проходят и принятый сокет телефона, и исходящий к kws.
+        set_sock_opts(writer)
 
     async def send(self, payload: bytes, opcode: int = 0x2) -> None:
         self.w.write(mtproto.ws_frame(payload, opcode, mask=self.mask_outgoing))
@@ -604,7 +635,6 @@ def cmd_diag(args):
 
 def cmd_doctor(args):
     """Самопроверка: ключ, IPv6, DNS, порт."""
-    import socket
     print("=== WSBridge Relay doctor ===")
     ok = True
     # ключ

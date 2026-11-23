@@ -25,6 +25,11 @@ S→C  binary <MTProto payload>
 `WSConn.mask_outgoing`: `False` для стороны телефона, `True` для kws.
 Нарушение → iOS закрывает соединение с `closeCode 0` (protocol error).
 
+`WSConn.__init__` вызывает `set_sock_opts`: `TCP_NODELAY=1` и
+`SO_RCVBUF`/`SO_SNDBUF = SOCK_BUF` на обеих сторонах. asyncio выставляет
+NODELAY только на исходящих соединениях — на принятых серверных остаётся 0
+(замер 23.11.2026), т.е. Нейгл включён и мелкие MTProto-кадры ждут до 40 мс.
+
 Init и первый MTProto-пакет приходят **одним кадром** (`forwardToWS` отдаёт
 весь буфер lwIP). Сервер накапливает 64 B из последовательных binary-кадров,
 остаток прогоняет через `Splitter` до чтения новых кадров.
@@ -60,6 +65,7 @@ Init и первый MTProto-пакет приходят **одним кадро
 | `UPSTREAM_TIMEOUT` | 10 с | `relay.py` |
 | `IDLE_TIMEOUT` | 600 с | `relay.py` |
 | `READ_BUF` | 65536 | `relay.py` |
+| `SOCK_BUF` | 262144 (`SO_RCVBUF`/`SO_SNDBUF`) | `relay.py` |
 | `STATS_FLUSH_SEC` | 30 с | `relay.py` |
 | `MAX_PACKET` | 16 MiB | `mtproto.py` |
 | `KEY_BYTES` | 32 (256 бит, base64url 43 симв.) | `state.py` |
