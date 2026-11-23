@@ -117,7 +117,8 @@ class WSConn:
     """
 
     def __init__(self, reader: asyncio.StreamReader,
-                 writer: asyncio.StreamWriter, peer: str = "?"):
+                 writer: asyncio.StreamWriter, peer: str = "?",
+                 mask_outgoing: bool = True):
         self.r = reader
         self.w = writer
         self._frag = bytearray()
@@ -125,9 +126,13 @@ class WSConn:
         # Реальный IP клиента за nginx (X-Real-IP / X-Forwarded-For),
         # иначе в логах был бы только 127.0.0.1 прокси.
         self.peer = peer
+        # Релей — СЕРВЕР для телефона (mask=False) и КЛИЕНТ для kws (mask=True).
+        # RFC 6455: сервер не маскирует; masked-кадр от сервера iOS отклоняет
+        # как нарушение протокола — именно это давало ws_closed:0 на iPhone.
+        self.mask_outgoing = mask_outgoing
 
     async def send(self, payload: bytes, opcode: int = 0x2) -> None:
-        self.w.write(mtproto.ws_frame(payload, opcode))
+        self.w.write(mtproto.ws_frame(payload, opcode, mask=self.mask_outgoing))
         await self.w.drain()
 
     async def send_text(self, text: str) -> None:
@@ -139,7 +144,7 @@ class WSConn:
         self.closed = True
         body = struct.pack(">H", code) + reason.encode()[:120]
         try:
-            self.w.write(mtproto.ws_frame(body, opcode=0x8))
+            self.w.write(mtproto.ws_frame(body, opcode=0x8, mask=self.mask_outgoing))
             await self.w.drain()
         except Exception:
             pass
@@ -237,7 +242,8 @@ async def accept_ws(reader: asyncio.StreamReader,
             xff = headers.get(b"x-forwarded-for", b"").decode("latin1")
             real = xff.split(",")[0].strip() if xff else ""
         peer_label = f"{real or sock_ip}:{raw_peer[1] if raw_peer else 0}"
-        return WSConn(reader, writer, peer_label)
+        # Телефон — клиент, релей для него СЕРВЕР: исходящие кадры БЕЗ маски.
+        return WSConn(reader, writer, peer_label, mask_outgoing=False)
     except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
         return None
 
@@ -275,7 +281,8 @@ async def upstream_connect(dc6: str, sni: str, path: str, insecure: bool):
     if not lines or "101" not in lines[0]:
         writer.close()
         raise ConnectionError(f"upstream upgrade: {lines[0] if lines else 'empty'}")
-    return WSConn(reader, writer, f"{sni}")
+    # kws — сервер, релей для него КЛИЕНТ: исходящие кадры С маской (RFC 6455).
+    return WSConn(reader, writer, f"{sni}", mask_outgoing=True)
 
 
 # ---------------------------------------------------------------- сессия

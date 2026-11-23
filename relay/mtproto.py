@@ -243,15 +243,20 @@ class Splitter:
         return [tail]
 
 
-def ws_frame(payload: bytes, opcode: int = 0x2) -> bytes:
-    """Клиентский (masked) WS-кадр. Маска обязательна по RFC 6455."""
-    mask = os.urandom(4)
+def ws_frame(payload: bytes, opcode: int = 0x2, mask: bool = True) -> bytes:
+    """WS-кадр. mask=True — клиентский (обязателен по RFC 6455),
+    mask=False — серверный (сервер НЕ маскирует; masked-кадр от сервера
+    клиент обязан отклонить как нарушение протокола)."""
     n = len(payload)
+    flag = 0x80 if mask else 0x00
     if n < 126:
-        hdr = bytes([0x80 | opcode, 0x80 | n])
+        hdr = bytes([0x80 | opcode, flag | n])
     elif n < 65536:
-        hdr = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack(">H", n)
+        hdr = bytes([0x80 | opcode, flag | 126]) + struct.pack(">H", n)
     else:
-        hdr = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack(">Q", n)
-    masked = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
-    return hdr + mask + masked
+        hdr = bytes([0x80 | opcode, flag | 127]) + struct.pack(">Q", n)
+    if not mask:
+        return hdr + payload
+    m = os.urandom(4)
+    masked = bytes(b ^ m[i & 3] for i, b in enumerate(payload))
+    return hdr + m + masked
