@@ -1,171 +1,163 @@
-# WSBridge (RU)
+# WSBridge
 
-IP-over-WebSocket релей для iOS (Packet Tunnel Provider) с выборочной
-маршрутизацией доменов через SOCKS5/HTTP-прокси.
-English version: [README.md](README.md)
+iOS Packet Tunnel Provider. Split-туннель: Telegram IPv4/TCP → WebSocket.
+EN: [README.md](README.md) · Сервер-релей: [relay/](relay/README.md)
 
-## Версионирование `X.Y.N`
+## Путь данных
 
-| Часть | Кто меняет | Когда |
-| --- | --- | --- |
-| `X` | разработчик вручную | только по явной команде, при глобальных изменениях |
-| `Y` | разработчик вручную | только по явной команде, на стабильном релизе |
-| `N` | CI автоматически | **каждая** превью-сборка в `main` |
-
-Источник правды — [`project.yml`](project.yml) (`WSB_VERSION = "X.Y"`,
-`WSB_BUILD = N`). Каждый пуш в `main` публикует `X.Y.N` в **один и тот же
-обновляемый** prerelease `preview` + gh-pages/GBox, после чего CI сам
-поднимает `N` до `N+1`. Теги `v*` при этом **не создаются**.
-
-Стабильный релиз выкладывается **только по явной команде**: вручную
-поднять `X`/`Y` в `project.yml`, запушить тег `vX.Y.N` — тогда сработает
-[`release.yml`](.github/workflows/release.yml). До этой команды все
-сборки остаются превью.
-
-## Что делает
-
-Приложение создаёт виртуальный сетевой интерфейс (TUN) и переносит
-IPv4 TCP-трафик Telegram через него в виде WebSocket-потока. Всё
-остальное продолжает ходить обычным путём устройства:
-
-```mermaid
-flowchart LR
-    subgraph DEV["iOS · процесс Packet Tunnel Provider"]
-        direction LR
-        TUN[/"TUN-интерфейс"/] --> LW["стек lwIP<br/>NO_SYS=1 · один поток · только IPv4"]
-        LW -->|терминированные TCP-потоки| WS["WebSocket-клиент"]
-        WS -->|декодированные IP-пакеты| TUN
-    end
-    APP(["Приложения"]) -->|"только IPv4-диапазоны Telegram"| TUN
-    APP -->|"всё остальное"| DIR(["напрямую · мимо туннеля"])
-    WS <-->|"wss:// (TLS) · HTTP 101 upgrade"| GW["Эндпоинт гейтвея"]
+```
+NEPacketTunnelProvider
+  packetFlow.readPackets → lwIP (NO_SYS=1, одна очередь, IPv4)
+  lwIP accept/recv       → TunnelSession
+  TunnelSession          → WSClient (URLSessionWebSocketTask)
+  WS-кадры               → эндпоинт
 ```
 
-1. Система направляет в TUN-интерфейс только IPv4-диапазоны Telegram;
-   остальные назначения уходят с устройства напрямую.
-2. Встроенный стек lwIP (однопоточный, `NO_SYS=1`, только IPv4)
-   терминирует TCP и переизлучает каждый поток кадрами WebSocket.
-3. Кадры передаются по TLS (`wss://`) HTTP-эндпоинту, который
-   апгрейдит соединение (статус 101) и ретранслирует поток.
-4. Ответы декодируются обратно в IP-пакеты и пишутся в TUN.
+lwIP терминирует TCP в процессе; каждый поток становится потоком WS-кадров.
+Обратные кадры пишутся через lwIP → `packetFlow.writePackets`.
+IPv6-маршрут не анонсируется (`includedRoutes6` определён, но не используется):
+lwIP только IPv4.
 
-## Область действия
+## Маршрутизация
 
-Это split-туннель, а не VPN на всё устройство. Что проходит через него,
-а что нет:
+`NEIPv4Settings.includedRoutes`:
 
-| Трафик | Проходит |
-| --- | --- |
-| Telegram IPv4, TCP | да — через релей WSBridge |
-| Домены из включённых списков (itdoginfo/allow-domains, Google AI и др.) | да — через SOCKS5/HTTP-прокси |
-| Telegram IPv4, прочие протоколы (UDP, ICMP) | нет — отбрасываются |
-| IPv6 | нет — IPv6-маршрут не анонсируется |
-| UDP:443 (QUIC) | нет — мгновенный ICMP Port Unreachable → фолбэк на TCP |
-| Все остальные назначения | нет — идут мимо туннеля напрямую |
+| CIDR | Источник |
+|---|---|
+| `149.154.0.0/16` | `TelegramDCs.includedRoutes` |
+| `91.108.0.0/16` | `TelegramDCs.includedRoutes` |
+| `91.105.192.0/24` | `TelegramDCs.includedRoutes` |
+| `/24` из списков | `providerConfiguration["routeCIDRs"]`, только режим прокси-доменов |
 
-Маршрутизируемые диапазоны Telegram — `149.154.0.0/16`, `91.108.0.0/16` и
-`91.105.192.0/24` ([`Tunnel/TelegramDCs.swift`](Tunnel/TelegramDCs.swift)).
-Берутся полные диапазоны, а не только известные адреса DC: Telegram может
-подключаться к любому адресу внутри них.
+`excludedRoutes`: `/32` на каждый хост SOCKS5/HTTP-прокси — чтобы сокет
+прокси не уехал обратно в utun.
 
-Проксируемые домены резолвятся локальным DNS туннеля в FakeIP
-`198.18.1.0/24`; для AAAA / SVCB(64) / HTTPS(65) резолвер возвращает
-пустой NOERROR — иначе `ipv4hint` из HTTPS RR уводит нативное приложение
-мимо прокси. Для приложений со своим DoH/DoT есть фолбэк по TLS SNI:
-подсети CDN из [`App/TunnelManager.swift`](App/TunnelManager.swift) тоже
-попадают в туннель, а [`Tunnel/TLSSNI.swift`](Tunnel/TLSSNI.swift) решает,
-гнать соединение в прокси или выпустить напрямую.
+Интерфейс: `198.18.0.2/32`, `tunnelRemoteAddress 198.18.0.1`, MTU 1500.
+UDP/ICMP внутри маршрутизируемых диапазонов отбрасываются.
+UDP:443 → ICMP port-unreachable.
 
-Шифрованный DNS (см. ниже) передаётся в конфигурации туннеля; насколько
-широко iOS его применяет, зависит от системной маршрутизации
-split-туннеля, а не от этого приложения.
+## Режимы транспорта
 
-## Выбор эндпоинтов
+Выбор в `PacketTunnelProvider.handleAccept`, по порядку:
 
-Соединения устанавливаются через упорядоченный каскад:
+| Условие | Режим | Точка входа |
+|---|---|---|
+| `proxyEndpoint != nil && isSNIInterceptCandidate(ip)` | прокси-домены (SOCKS5/HTTP CONNECT) | `TunnelSession.startProxy` |
+| `relayHost != nil && relayKey != nil` | WSBridge Relay | `TunnelSession.startRelay` → `WSClient.connectBridge` |
+| `workerDomain != nil` | CF Worker pipe | `TunnelSession.startPipe` → `WSClient.connectPipe` |
+| иначе | kws-каскад | `TunnelSession.startWS` → `WSClient.connect` |
 
-```mermaid
-flowchart TD
-    A(["новое соединение"]) --> B{"персистентный реестр здоровья<br/>пропуск: ≥3 фейлов подряд без успеха за 24 ч<br/>порядок: свежие успехи первыми"}
-    B --> T1["слой 1 · CDN edge<br/>kws{dc}.{domain} · round-robin старт"]
-    T1 -->|fail| T2["слой 2 · прямые IP<br/>адрес гейтвея + заголовок Host"]
-    T2 -->|fail| T3["слой 3 · native<br/>kws{dc}.*"]
-    T3 -->|fail| X(["обрыв · клиент переподключится → новый каскад"])
-    T1 & T2 & T3 -->|получены первые данные| OK(["сессия активна"])
-    OK -.->|"успех: failCount = 0, lastSuccess = now"| R[("реестр здоровья<br/>UserDefaults · переживает перезапуск")]
-    T1 & T2 & T3 -.->|"фейл до первых данных: failCount++<br/>+ бан 10 мин (runtime)"| R
-    R -.->|следующий connect| B
+`isSNIInterceptCandidate` возвращает false для `149.154/16` и `91.108/16`,
+поэтому Telegram всегда попадает в WS-ветки.
+
+### kws-каскад
+
+`WSClient.connect` строит `[Endpoint]` = `(host, hostHeader, plain)`:
+
+```
+1..6    ws://kws{dc}.{base}:80/apiws        (plain, 6 ротированных фронтов)
+7..12   wss://kws{dc}.{base}/apiws          (те же 6 фронтов, TLS)
+13..16  wss://{gatewayIP}/apiws             Host: kws{dc}[-1].web.telegram.org
+17      wss://kws{dc}[-1].web.telegram.org/apiws
 ```
 
-- **CDN edge** — хосты `kws{dc}.{domain}`, резолвятся и ротируются
-  round-robin; префикс живых эндпоинтов приоритетен.
-- **Прямые IP** — адреса гейтвея напрямую с заголовком `Host`.
-- **Native** — `kws{dc}.`-эндпоинты как последний fallback.
+`gatewayIPs`: `149.154.167.220`, `149.154.175.205`, `149.154.167.99`,
+`149.154.174.100`. Путь `/apiws_test` при `dcId >= 10000`.
+Media (`dc_idx < 0`) использует `kws{dc}-1`.
 
-Реестр здоровья эндпоинтов переживает перезапуски: число подряд идущих
-фейлов, время последнего фейла и последнего успеха. Эндпоинты с
-≥3 фейлами подряд и без успеха за 24 ч исключаются до восстановления;
-свежие успехи пробуются первыми.
+Состояние попытки: таймер 10 с, гасится по `GotData` (любой успешный
+`receive`), а не по `countOfBytesSent/Received` — для WS-кадров они остаются 0.
+`initFrame` (64 B) отправляется один раз на эндпоинт сразу после `resume()`.
+Ключ здоровья — `host` или `ws80:host`; `markDead` → бан 600 с +
+`FrontHealthRegistry.recordFailure`.
 
-## Обновление списка эндпоинтов
+`FrontHealthRegistry` (UserDefaults): исключает эндпоинты с ≥3 фейлами подряд
+и без успеха за 24 ч; сортирует по `lastSuccess` desc; удаляет записи,
+мёртвые >7 суток и отсутствующие в апстрим-списке.
 
-Список эндпоинтов обновляется без пересборки приложения:
+### WSBridge Relay
 
-1. Приложение скачивает список с основного URL, с фолбэком на два
-   CDN-зеркала (таймаут 10 с, обход кэша).
-2. Каждая запись валидируется форматом и DNS-резолвом; список, где
-   резолвится меньше 3 записей, отбрасывается как протухший.
-3. Валидные записи мерджатся в персистентный реестр — встроенный
-   список всегда первым, как неизменяемый fallback; известные живые
-   не перетестируются, мёртвые получают DNS-ре-чек, мёртвые >7 дней
-   и пропавшие из апстрима удаляются.
-4. Реестр питает каскад при следующем старте туннеля.
-   Автообновление — не чаще раза в 30 минут, после старта туннеля,
-   не до него.
+`wss://{relayHost}/` — протокол в [relay/README.md](relay/README.md).
+Клиент шлёт `{"v":1,"token":…}` первым кадром, затем сырой MTProto-поток;
+init парсит и кадрирует сервер. Клиентский сплиттер в этом режиме не используется.
+Ключ в Keychain (`kSecClassGenericPassword`, service `WSBridge`,
+account `relayKey`, `AccessibleAfterFirstUnlock`). Watchdog 8 с по `firstRecv`.
+
+### CF Worker pipe
+
+`wss://{workerDomain}/apiws?dst={IPv4}` — сырая труба байтов, воркер диалит
+`dst:443`. Форма `host:port` не поддерживается (legacy raw-TCP удалён).
+`sendPing` → `ws_ping`; watchdog 7 с по `firstRecv || pingOK`.
+
+### Прокси-домены
+
+`routeCIDRs` — блоки `/24`, зарезолвленные из включённых списков доменов
+в процессе приложения. `TLSSNI.extract` читает ClientHello (буфер до 2048 B);
+совпало → `ProxyClient.connect` (SOCKS5 или HTTP CONNECT по имени),
+не совпало → `DirectStream` (`NWConnection`, привязка к физическому интерфейсу).
+
+## Обработка MTProto
+
+`InitParser` (64 B obfuscated2): `key = init[8:40]`, `iv = init[40:56]`,
+AES-256-CTR decrypt → `proto_tag` в `[56:60]` LE, `dc_idx` в `[60:62]` `<h`.
+Валидные теги: `0xEFEFEFEF` abridged, `0xEEEEEEEE` intermediate,
+`0xDDDDDDDD` padded. `dcId = abs(dc_idx)`, `isMedia = dc_idx < 0`,
+`isTestDC = dcId >= 10000`.
+
+`MsgSplitter`: AES-CTR fast-forward 64, расшифровывает только префиксы длин,
+отдаёт срезы исходного шифртекста. Payload не перешифровывается;
+init клиента уходит как есть (режим kws-каскада).
+
+## Обновление списка фронтов
+
+`CFDomains.builtinBases` — 20 неизменяемых записей, всегда первыми.
+`TunnelManager.updateFronts` качает origin + 2 CDN-зеркала (таймаут 10 с,
+обход кэша), декодирует сдвиговым шифром апстрима, валидирует формат и
+DNS-резолв; списки с <3 резолвящимися записями отбрасываются. Мердж в
+`frontBases`, передача через `providerConfiguration["fronts"]`.
+Лимит 30 мин, выполняется после старта туннеля.
 
 ## DNS
 
-Шифрованный транспорт выбирается в приложении: DNS-over-TLS (по
-умолчанию) или DNS-over-HTTPS. Если у выбранного сервера нет нужного
-транспорта — используется второй, иначе обычный UDP. DoT идёт напрямую
-к IP сервера с SNI и не требует бутстрап-резолва имени, на который DoH
-под туннелем не всегда может положиться. Пресеты идут со списками
-резолверов и ссылками на сайт провайдера; своим конфигам DoT-хост
-обязателен. Изменения применяются при следующем старте туннеля.
+`NEDNSSettings` выставляется только при активном пользовательском пресете;
+по умолчанию системный резолвер (`dnsSettings = nil`). Транспорты: DoT
+(`NEDNSOverTLSSettings`, `serverName` обязателен, коннект к IP с SNI), DoH
+(`NEDNSOverHTTPSSettings`), plain UDP. DoH/FakeIP-роутинг не реализован —
+закрытая концепция в [docs/DoH-Routing.ru.md](docs/DoH-Routing.ru.md).
+
+## Журнал
+
+`EventLog`: файл на прогон `Library/Logs/run-<yyyyMMdd-HHmmss>.log`, дозапись
+построчно, ротация 20 файлов. `JournalServer`: loopback TCP `127.0.0.1:51001`,
+команды `journal` / `list` / `file:<name>`. Darwin-уведомления
+`com.l1ratch.WSBridge.<event>` для счётчиков UI.
+
+Ключевые маркеры: `cfg:relay=`, `cfg:worker=`, `cfg:routeB`, `accept:c<N>`,
+`init:conn<N>:DC<n>`, `ws_try:`, `ws_up`, `ws_recv:c<N>:n<K>:<bytes>`,
+`ws_closed:<code>:<reason>`, `relayws_try:`, `relayws_auth_sent`,
+`relayws_slow`, `io:in/out/wd/wf/up/rx/sent/mem/conns`.
 
 ## Сборка
 
-- Xcode-проект генерируется через `xcodegen` из `project.yml`.
-- CI (GitHub Actions) собирает unsigned `.ipa` при пуше в `main`.
-
 ```sh
-brew install xcodegen
 xcodegen generate
 xcodebuild -project WSBridge.xcodeproj -scheme WSBridge -sdk iphoneos build
 ```
 
-### Версионирование
+Таргеты: `WSBridge` (app), `WSBridgeTunnel` (packet-tunnel-provider),
+`WSBridgeLive` (widgetkit-extension). iOS 17.0+, Swift 5.9.
+ATS расширения: `NSExceptionDomains` на 20 базовых доменов фронтов
+(`NSExceptionAllowsInsecureHTTPLoads`, `NSIncludesSubdomains`) — нужно для
+`ws://…:80`. Глобального `NSAllowsArbitraryLoads` нет.
 
-Версия — `V.V.N`, то есть **версия.патч.сборка**, где третье число и есть
-номер сборки. Её дают два значения в `project.yml`:
-
-- `WSB_VERSION` — блок версии (`0.3`), растёт на релизных вехах;
-- `WSB_BUILD` — номер сборки внутри блока, с нуля: `0.3.0`, `0.3.1`,
-  `0.3.2`, … и сбрасывается в `0` на новом блоке (`0.4.0`).
-
-Склеенная строка `<WSB_VERSION>.<WSB_BUILD>` используется везде — в UI,
-в `CFBundleShortVersionString`, в манифесте GBox и в теге релиза.
-Отдельного номера сборки в скобках нигде нет. CI падает, если plist-ы
-разошлись с этими значениями, а релизный workflow отказывается собирать
-тег, не совпадающий со склеенной версией:
-
-```sh
-# подними WSB_BUILD (или WSB_VERSION + WSB_BUILD=0 для нового блока), затем
-git push origin main
-git tag v0.3.1 && git push origin v0.3.1
-```
+Версия = `$(WSB_VERSION).$(WSB_BUILD)` из `project.yml`;
+`CFBundleVersion = $(WSB_BUILD)`. CI публикует unsigned IPA в единственный
+prerelease `preview` + манифест gh-pages на каждый пуш в `main`, затем
+поднимает `WSB_BUILD`. Тег `vX.Y.N` запускает `release.yml`; он отклоняет тег,
+не совпадающий со склеенной версией.
 
 ## Лицензия
 
 MIT © 2026 l1ratch. Портируемая логика —
 [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy) (MIT).
+lwIP: BSD (`Tunnel/lwip/COPYING`).
